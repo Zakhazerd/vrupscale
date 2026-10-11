@@ -15,7 +15,7 @@
 #include <vector>
 #include <utility>
 
-#define VU_VERSION_STR "0.6.1"
+#define VU_VERSION_STR "0.6.2"
 
 namespace vu {
 

@@ -12,7 +12,7 @@ if [ -f build/gen/shader_sources.h ]; then $CXX $FLAGS -Ibuild/gen test/compile_
 
 P=build/pkg/vrupscale-$VER
 rm -rf build/pkg && mkdir -p $P/LICENSES $P/selftest $P/payload
-cp build/vrupscale.exe README.md third_party/openvr/openvr_api.dll $P/
+cp build/vrupscale.exe README.md CHANGELOG.md third_party/openvr/openvr_api.dll $P/
 cp build/dxgi.dll $P/payload/
 cp LICENSE $P/LICENSES/vrupscale-MIT.txt
 cp third_party/minhook/LICENSE.txt $P/LICENSES/MinHook-BSD2.txt
@@ -35,7 +35,7 @@ with zipfile.ZipFile('../vrupscale-$VER.zip', 'w', zipfile.ZIP_STORED) as z:
 
 S=build/src/vrupscale-$VER-src
 rm -rf build/src && mkdir -p $S
-cp -r src shaders test tools app third_party build.sh README.md LICENSE .gitignore .github $S/
+cp -r src shaders test tools app third_party build.sh README.md CHANGELOG.md LICENSE .gitignore .github $S/
 (cd build/src && python3 -I -c "
 import shutil; shutil.make_archive('../vrupscale-$VER-src', 'zip', '.', 'vrupscale-$VER-src')")
 ls -la build/vrupscale-$VER*

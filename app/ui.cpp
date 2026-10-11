@@ -30,6 +30,8 @@ const FontSpec kSpec[F_COUNT] = {
     { 700, 13 },   // F_BUTTON
     { 700, 11 },   // F_TINY
     { 400, 12 },   // F_MONO (Consolas)
+    { 700, 15 },   // F_BODYB: bold in body text (the change log)
+    { 400, 14 },   // F_CODE (Consolas): code in body text
 };
 
 struct FontData {
@@ -228,7 +230,7 @@ void MakeFonts(UINT dpi)
         lf.lfHeight = -(LONG)lroundf(kSpec[i].px * g_scale);
         lf.lfQuality = CLEARTYPE_QUALITY;
         lf.lfCharSet = DEFAULT_CHARSET;
-        if (i == F_MONO) {
+        if (i == F_MONO || i == F_CODE) {
             lstrcpyW(lf.lfFaceName, L"Consolas");
             lf.lfWeight = FW_NORMAL;
         } else if (g_fontsLoaded) {
@@ -416,12 +418,12 @@ float GroundY(float x, float width)
     return py[4];
 }
 
-void DrawGround(Canvas &c, float width, float height)
+void DrawGround(Canvas &c, float width, float height, float shift)
 {
     c.Fill({ 0, 0, width, height }, col::sky);
     static const float px[] = { 0.0f, 0.17f, 0.56f, 0.74f, 1.0f };
     gp::PointF pts[7];
-    for (int i = 0; i < 5; ++i) pts[i] = gp::PointF(px[i] * width, GroundY(px[i] * width, width));
+    for (int i = 0; i < 5; ++i) pts[i] = gp::PointF(px[i] * width, GroundY(px[i] * width, width) + shift);
     pts[0].X = -2;
     pts[4].X = width + 2;
     pts[5] = gp::PointF(width + 2, height + 2);

@@ -1,6 +1,7 @@
 // vrupscale.exe: install vrupscale into SteamVR, see what it is doing, change its settings live.
 // The window is drawn by hand (ui.cpp) in the style of Valve's Steam hardware pages; the only
 // native control is the fixed-height field.
+#include "changelog.h"
 #include "core.h"
 #include "gameres.h"
 #include "ui.h"
@@ -35,7 +36,7 @@ enum : int {
     IDC_TINT, IDC_HOTKEYS, IDC_AREA, IDC_AREAVAL, IDC_AREAHINT, IDC_HIST, IDC_HISTVAL, IDC_MOVING, IDC_MOVINGVAL, IDC_TOL, IDC_TOLVAL,
     IDC_DEFAULTS, IDC_SAVED, IDC_OPENLOG, IDC_OPENFOLDER, IDC_STATUS, IDC_DETAIL, IDC_TEXLIST, IDC_TEXHINT, IDC_EVENTS,
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
-    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE,
+    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG,
 };
 enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
@@ -949,8 +950,24 @@ float VersionPillRight()   // where the version pill by the name ends (DrawBackg
     return 36 + ui::Measure(ui::F_BRAND, L"vrupscale") + 10 + ui::Measure(ui::F_TINY, Widen(VU_APP_VERSION)) + 16;
 }
 
+// The Change log button sits by the version pill, the Update button (when there is one) after it.
+RectF ChangeLogButtonRect() { return { VersionPillRight() + 12, 26, ui::Measure(ui::F_BUTTON, L"Change log") + 34, 29 }; }
+
+void OpenChangeLog(bool bringForward = true)
+{
+    app::ChangeLogInfo info;
+    info.current = Widen(VU_APP_VERSION);
+    info.updatedFrom = g_updatedFrom;
+    if (g_updState != UpdNone) {
+        info.updVersion = g_upd.version;
+        info.updNotes = g_upd.notes;
+    }
+    app::ShowChangeLog(g_wnd, g_inst, g_dpi, info, bringForward);
+}
+
 void RefreshUpdateUi()
 {
+    if (ui::Widget *cl = W(IDC_CHANGELOG)) cl->r = ChangeLogButtonRect();
     ui::Widget *w = W(IDC_UPDATE);
     if (!w) return;
     std::wstring t;
@@ -965,7 +982,7 @@ void RefreshUpdateUi()
     case UpdFailed: t = L"Update failed: try again"; break;
     }
     const float bw = std::max(ui::Measure(ui::F_BUTTON, L"Downloading… 100%"), ui::Measure(ui::F_BUTTON, t)) + 34;
-    w->r = { VersionPillRight() + 12, 26, bw, 29 };
+    w->r = { ChangeLogButtonRect().r() + 10, 26, bw, 29 };
     w->text = t;
     w->enabled = en;
     w->visible = g_updState != UpdNone;
@@ -1005,6 +1022,7 @@ void OnUpdateCheck(app::UpdateInfo *u)
             g_updState = UpdNone;   // (a release can be withdrawn)
         }
         RefreshUpdateUi();
+        if (app::ChangeLogOpen()) OpenChangeLog(false);   // (an available update's notes show there too)
     }
     delete u;
 }
@@ -1178,6 +1196,7 @@ void CreateControls()
 {
     using ui::Kind;
     const RectF U = kCardUp, T = kCardTemp, V = kCardVR, X = kCardTex, E = kCardEv;
+    AddWidget(IDC_CHANGELOG, Kind::Button, ChangeLogButtonRect(), L"Change log");
     AddWidget(IDC_UPDATE, Kind::Button, { 0, 0, 0, 0 }, L"Update", ui::BtnPrimary);   // placed by RefreshUpdateUi
     W(IDC_UPDATE)->visible = false;
     AddWidget(IDC_ENABLED, Kind::Toggle, { U.r() - 64, U.y + 15, 44, 26 }, L"");
@@ -1451,6 +1470,13 @@ std::wstring TipText(int id, int part, std::wstring &title)
                L" and install it: the app restarts in the new version. SteamVR's copy is updated at once if SteamVR is closed, "
                L"otherwise as soon as it is. Your settings stay.";
     }
+    case IDC_CHANGELOG:
+        title = L"Change log";
+        return L"What changed in each version of vrupscale, newest first, in a window of its own (the same as CHANGELOG.md "
+               L"next to the app)." +
+               std::wstring(!g_updatedFrom.empty() ? L" The versions since " + g_updatedFrom + L", which you just updated from, are marked new."
+                            : L"") +
+               std::wstring(g_updState != UpdNone ? L" The available update's notes come first." : L"");
     case IDC_ENABLED:
         title = L"Upscaling on or off";
         return L"Turns vrupscale on or off inside SteamVR, at once. Off, SteamVR shows what the game renders as it is (at "
@@ -1666,7 +1692,7 @@ void DrawTip(ui::Canvas &c)
 void DrawPage(ui::Canvas &c)
 {
     if (g_updState == UpdNone && !g_updatedFrom.empty())
-        c.Text(ui::F_SMALL, L"Updated from " + g_updatedFrom, VersionPillRight() + 12, ui::Mid(ui::F_SMALL, 40.5f), col::inkSoft);
+        c.Text(ui::F_SMALL, L"Updated from " + g_updatedFrom, ChangeLogButtonRect().r() + 12, ui::Mid(ui::F_SMALL, 40.5f), col::inkSoft);
     // hero: a headline and a sentence or two, like a hardware page
     c.FillCircle(45, 89, 9, g_statusColor);
     c.StrokeCircle(45, 89, 9, col::ink, 2.5f);
@@ -1940,6 +1966,7 @@ void OnButton(int id)
     }
     case IDC_INSTALL: DoInstall(false); break;
     case IDC_UPDATE: StartUpdate(); break;
+    case IDC_CHANGELOG: OpenChangeLog(); break;
     case IDC_UNINSTALL:
         if (MessageBoxW(g_wnd, L"Remove vrupscale from SteamVR? Your settings are kept.", L"vrupscale", MB_OKCANCEL | MB_ICONQUESTION) == IDOK)
             DoInstall(true);
@@ -2240,6 +2267,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DPICHANGED: {
         g_dpi = HIWORD(wp);
         ui::MakeFonts(g_dpi);
+        app::ChangeLogDpiChanged(g_dpi);
+        RefreshUpdateUi();
         g_bgDirty = true;
         RECT *r = (RECT *)lp;
         SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2365,7 +2394,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool doInstall = false, doUninstall = false, force = false, headless = false;
     std::wstring statusFile, steamvr, gameRes, report;
-    bool gameResTest = false, updateTest = false, checkUpdate = false;
+    bool gameResTest = false, updateTest = false, checkUpdate = false, changeLogTest = false, showChangeLog = false;
     std::vector<std::wstring> sets;
     int waitMs = 3000;
     for (int i = 1; i < argc; ++i) {
@@ -2386,6 +2415,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         else if (a == L"--report") report = next();
         else if (a == L"--updated-from") g_updatedFrom = next();
         else if (a == L"--test-update") updateTest = headless = true;   // self-test of the updater's parts (no network)
+        else if (a == L"--test-changelog") changeLogTest = headless = true;   // self-test of the change log's reading and layout
+        else if (a == L"--changelog") showChangeLog = true;   // open the change log at start
         else if (a == L"--check-update") checkUpdate = headless = true; // ask GitHub (or VRUPSCALE_UPDATE_URL) and report
     }
     LocalFree(argv);
@@ -2395,6 +2426,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         std::wstring out;
         if (gameResTest) code = app::GameResSelfTest(out) ? 5 : 0;
         if (updateTest) code = app::UpdateSelfTest(out) ? 7 : code;
+        if (changeLogTest) {
+            ui::Startup(inst);
+            ui::MakeFonts(96);
+            code = app::ChangeLogSelfTest(Widen(VU_APP_VERSION), out) ? 9 : code;
+            ui::Shutdown();
+        }
         if (checkUpdate) {
             app::UpdateInfo u = app::CheckForUpdate(Widen(VU_APP_VERSION));
             out += Fmt(L"check: %s%s, latest %s, newer %d, zip %s (%llu bytes), sha256 %s, sha asset %s\n", u.ok ? L"ok" : L"FAILED: ",
@@ -2523,6 +2560,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     }
     ShowWindow(w, show);
     UpdateWindow(w);
+    if (showChangeLog) OpenChangeLog();
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);

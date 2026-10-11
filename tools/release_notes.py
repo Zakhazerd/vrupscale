@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Prints the README's "What changed in <version>" section: the release's notes on GitHub, which
-the app also shows on its Update button."""
+"""Prints CHANGELOG.md's section for a version ("## <version>" up to the next "## "): the release's
+notes on GitHub, which the app also shows on its Update button."""
 import sys
 
 ver = sys.argv[1]
 out, on = [], False
-with open('README.md', encoding='utf-8') as f:
+with open('CHANGELOG.md', encoding='utf-8') as f:
     for line in f.read().splitlines():
-        if line.startswith('### ') or line.startswith('## '):
+        if line.startswith('## ') or line.startswith('# '):
             if on:
                 break
-            on = line.strip() == '### What changed in ' + ver
+            on = line.strip() == '## ' + ver
             continue
         if on:
             out.append(line)

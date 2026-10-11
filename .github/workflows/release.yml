@@ -1,7 +1,7 @@
 # Publishes a GitHub release for each new version: when main gets a VU_VERSION_STR (src/common.h)
 # that has no release yet, this builds vrupscale and creates release v<version> at that commit,
 # with the zip the app's updater downloads (stored uncompressed), its SHA-256, and the source.
-# The notes are the README's "What changed in <version>" section. (Pushing a tag v<version>
+# The notes are the version's section of CHANGELOG.md. (Pushing a tag v<version>
 # works too; a version that already has a release is skipped.)
 name: Release
 

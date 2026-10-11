@@ -37,7 +37,7 @@ constexpr COLORREF mid = RGB(79, 79, 79);
 COLORREF Mix(COLORREF a, COLORREF b, float t);   // a .. b
 Gdiplus::Color C(COLORREF c, BYTE alpha = 255);
 
-enum FontId { F_DISPLAY, F_BRAND, F_H2, F_BODY, F_LABEL, F_VALUE, F_SMALL, F_BUTTON, F_TINY, F_MONO, F_COUNT };
+enum FontId { F_DISPLAY, F_BRAND, F_H2, F_BODY, F_LABEL, F_VALUE, F_SMALL, F_BUTTON, F_TINY, F_MONO, F_BODYB, F_CODE, F_COUNT };
 
 void Startup(HINSTANCE inst);   // GDI+, the embedded fonts, the kraft texture
 void Shutdown();
@@ -94,7 +94,7 @@ private:
 // ---- page -------------------------------------------------------------------------------------
 
 float GroundY(float x, float width);   // the kraft's top edge
-void DrawGround(Canvas &c, float width, float height);
+void DrawGround(Canvas &c, float width, float height, float shift = 0);   // shift: moves the ground's edge down (< 0: up)
 void DrawCard(Canvas &c, const RectF &r, const wchar_t *title);
 void DrawWell(Canvas &c, const RectF &r);
 

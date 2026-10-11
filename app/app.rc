@@ -6,6 +6,8 @@
 202 RCDATA "fonts/rubik-500.ttf"
 203 RCDATA "fonts/rubik-700.ttf"
 204 RCDATA "fonts/rubik-800.ttf"
+// the change log window shows this (app/changelog.cpp)
+205 RCDATA "CHANGELOG.md"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO

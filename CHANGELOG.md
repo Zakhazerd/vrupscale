@@ -1,0 +1,98 @@
+# Change log
+
+What changed in each version of vrupscale, newest first.
+
+## 0.6.2
+
+- A **Change log** button shows this list. After an update, what's new since your last version is marked.
+
+## 0.6.1
+
+- FSR 1 mode uses the **Temporal area** too: FSR 1 inside it, a fast spatial upscale outside. **Bilinear edges**, **Debug tint**, **Follow gaze** and calibration now work in FSR 1 mode.
+- The area has its own value while **Follow gaze** is on: 40% by default (60% otherwise).
+
+## 0.6.0
+
+- The app updates itself from GitHub: an **Update** button appears when a new version is out.
+
+## 0.5.1
+
+- Resting the pointer on a control shows a longer description of it.
+
+## 0.5.0
+
+- Less smearing on moving objects such as avatars.
+- Switching scaling presets no longer causes **Temporal paused**, and a new render size is picked up faster.
+- Less GPU work outside the temporal area.
+
+## 0.4.9
+
+- **Set VRChat's resolution** takes effect immediately while VRChat runs.
+
+## 0.4.8
+
+- Eye tracking (Bigscreen Beyond 2e): the temporal area can follow your gaze. Includes **Calibrate** (Ctrl+F8 in VR), **Clear calibration** and **Show gaze**.
+- The Settings card's buttons moved into the SteamVR card.
+
+## 0.4.7
+
+- **Native (1×)** replaces Ultra Performance: no upscaling, just temporal anti-aliasing. A saved Ultra Performance becomes Performance.
+- **Set VRChat's resolution** (off by default): VRChat renders at the resolution the preset needs.
+
+## 0.4.6
+
+- **Bilinear edges** (off by default): a cheaper, softer upscale outside the temporal area. Ctrl+F7 in VR.
+
+## 0.4.5
+
+- Scaling presets replace the factor slider.
+- **Sharp history** is off by default. If you used 0.4.4, switch it off once (Ctrl+F6).
+- New shortcuts: Ctrl+F5 next scaling preset, Ctrl+F6 Sharp history.
+
+## 0.4.4
+
+- New defaults: Sharpness 1.00, History strength 1.00, Moving objects 1.00, Motion tolerance 1.50. **Restore defaults** applies them.
+- **Sharp history**: keeps finer detail, for some GPU time.
+- History strength goes up to 2.00, Motion tolerance to 3.00.
+- Removed the fixed output height and the Reset history button.
+
+## 0.4.3
+
+- A new look for the app; it also works from the keyboard and scrolls on small screens.
+- Fixed: unticking a texture didn't stick.
+
+## 0.4.2
+
+- Fixed: changing SteamVR's resolution while the game ran made temporal mode flicker.
+- When an eye can't use temporal mode, it stays on FSR 1 and the app says **Temporal paused**, instead of alternating.
+- The app shows the game's render resolution, and marks eye textures, which can't be unticked.
+- Fixed: the app showed the wrong installed version.
+
+## 0.4.1
+
+- Fixed: every mode was slower than native. Each new frame is now upscaled once, not on every draw.
+- The app shows new frames per second and GPU time per frame.
+
+## 0.4.0
+
+- Much cheaper temporal mode: only the **Temporal area** (default 60%) gets temporal detail.
+- The app shows the GPU time vrupscale takes inside SteamVR.
+- Uses less video memory.
+
+## 0.3.0
+
+- An app replaces the ini file and install script: install, uninstall, live status and live settings.
+- Settings are kept in one place: `%LOCALAPPDATA%\vrupscale\vrupscale.ini`.
+- The log and the app say why each texture is left alone.
+
+## 0.2.4
+
+- Works with SteamVR's command-list rendering.
+
+## 0.2.3
+
+- Covers every variant of the D3D11 calls the compositor uses.
+
+## 0.2.2
+
+- A cheaper temporal path, and self-test fixes for NVIDIA.
