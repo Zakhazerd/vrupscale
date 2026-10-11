@@ -634,6 +634,93 @@ static void RunFoveationTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, const 
 // SteamVR's compositor draws every texture of the app's swapchain (3 per eye) every frame, into
 // that eye's viewport of a side-by-side target, while new app frames arrive more slowly. Each
 // texture must be upscaled only when its content is new, and an eye's textures share one history.
+// ---------------------------------------------------------------------------------------------
+// FSR 1 mode uses the same area: FSR 1 inside it, the cheap spatial upscale outside, the same band.
+
+static bool InRect(int x, int y, const int r[4], int grow) { return x >= r[0] - grow && y >= r[1] - grow && x < r[2] + grow && y < r[3] + grow; }
+
+static void RunFoveatedFsrTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, const char *iniBase, const char *reqShared, float F,
+                               UINT misc, float area, const SeqResult &rf, const char *outDir)
+{
+    SetFovRegion(mov.ow, mov.oh, area);
+    printf("[FSR 1 in the area only (area %.1f: FSR 1 in the centre %dx%d, blend band %d px)]\n", area, g_fovRect[2] - g_fovRect[0],
+           g_fovRect[3] - g_fovRect[1], g_fovBand);
+    std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
+    ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
+    ID3D11ShaderResourceView *views[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+                                           MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
+    char ini[2048];
+    auto Ini = [&](const char *mode, float a, const char *upscaleExtra, const char *temporalExtra) {
+        snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=%s\nupscaleFactor=%.2f\nsharpness=0.5\n%s[temporal]\ntemporalArea=%.2f\n%s",
+                 iniBase, reqShared, mode, F, upscaleExtra, a, temporalExtra);
+        WriteIni(ini);
+        Pump(g);
+    };
+    Ini("fsr", area, "", "");
+    SeqResult rv = RunSequence(g, tgt, mov, app, views, 8);
+    printf("         region        FSR 1 (whole)   FSR 1 in the area   (PSNR vs ground truth, dB)\n");
+    printf("         centre        %6.2f          %6.2f\n", rf.fovCore.Psnr(), rv.fovCore.Psnr());
+    printf("         blend band    %6.2f          %6.2f\n", rf.fovBand.Psnr(), rv.fovBand.Psnr());
+    printf("         periphery     %6.2f          %6.2f\n", rf.fovOuter.Psnr(), rv.fovOuter.Psnr());
+    CHECK(AllFinite(rv.lastOut), "FSR 1 in the area: output finite and in range");
+    CHECK(fabs(rv.fovCore.Psnr() - rf.fovCore.Psnr()) < 0.02, "the centre is FSR 1 as over the whole image (%+.3f dB)",
+          rv.fovCore.Psnr() - rf.fovCore.Psnr());
+    CHECK(rv.fovOuter.Psnr() > rf.fovOuter.Psnr() - 1.0, "periphery close to FSR 1 (%+.2f dB)", rv.fovOuter.Psnr() - rf.fovOuter.Psnr());
+    CHECK(rv.fovBand.Psnr() > std::min(rf.fovBand.Psnr(), rv.fovOuter.Psnr()) - 0.3, "no seam: blend band %.2f dB", rv.fovBand.Psnr());
+
+    // one frame three ways: inside the area exactly FSR 1, outside exactly temporal's spatial edges
+    auto Shot = [&](const char *mode, float a, const char *ux, const char *tx) {
+        Ini(mode, a, ux, tx);
+        UploadSlices(g, app, mov.in[0][5], mov.in[1][5]);
+        DrawEye(g, tgt, views[1], 1, nullptr, false);
+        return DrawEye(g, tgt, views[0], 0, nullptr, true);
+    };
+    const Image whole = Shot("fsr", 1.0f, "", ""), fov = Shot("fsr", area, "", ""), temporal = Shot("temporal", area, "", "");
+    double inMax = 0, outMax = 0;
+    for (int y = 0; y < mov.oh; ++y)
+        for (int x = 0; x < mov.ow; ++x) {
+            const float *a = fov.at(x, y), *b = whole.at(x, y), *t = temporal.at(x, y);
+            const int core[4] = { g_fovRect[0] + g_fovBand + 2, g_fovRect[1] + g_fovBand + 2, g_fovRect[2] - g_fovBand - 2, g_fovRect[3] - g_fovBand - 2 };
+            for (int c = 0; c < 3; ++c) {
+                if (InRect(x, y, core, 0)) inMax = std::max(inMax, (double)fabsf(a[c] - b[c]));
+                if (!InRect(x, y, g_fovRect, 2)) outMax = std::max(outMax, (double)fabsf(a[c] - t[c]));
+            }
+        }
+    CHECK(inMax <= 1.5 / 255.0, "inside the area, exactly what FSR 1 gives over the whole image (largest difference %.1f/255)", inMax * 255.0);
+    CHECK(outMax <= 1.5 / 255.0, "outside it, exactly Temporal's spatial upscale of the edges (largest difference %.1f/255)", outMax * 255.0);
+
+    // Bilinear edges: outside the area what a plain bilinear upscale gives
+    Ini("bilinear", 1.0f, "", "");
+    SeqResult rb = RunSequence(g, tgt, mov, app, views, 8);
+    Ini("fsr", area, "", "bilinearEdges=1\n");
+    SeqResult rvb = RunSequence(g, tgt, mov, app, views, 8);
+    printf("         Bilinear edges: centre %.2f dB, blend band %.2f dB, periphery %.2f dB (plain bilinear there: %.2f)\n",
+           rvb.fovCore.Psnr(), rvb.fovBand.Psnr(), rvb.fovOuter.Psnr(), rb.fovOuter.Psnr());
+    CHECK(fabs(rvb.fovCore.Psnr() - rv.fovCore.Psnr()) < 0.02 && fabs(rvb.fovOuter.Psnr() - rb.fovOuter.Psnr()) < 0.15,
+          "Bilinear edges: the same centre, bilinear outside (%.2f dB, bilinear mode %.2f dB)", rvb.fovOuter.Psnr(), rb.fovOuter.Psnr());
+
+    // debug tint: magenta in the area, blue outside it
+    const Image plain = Shot("fsr", area, "", ""), tinted = Shot("fsr", area, "debugTint=1\n", "");
+    auto Ratio = [&](const Image &im, int x0, int y0, int x1, int y1, int a, int b) {
+        double sa = 0, sb = 0;
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) { sa += im.at(x, y)[a]; sb += im.at(x, y)[b]; }
+        return sa / std::max(sb, 1e-6);
+    };
+    const int cx = (g_fovRect[0] + g_fovRect[2]) / 2, cy = (g_fovRect[1] + g_fovRect[3]) / 2;
+    const double gc0 = Ratio(plain, cx - 20, cy - 20, cx + 20, cy + 20, 1, 0), gc1 = Ratio(tinted, cx - 20, cy - 20, cx + 20, cy + 20, 1, 0);
+    const double ge0 = Ratio(plain, 2, 2, 30, 30, 0, 2), ge1 = Ratio(tinted, 2, 2, 30, 30, 0, 2);
+    CHECK(gc1 < gc0 * 0.8 && ge1 < ge0 * 0.8, "debug tint: magenta in the area (G/R %.2f -> %.2f), blue outside (R/B %.2f -> %.2f)", gc0, gc1, ge0,
+          ge1);
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\fsr_area.ppm", outDir); SavePpm(fov, path);
+    snprintf(path, sizeof(path), "%s\\fsr_area_tint.ppm", outDir); SavePpm(tinted, path);
+    ClearAll(g);
+    SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
+    Settle(g);
+    g_fovBand = 0;
+}
+
 static void Upload1(Gfx &g, ID3D11Texture2D *t, const Image &im)
 {
     std::vector<uint8_t> bytes(size_t(im.w) * im.h * 4);
@@ -1440,6 +1527,40 @@ static void RunGazeTest(Gfx &g, const Sequence &mov, const char *iniBase, const 
         Ini(1, 0, 0, 0, 0.5f);
     }
 
+    // 4c. FSR 1 mode follows the gaze too, with the area's own value while following (gazeArea)
+    {
+        auto FsrShot = [&](int follow, float area) {
+            snprintf(ini, sizeof(ini),
+                     "%srequireShared=%s\n[upscale]\nmode=fsr\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=%.2f\n"
+                     "gazeArea=0.40\n[eyes]\nfollowGaze=%d\nprojection=-1 1 -1 1 -1 1 -1 1\n",
+                     iniBase, reqShared, F, area, follow);
+            WriteIni(ini);
+            Pump(g);
+            g_gazeTx = 0.25f; g_gazeTy = 0.2f;   // -> (0.625, 0.4) of the picture
+            Frames(7, 2);
+            return DrawEye(g, tgt, views[0], 0, nullptr, true);
+        };
+        const Image whole = FsrShot(0, 1.0f), follow = FsrShot(1, 0.6f);
+        auto side = [](int out, float a) { int r = (int)ceilf(out * a / 16.0f) * 16; return r + 32 >= out ? out : r; };
+        const int rw = side(OW, 0.4f), rh = side(OH, 0.4f), band = std::max(16, (int)lroundf(0.02f * std::min(OW, OH)));
+        const int rx = std::max(0, std::min((int)lroundf(0.625f * OW - 0.5f * rw), OW - rw));
+        const int ry = std::max(0, std::min((int)lroundf(0.4f * OH - 0.5f * rh), OH - rh));
+        double inMax = 0, strip = 0;
+        int n = 0;
+        for (int y = ry + band + 2; y < ry + rh - band - 2; ++y)
+            for (int x = 0; x < OW; ++x) {
+                const float *a = follow.at(x, y), *b = whole.at(x, y);
+                for (int c = 0; c < 3; ++c) {
+                    if (x >= rx + band + 2 && x < rx + rw - band - 2) inMax = std::max(inMax, (double)fabsf(a[c] - b[c]));
+                    if (x >= rx - 30 && x < rx - 2) { strip += fabsf(a[c] - b[c]); ++n; }   // inside a 60% area, outside 40%
+                }
+            }
+        strip /= std::max(n, 1);
+        CHECK(inMax <= 1.5 / 255.0 && strip > 0.002,
+              "FSR 1 mode: the area (40%% while following, %dx%d) sits around the gaze (FSR 1 there: largest difference %.1f/255; "
+              "the cheap upscale just beside it: %.4f mean difference)", rw, rh, inMax * 255.0, strip);
+    }
+
     // 5. the gaze moves while the game repeats a frame, and a setting forces a repaint: the area
     //    stays where its history was made until the next new frame
     Image before = DrawEye(g, tgt, views[0], 0, nullptr, true);
@@ -1676,6 +1797,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     snprintf(path, sizeof(path), "%s\\t_input.ppm", outDir); SavePpm(mov.in[0][mov.frames - 1], path);
     if (qualityOnly) {
         RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
+        RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
         RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
         RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
         RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
@@ -1716,6 +1838,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     }
 
     RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
+    RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
 
     // ---- still scene: no extra information, must not be worse than FSR 1 by much
     printf("[temporal: still scene]\n");
@@ -2044,12 +2167,12 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
     };
 
     // the last run repeats foveated temporal with per-pass timestamps (kept out of the table: they add a little)
-    enum { kOff, kBilinear, kFsr, kTemporalFull, kTemporalFov, kTemporalFovBil, kPerPass, kRuns };
-    const char *names[kRuns] = { "off", "bilinear", "fsr", "temporal, whole image", "temporal, area 0.6", "  + bilinear edges",
-                                 "per-pass timestamps" };
-    const char *modeIni[kRuns] = { "enabled=0\n", "mode=bilinear\n", "mode=fsr\n", "mode=temporal\n", "mode=temporal\n", "mode=temporal\n",
-                                   "mode=temporal\n" };
-    const char *areaIni[kRuns] = { "1", "1", "1", "1", "0.6", "0.6\nbilinearEdges=1", "0.6" };
+    enum { kOff, kBilinear, kFsr, kFsrFov, kTemporalFull, kTemporalFov, kTemporalFovBil, kPerPass, kRuns };
+    const char *names[kRuns] = { "off", "bilinear", "fsr, whole image", "fsr, area 0.6", "temporal, whole image", "temporal, area 0.6",
+                                 "  + bilinear edges", "per-pass timestamps" };
+    const char *modeIni[kRuns] = { "enabled=0\n", "mode=bilinear\n", "mode=fsr\n", "mode=fsr\n", "mode=temporal\n", "mode=temporal\n",
+                                   "mode=temporal\n", "mode=temporal\n" };
+    const char *areaIni[kRuns] = { "1", "1", "1", "0.6", "1", "0.6", "0.6\nbilinearEdges=1", "0.6" };
     double mean[kRuns] = {}, med[kRuns] = {};
     uint64_t newFrames[kRuns] = {};
     uint32_t serial = 1;
@@ -2175,6 +2298,9 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
         const double bil = med[kTemporalFovBil] - med[kOff];
         printf("         bilinear edges (area 0.6): %+.3f ms per frame (%+.0f%%)\n", bil - fov, fov > 0 ? 100.0 * (bil - fov) / fov : 0.0);
         CHECK(fov < full, "foveated temporal is cheaper than whole-image temporal (%.3f vs %.3f ms)", fov, full);
+        const double fsrFull = med[kFsr] - med[kOff], fsrFov = med[kFsrFov] - med[kOff];
+        printf("         FSR 1 in the area (0.6) costs %.0f%% of whole-image FSR 1\n", fsrFull > 0 ? 100.0 * fsrFov / fsrFull : 0.0);
+        CHECK(fsrFov < fsrFull, "FSR 1 in the area only is cheaper than over the whole image (%.3f vs %.3f ms)", fsrFov, fsrFull);
     }
     for (auto &q : ts) SafeRelease(q);
     for (auto &q : djf) SafeRelease(q);

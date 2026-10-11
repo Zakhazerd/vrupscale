@@ -237,7 +237,7 @@ void UpdateValueLabels()
         SetText(IDC_FACTORHINT, what + Fmt(L" VRChat will render at %d%% when it runs (with this app open).", pct));
     SetText(IDC_SHARPVAL, Pos(IDC_SHARP) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_SHARP) / 100.0f));
     SetText(IDC_AREAVAL, Pos(IDC_AREA) >= 100 ? std::wstring(L"all") : Fmt(L"%d%%", Pos(IDC_AREA)));
-    Enable(IDC_BILEDGES, g_s.mode == kVuModeTemporal && Pos(IDC_AREA) < 100);   // area "all": there are no edges
+    Enable(IDC_BILEDGES, g_s.mode != kVuModeBilinear && Pos(IDC_AREA) < 100);   // area "all": there are no edges
     SetText(IDC_HISTVAL, Fmt(L"%.2f", Pos(IDC_HIST) / 100.0f));
     SetText(IDC_MOVINGVAL, Pos(IDC_MOVING) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_MOVING) / 100.0f));
     SetText(IDC_TOLVAL, Fmt(L"%.2f", Pos(IDC_TOL) / 100.0f));
@@ -245,10 +245,13 @@ void UpdateValueLabels()
 
 void SyncListChecks();
 
+// The area the slider shows and edits: its own value while following the gaze.
+float ActiveArea() { return g_s.gazeFollow ? g_s.gazeArea : g_s.temporalArea; }
+
 // The Eye tracking card: what the tracker is doing, and the calibration.
 void UpdateGazeUi()
 {
-    const bool temporal = g_s.mode == kVuModeTemporal;
+    const bool areaModes = g_s.mode != kVuModeBilinear;   // Temporal and FSR 1 have the area
     const VuGazeInfo &gz = g_st.gaze;
     std::wstring st;
     if (g_live) {
@@ -258,12 +261,12 @@ void UpdateGazeUi()
             st = L"Bigscreen eye tracking found, but no gaze right now (headset off, or its client paused).";
         else if (!g_s.gazeFollow)
             st = Fmt(L"Bigscreen eye tracking, %.0f updates/s. Switch on Follow gaze to use it.", gz.rate);
-        else if (!temporal)
-            st = L"Following the gaze works in Temporal mode.";
-        else if (g_s.temporalArea >= 0.995f)
-            st = L"Temporal area is \"all\": nothing to move. Lower it to follow the gaze.";
+        else if (!areaModes)
+            st = L"Following the gaze works in Temporal and FSR 1 mode.";
+        else if (g_s.gazeArea >= 0.995f)
+            st = L"The area is \"all\": nothing to move. Lower it to follow the gaze.";
         else
-            st = Fmt(L"The temporal area follows your gaze (Bigscreen eye tracking, %.0f updates/s).", gz.rate);
+            st = Fmt(L"The area follows your gaze (Bigscreen eye tracking, %.0f updates/s).", gz.rate);
     } else {
         st = app::EyeTrackerPresent() ? L"Bigscreen eye tracking is running. It is used once SteamVR runs."
                                       : L"For Bigscreen Beyond 2e: start its Eyetracking client and switch on VRCFT there.";
@@ -283,9 +286,9 @@ void UpdateGazeUi()
     else
         cal = L"Not calibrated. Calibrate, then look at the cross in VR (or press Ctrl+F8 there).";
     SetText(IDC_CALSTATUS, cal);
-    Enable(IDC_GAZEFOLLOW, temporal);
-    Enable(IDC_GAZESHOW, temporal);
-    Enable(IDC_CALIBRATE, g_live && temporal && g_st.current.enabled && gz.live && gz.calState != kVuCalRunning);
+    Enable(IDC_GAZEFOLLOW, areaModes);
+    Enable(IDC_GAZESHOW, areaModes);
+    Enable(IDC_CALIBRATE, g_live && areaModes && g_st.current.enabled && gz.live && gz.calState != kVuCalRunning);
     Enable(IDC_CALCLEAR, calibrated);
 }
 
@@ -298,7 +301,7 @@ void ModelToUi()
     SetPos(IDC_SHARP, (int)lroundf(g_s.sharpness * 100));
     SetCheck(IDC_TINT, g_s.tint != 0);
     SetCheck(IDC_HOTKEYS, g_s.hotkeys != 0);
-    SetPos(IDC_AREA, (int)lroundf(g_s.temporalArea * 100));
+    SetPos(IDC_AREA, (int)lroundf(ActiveArea() * 100));
     SetPos(IDC_HIST, (int)lroundf(g_s.maxWeight * 100));
     SetPos(IDC_MOVING, (int)lroundf(g_s.localTrust * 100));
     SetPos(IDC_TOL, (int)lroundf(g_s.residualTol * 100));
@@ -308,10 +311,14 @@ void ModelToUi()
     SetCheck(IDC_GAZEFOLLOW, g_s.gazeFollow != 0);
     SetCheck(IDC_GAZESHOW, g_s.gazeShow != 0);
     const bool temporal = g_s.mode == kVuModeTemporal;
-    for (int id : { IDC_AREA, IDC_HIST, IDC_MOVING, IDC_TOL, IDC_SHARPHIST }) Enable(id, temporal);
-    SetText(IDC_AREAHINT, !temporal ? L"Used in Temporal mode only."
-                          : g_s.bilinearEdges ? L"Centre gets temporal detail, edges a bilinear upscale."
-                                              : L"Centre gets temporal detail, edges a fast spatial upscale.");
+    for (int id : { IDC_HIST, IDC_MOVING, IDC_TOL, IDC_SHARPHIST }) Enable(id, temporal);
+    Enable(IDC_AREA, g_s.mode != kVuModeBilinear);
+    {
+        const wchar_t *what = temporal ? L"temporal detail" : L"FSR 1", *rest = g_s.bilinearEdges ? L"a bilinear upscale" : L"a fast spatial upscale";
+        SetText(IDC_AREAHINT, g_s.mode == kVuModeBilinear ? std::wstring(L"Used in Temporal and FSR 1 mode.")
+                              : g_s.gazeFollow ? Fmt(L"Following your gaze (its own value): where you look gets %s, the rest %s.", what, rest)
+                                               : Fmt(L"Centre gets %s, edges %s.", what, rest));
+    }
     UpdateValueLabels();
     UpdateGazeUi();
     g_ui = false;
@@ -1417,8 +1424,8 @@ std::wstring TipText(int id, int part, std::wstring &title)
           L"most GPU time; the Temporal card tunes it. Ctrl+F2 in VR switches modes." },
         { L"FSR 1",
           L"AMD FidelityFX Super Resolution 1: each frame is upscaled and sharpened on its own (an edge-aware upscale, then "
-          L"RCAS). Nothing from earlier frames, so nothing can ghost, but no added detail and more shimmer than Temporal. "
-          L"Cheaper." },
+          L"RCAS), inside the same area Temporal uses; the rest gets a fast spatial upscale. Nothing from earlier frames, "
+          L"so nothing can ghost, but no added detail and more shimmer than Temporal. Cheaper." },
         { L"Bilinear", L"A plain bilinear upscale with no sharpening: to compare the other modes against." },
     };
     static const wchar_t *const kScaleTip[kVuScaleCount][2] = {
@@ -1478,8 +1485,8 @@ std::wstring TipText(int id, int part, std::wstring &title)
                L"Default 1.00. Ctrl+F4 in VR steps through 0, 0.25, 0.5, 0.75 and 1.";
     case IDC_TINT:
         title = L"Debug tint";
-        return L"Tints everything vrupscale processes: magenta where it upscales, and in Temporal mode blue on the edges "
-               L"that get the fast spatial upscale. Use it to check that only the world is upscaled, not SteamVR's menus or "
+        return L"Tints everything vrupscale processes: magenta where it upscales, and in Temporal and FSR 1 mode blue on "
+               L"the edges outside the area, which get the fast spatial upscale. Use it to check that only the world is upscaled, not SteamVR's menus or "
                L"overlays (untick those in the Textures list). Ctrl+F3 in VR.";
     case IDC_HOTKEYS:
         title = L"Shortcuts in VR";
@@ -1487,11 +1494,13 @@ std::wstring TipText(int id, int part, std::wstring &title)
                L"F5 next scaling preset, F6 Sharp history, F7 Bilinear edges, F8 calibrate the eye tracking. The app's "
                L"controls follow along and save the change.";
     case IDC_AREA:
-        title = L"Temporal area";
-        return L"The width and height of the part of each eye's picture that gets history and motion estimation. 60% covers "
-               L"about a third of the pixels: the lens's sharp centre, where you look most. The rest gets a fast spatial "
-               L"upscale, and a soft band blends the two. The main cost control: smaller is cheaper; all turns this off. "
-               L"Default 60%. Changing it rebuilds the histories (a brief hitch).";
+        title = g_s.gazeFollow ? L"Temporal area, following your gaze" : L"Temporal area";
+        return L"The width and height of the part of each eye's picture that gets the full treatment: history and motion "
+               L"estimation in Temporal mode, FSR 1 in FSR 1 mode. The rest gets a fast spatial upscale, and a soft band "
+               L"blends the two. The main cost control: smaller is cheaper; all turns this off.\n\nIt has two values: "
+               L"60% by default, centred (about a third of the pixels, the lens's sharp centre), and 40% while Follow gaze "
+               L"is on, since the area then sits wherever you look. The slider shows and sets the one for the Follow gaze "
+               L"switch's state. Changing it rebuilds the histories (a brief hitch).";
     case IDC_HIST:
         title = L"History strength";
         return L"How much the earlier frames may count. Each output pixel mixes this frame with the history, and the "
@@ -1520,15 +1529,16 @@ std::wstring TipText(int id, int part, std::wstring &title)
                L"36 texture reads per pixel instead of 5. Default off. Ctrl+F6 in VR.";
     case IDC_BILEDGES:
         title = L"Bilinear edges";
-        return L"Outside the temporal area, a plain bilinear upscale instead of Catmull-Rom: softer at the edges, where the "
-               L"lenses blur the most anyway, and cheaper. The centre is untouched, and the blend band still hides the border. "
+        return L"Outside the area (Temporal and FSR 1 mode), a plain bilinear upscale instead of Catmull-Rom: softer at the "
+               L"edges, where the lenses blur the most anyway, and cheaper. The centre is untouched, and the blend band still hides the border. "
                L"Greyed out when Temporal area is all (there are no edges). Default off. Ctrl+F7 in VR.";
     case IDC_GAZEFOLLOW:
         title = L"Follow gaze";
-        return L"Bigscreen Beyond 2e eye tracking: the temporal area moves to where you look, so the sharp, steady part of "
-               L"the picture is wherever your eyes are. It moves once your gaze leaves a small zone around the area's centre "
-               L"(2% of the width); the strip it uncovers catches up within a few frames. Needs Bigscreen's eye tracking "
-               L"client with its VRCFT output on.";
+        return L"Bigscreen Beyond 2e eye tracking: the area (temporal detail, or FSR 1) moves to where you look, so the "
+               L"sharp part of the picture is wherever your eyes are. It moves once your gaze leaves a small zone around the "
+               L"area's centre (2% of the width); in Temporal mode the strip it uncovers catches up within a few frames. "
+               L"While following, the area has its own size, 40% by default (the Temporal area slider sets it). Needs "
+               L"Bigscreen's eye tracking client with its VRCFT output on.";
     case IDC_GAZESHOW:
         title = L"Show gaze";
         return L"Draws a green ring in VR where vrupscale thinks you look. Use it to check the calibration: the ring should "
@@ -1537,7 +1547,7 @@ std::wstring TipText(int id, int part, std::wstring &title)
         title = L"Calibrate";
         return L"A cross appears straight ahead in both eyes: look at its centre until it goes (about 3 seconds). The "
                L"tracker's reading then becomes the offset taken off every later reading, so that straight ahead lines up. "
-               L"If your gaze wandered it fails and keeps the old calibration. Needs Temporal mode and live eye tracking. "
+               L"If your gaze wandered it fails and keeps the old calibration. Needs Temporal or FSR 1 mode and live eye tracking. "
                L"Ctrl+F8 in VR.";
     case IDC_CALCLEAR:
         title = L"Clear calibration";
@@ -1816,11 +1826,12 @@ void OnSlider(int id, bool tracking)
         Changed(false);
     } else if (id == IDC_AREA) {
         // A new area re-plans the histories: sent once the slider is let go and has settled
-        // (keys move it in steps).
+        // (keys move it in steps). It is the value for the current Follow gaze state.
         if (tracking) return;
         float a = Pos(IDC_AREA) / 100.0f;
-        if (fabsf(a - g_s.temporalArea) > 0.004f) {
-            g_s.temporalArea = a;
+        float &area = g_s.gazeFollow ? g_s.gazeArea : g_s.temporalArea;
+        if (fabsf(a - area) > 0.004f) {
+            area = a;
             g_lastEdit = GetTickCount();
             g_replanPending = true;
             SetTimer(g_wnd, TIMER_REPLAN, 400, nullptr);
@@ -1899,7 +1910,7 @@ void OnToggle(int id)
     case IDC_SHARPHIST: g_s.fastHistory = w->on ? 0 : 1; Changed(true); break;
     case IDC_BILEDGES: g_s.bilinearEdges = w->on; ModelToUi(); Changed(true); break;
     case IDC_GAMERES: OnGameResToggle(w->on); break;
-    case IDC_GAZEFOLLOW: g_s.gazeFollow = w->on; Changed(true); UpdateGazeUi(); break;
+    case IDC_GAZEFOLLOW: g_s.gazeFollow = w->on; ModelToUi(); Changed(true); break;   // (the area shows its value for this state)
     case IDC_GAZESHOW: g_s.gazeShow = w->on; Changed(true); break;
     }
 }

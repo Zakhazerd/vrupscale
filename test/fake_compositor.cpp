@@ -697,7 +697,9 @@ int main(int argc, char **argv)
 
     // ================= 2. FSR mode
     printf("[fsr mode]\n");
-    snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=fsr\nupscaleFactor=%.2f\nsharpness=0.5\ndedupeMs=3\n", kIniBase, reqShared, F);
+    // (FSR 1 over the whole image here: the area has its own test)
+    snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=fsr\nupscaleFactor=%.2f\nsharpness=0.5\ndedupeMs=3\n[temporal]\ntemporalArea=1\n",
+             kIniBase, reqShared, F);
     WriteIni(ini);
     Pump(g);
     LONG upBefore = Stats().upscales;
@@ -1049,7 +1051,8 @@ int main(int argc, char **argv)
 
     // ================= 8. tint + disable
     printf("[debug tint, enabled=0]\n");
-    snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=fsr\nupscaleFactor=%.2f\nsharpness=0.5\ndebugTint=1\n", kIniBase, reqShared, F);
+    snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=fsr\nupscaleFactor=%.2f\nsharpness=0.5\ndebugTint=1\n[temporal]\ntemporalArea=1\n",
+             kIniBase, reqShared, F);
     WriteIni(ini);
     Pump(g);
     Sleep(10);

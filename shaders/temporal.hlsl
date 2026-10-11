@@ -321,10 +321,11 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
 #elif TPASS == TP_SDECIDE
 
 // Spatial path: upscale only if this texture range's content changed since its proxy was written
-// (or a setting changed: TF_FORCE). Strides.xyz = the upscale passes' group counts.
+// (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the passes over the area
+// (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2).
 ByteAddressBuffer   Fp : register(t0);
 RWByteAddressBuffer Gate : register(u0);   // 0: fingerprint the proxy shows (x, y), 8: valid, 12: updates, 16: checks
-RWByteAddressBuffer Args : register(u1);   // two indirect-dispatch entries
+RWByteAddressBuffer Args : register(u1);   // three indirect-dispatch entries
 
 [numthreads(1, 1, 1)]
 void main()
@@ -335,6 +336,7 @@ void main()
     uint3 g = isNew ? Strides.xyz : uint3(0, 0, 0);
     Args.Store3(0, g);
     Args.Store3(12, g);
+    Args.Store3(24, isNew ? uint3(Size23.xy, Strides.z) : uint3(0, 0, 0));
     Gate.Store2(0, fp);
     Gate.Store(8, 1u);
     Gate.Store(12, Gate.Load(12) + (isNew ? 1u : 0u));

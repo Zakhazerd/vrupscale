@@ -92,6 +92,7 @@ void ConfigToSettings(const Config &c, VuSettings &s)
     s.clipGamma = c.clipGamma;
     s.maxStreams = c.maxStreams;
     s.temporalArea = c.temporalArea;
+    s.gazeArea = c.gazeArea;
     s.requireShared = c.requireShared;
     s.minWidth = c.minWidth;
     s.minHeight = c.minHeight;
@@ -124,6 +125,7 @@ void SettingsToConfig(const VuSettings &s, Config &c)
     c.clipGamma = s.clipGamma;
     c.maxStreams = s.maxStreams;
     c.temporalArea = s.temporalArea;
+    if (s.gazeArea > 0.0f) c.gazeArea = s.gazeArea;   // (0: an app from before 0.6.1)
     c.requireShared = s.requireShared != 0;
     c.minWidth = s.minWidth;
     c.minHeight = s.minHeight;

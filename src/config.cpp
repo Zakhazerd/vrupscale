@@ -135,6 +135,7 @@ bool LoadConfig(Config &c)
             memcpy(c.eyeProj, v, sizeof(v));
     }
     c.temporalArea = ReadFloat(L"temporal", L"temporalArea", d.temporalArea);
+    c.gazeArea = ReadFloat(L"temporal", L"gazeArea", d.gazeArea);
     c.maxStreams = ReadInt(L"temporal", L"maxStreams", d.maxStreams);
     c.linkPools = ReadBool(L"temporal", L"linkPools", d.linkPools);
     c.linkGapMs = ReadFloat(L"temporal", L"linkGapMs", d.linkGapMs);
@@ -166,9 +167,10 @@ void SanitizeConfig(Config &c)
     fin(c.clipGamma, d.clipGamma); fin(c.residualTol, d.residualTol); fin(c.sampleSigma, d.sampleSigma);
     fin(c.minNewWeight, d.minNewWeight); fin(c.lkEps, d.lkEps); fin(c.searchLambda, d.searchLambda);
     fin(c.clipReject, d.clipReject); fin(c.localTrust, d.localTrust); fin(c.localGate, d.localGate);
-    fin(c.localRatio, d.localRatio); fin(c.temporalArea, d.temporalArea); fin(c.linkGapMs, d.linkGapMs);
+    fin(c.localRatio, d.localRatio); fin(c.temporalArea, d.temporalArea); fin(c.gazeArea, d.gazeArea); fin(c.linkGapMs, d.linkGapMs);
     c.upscaleFactor = roundf(c.upscaleFactor * 100.0f) / 100.0f;
     c.temporalArea = roundf(c.temporalArea * 100.0f) / 100.0f;
+    c.gazeArea = roundf(c.gazeArea * 100.0f) / 100.0f;
     if (c.upscaleFactor < 1.0f) c.upscaleFactor = 1.0f;
     if (c.upscaleFactor > 3.0f) c.upscaleFactor = 3.0f;
     if (c.sharpness < 0.0f) c.sharpness = 0.0f;
@@ -198,6 +200,7 @@ void SanitizeConfig(Config &c)
     if (c.localGate < 0.0f) c.localGate = 0.0f;
     c.localRatio = c.localRatio < 0.1f ? 0.1f : (c.localRatio > 1.0f ? 1.0f : c.localRatio);
     c.temporalArea = c.temporalArea < 0.3f ? 0.3f : (c.temporalArea > 1.0f ? 1.0f : c.temporalArea);
+    c.gazeArea = c.gazeArea < 0.3f ? 0.3f : (c.gazeArea > 1.0f ? 1.0f : c.gazeArea);
     if (c.maxStreams < 0) c.maxStreams = 0;
     if (c.maxStreams > 16) c.maxStreams = 16;
     if (c.linkGapMs < 0.0f) c.linkGapMs = 0.0f;
@@ -213,10 +216,10 @@ void PrintConfig(const Config &c)
          c.active, c.enabled, ModeName(c.mode), c.upscaleFactor, c.sharpness, c.dedupeMs, c.tint, c.sharpHistory, c.bilinearEdges,
          c.gazeFollow, c.gazeShow, c.gazeOffset[0], c.gazeOffset[1]);
     LOGI("config: temporal maxWeight=%.1f clipGamma=%.2f residualTol=%.3f sampleSigma=%.2f minNewWeight=%.3f lkEps=%.4f "
-         "searchLambda=%.4f clipReject=%.2f localTrust=%.2f localGate=%.2f localRatio=%.2f temporalArea=%.2f maxStreams=%d "
+         "searchLambda=%.4f clipReject=%.2f localTrust=%.2f localGate=%.2f localRatio=%.2f temporalArea=%.2f gazeArea=%.2f maxStreams=%d "
          "linkPools=%d linkGapMs=%.1f detectContent=%d probeWindowMs=%d",
          c.maxWeight, c.clipGamma, c.residualTol, c.sampleSigma, c.minNewWeight, c.lkEps, c.searchLambda, c.clipReject,
-         c.localTrust, c.localGate, c.localRatio, c.temporalArea, c.maxStreams, c.linkPools, c.linkGapMs, c.detectContent,
+         c.localTrust, c.localGate, c.localRatio, c.temporalArea, c.gazeArea, c.maxStreams, c.linkPools, c.linkGapMs, c.detectContent,
          c.probeWindowMs);
     LOGI("config: match min=%dx%d aspect=[%.2f, %.2f] requireShared=%d followCopies=%d maxArraySize=%d onlySizes=%zu excludeSizes=%zu",
          c.minWidth, c.minHeight, c.minAspect, c.maxAspect, c.requireShared, c.followCopies, c.maxArraySize,

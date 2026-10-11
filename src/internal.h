@@ -150,6 +150,8 @@ public:
     int nlinks = 0;
     ContentGate gates[3];     // spatial path: [0] the whole texture, [1 + i] links[i]'s slices
     Ref<ContentProbe> probe;  // created on first use
+    struct Area { UINT x = 0, y = 0, w = 0, h = 0; bool valid = false; };
+    Area area[2];             // spatial path: where the area is in each of (up to) two slices, in the picture
 protected:
     ~TexState() override;
 };
@@ -251,10 +253,22 @@ bool CreateGateResources(DevState *ds);
 bool EnsureGate(DevState *ds, ContentGate &g);
 void ReleaseGate(ContentGate &g);
 // Fingerprints the source slices and compares them with what the gate's proxy shows. Leaves the
-// indirect args (2 entries of gx, gy, gz, or zeros when unchanged) in ds->gateArgs. Binds the
-// temporal constant buffer. False: could not run (dispatch directly instead).
+// indirect args (2 entries of gx, gy, gz and one of gx2, gy2, gz; zeros when unchanged) in
+// ds->gateArgs. Binds the temporal constant buffer. False: could not run (dispatch directly instead).
 bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11ShaderResourceView *src, UINT first,
-                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz);
+                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2);
+// The spatial path's area (FSR 1 inside, a cheap upscale outside): the size and placement rules of
+// a stream's region (temporal.cpp's PlanRegion / PlaceRegion), for the slices first.. of a texture
+// in its picture. side: the eye when the texture is not an array of both (-1 unknown). Fills the
+// gaze markers as well. False: no area (it is everything, or more than two slices).
+struct SpatialArea {
+    UINT band = 0;
+    UINT content[4] = {};               // the picture in the proxy: x0, y0, x1, y1
+    UINT region[2][4] = {};             // per slice: x, y, w, h (proxy px)
+    uint32_t marks[2][4] = { { ~0u, ~0u, ~0u, ~0u }, { ~0u, ~0u, ~0u, ~0u } };
+};
+bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialArea &a);
+
 // Content rectangles: reads finished observation windows and starts new ones (render tick).
 void PollProbes(ID3D11DeviceContext *ctx, ID3D11Device *dev);
 // The vrupscale app changed the game's render resolution (SteamVR's resolution) just now: for a few

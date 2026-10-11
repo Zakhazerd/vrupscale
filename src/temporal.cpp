@@ -324,21 +324,26 @@ int CurrentStreams()
     return n;
 }
 
-// The centred output rectangle that keeps history: temporalArea of the width and height, in whole
-// 16-pixel accumulation tiles; nearly everything becomes everything (no thin spatial rim).
+// One side of the area: `area` of the output, in whole 16-pixel tiles; nearly everything becomes
+// everything (no thin spatial rim).
+UINT AreaSide(UINT out, float area)
+{
+    if (area >= 0.999f) return out;
+    const UINT r = ((UINT)ceilf((float)out * area / 16.0f)) * 16;
+    return r + 32 >= out ? out : r;
+}
+
+UINT AreaBand(UINT outW, UINT outH) { return std::max(16u, (UINT)lroundf(0.02f * (float)std::min(outW, outH))); }
+
+// The centred output rectangle that keeps history: the area of the width and height.
 void PlanRegion(Stream *s, float area)
 {
-    auto side = [&](UINT out) -> UINT {
-        if (area >= 0.999f) return out;
-        UINT r = ((UINT)ceilf((float)out * area / 16.0f)) * 16;
-        return r + 32 >= out ? out : r;
-    };
-    s->rw = side(s->outW);
-    s->rh = side(s->outH);
+    s->rw = AreaSide(s->outW, area);
+    s->rh = AreaSide(s->outH, area);
     s->rx = (s->outW - s->rw) / 2;
     s->ry = (s->outH - s->rh) / 2;
     s->foveated = s->rw < s->outW || s->rh < s->outH;
-    s->band = s->foveated ? std::max(16u, (UINT)lroundf(0.02f * (float)std::min(s->outW, s->outH))) : 0u;
+    s->band = s->foveated ? AreaBand(s->outW, s->outH) : 0u;
 }
 
 // Returns a stream holding two references (one for the list, one for the caller's link).
@@ -363,7 +368,7 @@ Stream *CreateStream(DevState *ds, const TexState *ts, UINT count, const OutSig 
     s->scaleY = ts->plan.scaleY;
     s->xform = ts->plan.xform;
     s->sig = sig;
-    PlanRegion(s, g_cfg.temporalArea);
+    PlanRegion(s, RegionArea(g_cfg));
     s->lw[0] = s->w;
     s->lh[0] = s->h;
     for (int l = 1; l < 5; ++l) {
@@ -939,6 +944,55 @@ void PlaceRegion(Stream *s, int side, TParams &p)
     }
 }
 
+} // namespace
+
+bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialArea &a)
+{
+    const LinkGeo g = ContentGeo(ts);
+    a.content[0] = g.ox; a.content[1] = g.oy; a.content[2] = g.ox + g.outW; a.content[3] = g.oy + g.outH;
+    const UINT rw = AreaSide(g.outW, RegionArea(g_cfg)), rh = AreaSide(g.outH, RegionArea(g_cfg));
+    const bool on = (rw < g.outW || rh < g.outH) && count <= 2;
+    a.band = on ? AreaBand(g.outW, g.outH) : 0u;
+    for (UINT z = 0; z < std::min(count, 2u); ++z) {
+        // the eye: an array of both holds it in its slice, otherwise the viewport said
+        const int eye = (ts->src.ArraySize == 2 && first + z < 2) ? (int)(first + z) : side;
+        TexState::Area &st = ts->area[z];
+        if (!st.valid || st.w != rw || st.h != rh) {   // (a new size or picture: centred)
+            st.x = (g.outW - rw) / 2;
+            st.y = (g.outH - rh) / 2;
+            st.w = rw;
+            st.h = rh;
+            st.valid = true;
+        }
+        float u = 0, v = 0;
+        const bool live = GazePoint(eye, &u, &v);
+        if (!g_cfg.gazeFollow) {
+            st.x = (g.outW - rw) / 2;
+            st.y = (g.outH - rh) / 2;
+        } else if (live) {   // as a stream's region: moves once the gaze leaves a small zone around its centre
+            const float cx = u * (float)g.outW, cy = v * (float)g.outH, dead = g_cfg.gazeDeadzone * (float)g.outW;
+            if (fabsf(cx - (st.x + 0.5f * rw)) > dead || fabsf(cy - (st.y + 0.5f * rh)) > dead) {
+                const long x = lroundf(cx - 0.5f * rw), y = lroundf(cy - 0.5f * rh);
+                st.x = (UINT)std::max(0L, std::min(x, (long)(g.outW - rw)));
+                st.y = (UINT)std::max(0L, std::min(y, (long)(g.outH - rh)));
+            }
+        }
+        a.region[z][0] = g.ox + st.x; a.region[z][1] = g.oy + st.y; a.region[z][2] = rw; a.region[z][3] = rh;
+        if (live && GazeShowRing()) {
+            a.marks[z][0] = g.ox + (uint32_t)lroundf(u * g.outW);
+            a.marks[z][1] = g.oy + (uint32_t)lroundf(v * g.outH);
+        }
+        if (GazeCalibrating()) {
+            GazeTarget(eye, &u, &v);
+            a.marks[z][2] = g.ox + (uint32_t)lroundf(u * g.outW);
+            a.marks[z][3] = g.oy + (uint32_t)lroundf(v * g.outH);
+        }
+    }
+    return on;
+}
+
+namespace {
+
 // Which grid cells the motion passes cover: the input footprint of the output region plus a
 // margin for their windows and for the flow interpolation in ACCUM.
 void FillRegionParams(const Stream *s, bool localSearch, TParams &p)
@@ -1166,7 +1220,7 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
 bool CreateGateResources(DevState *ds)
 {
     Buf fp, args;
-    if (!CreateRaw(ds->dev.Get(), fp, 16, true, false) || !CreateRaw(ds->dev.Get(), args, 32, false, true)) return false;
+    if (!CreateRaw(ds->dev.Get(), fp, 16, true, false) || !CreateRaw(ds->dev.Get(), args, 48, false, true)) return false;
     ds->gateFp = fp.buf;
     ds->gateFpSRV = fp.srv;
     ds->gateFpUAV = fp.uav;
@@ -1194,7 +1248,7 @@ void ReleaseGate(ContentGate &g)
 }
 
 bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11ShaderResourceView *src, UINT first,
-                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz)
+                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2)
 {
     if (!ds->gateFpUAV || !EnsureGate(ds, g)) return false;
     const UINT w = ts->src.Width, h = ts->src.Height;
@@ -1208,6 +1262,7 @@ bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11
     if (probe) p.misc[1] |= (probe->primed & sliceMask) == sliceMask ? TF_PROBE : TF_PRIME;
     p.misc[2] = count;
     p.strides[0] = gx; p.strides[1] = gy; p.strides[2] = gz;
+    p.size23[0] = gx2; p.size23[1] = gy2;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx->Map(ds->tcb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
     memcpy(m.pData, &p, sizeof(p));

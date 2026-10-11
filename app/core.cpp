@@ -85,6 +85,7 @@ VuSettings DefaultSettings()
     s.clipGamma = 1.25f;
     s.maxStreams = 4;
     s.temporalArea = 0.6f;
+    s.gazeArea = 0.4f;   // following the gaze: it is where you look, so less does
     s.requireShared = 1;
     s.minWidth = 1000;
     s.minHeight = 1000;
@@ -142,6 +143,7 @@ static void Clamp(VuSettings &s)
     s.localTrust = cl(s.localTrust, 0.0f, 1.0f);
     s.residualTol = cl(s.residualTol, 0.05f, 10.0f);
     s.temporalArea = roundf(cl(s.temporalArea, 0.3f, 1.0f) * 100.0f) / 100.0f;
+    s.gazeArea = roundf(cl(s.gazeArea, 0.3f, 1.0f) * 100.0f) / 100.0f;
     s.upscaleFactor = roundf(s.upscaleFactor * 100.0f) / 100.0f;
     if (s.mode < 0 || s.mode > 2) s.mode = kVuModeTemporal;
     if (s.excludeCount < 0) s.excludeCount = 0;
@@ -183,6 +185,7 @@ bool LoadSettings(const std::wstring &p, VuSettings &s, bool *adjusted)
     }
     IniInt(p, L"temporal", L"maxStreams", s.maxStreams);
     IniFloat(p, L"temporal", L"temporalArea", s.temporalArea);
+    IniFloat(p, L"temporal", L"gazeArea", s.gazeArea);
     IniBool(p, L"match", L"requireShared", s.requireShared);
     IniInt(p, L"match", L"minWidth", s.minWidth);
     IniInt(p, L"match", L"minHeight", s.minHeight);
@@ -246,6 +249,7 @@ bool SaveSettings(const std::wstring &p, const VuSettings &s)
     put(L"temporal", L"localTrust", Fmt(L"%.2f", s.localTrust));
     put(L"temporal", L"residualTol", Fmt(L"%.2f", s.residualTol));
     put(L"temporal", L"temporalArea", Fmt(L"%.2f", s.temporalArea));
+    put(L"temporal", L"gazeArea", Fmt(L"%.2f", s.gazeArea));
     put(L"temporal", L"sharpHistory", s.fastHistory ? L"0" : L"1");
     put(L"temporal", L"bilinearEdges", s.bilinearEdges ? L"1" : L"0");
     put(L"eyes", L"followGaze", s.gazeFollow ? L"1" : L"0");
@@ -278,7 +282,7 @@ bool SameSettings(const VuSettings &a, const VuSettings &b)
         !feq(a.sharpness, b.sharpness) ||
         a.tint != b.tint || a.hotkeys != b.hotkeys ||
         !feq(a.maxWeight, b.maxWeight) || !feq(a.localTrust, b.localTrust) || !feq(a.residualTol, b.residualTol) ||
-        !feq(a.temporalArea, b.temporalArea) || a.excludeCount != b.excludeCount)
+        !feq(a.temporalArea, b.temporalArea) || !feq(a.gazeArea, b.gazeArea) || a.excludeCount != b.excludeCount)
         return false;
     for (int i = 0; i < a.excludeCount; ++i)
         if (a.exclude[i] != b.exclude[i]) return false;
@@ -315,6 +319,7 @@ bool SetSettingByName(VuSettings &s, const std::wstring &key, const std::wstring
     else if (key == L"localTrust") s.localTrust = f;
     else if (key == L"residualTol") s.residualTol = f;
     else if (key == L"temporalArea") s.temporalArea = f;
+    else if (key == L"gazeArea") s.gazeArea = f;
     else if (key == L"excludeSizes") {
         s.excludeCount = 0;
         size_t a = 0;

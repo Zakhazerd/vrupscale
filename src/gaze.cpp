@@ -251,8 +251,8 @@ bool GazeStartCalibration(const char *by)
     const LONGLONG now = Now();
     AcquireSRWLockExclusive(&g_lock);
     bool ok = false;
-    if (g_cfg.mode != Mode::Temporal || !g_cfg.enabled)
-        snprintf(g_calMsg, sizeof(g_calMsg), "Calibration needs upscaling on, in Temporal mode (the cross is drawn there).");
+    if (g_cfg.mode == Mode::Bilinear || !g_cfg.enabled)
+        snprintf(g_calMsg, sizeof(g_calMsg), "Calibration needs upscaling on, in Temporal or FSR 1 mode (the cross is drawn there).");
     else if (!g_view)
         snprintf(g_calMsg, sizeof(g_calMsg), "Calibration needs eye tracking: no data from the Beyond eye tracking client.");
     else if (!Live(now))
@@ -315,7 +315,7 @@ void GazeFillStatus(VuGazeInfo &g)
     g.rate = g.live ? g_rate : 0.0f;
     g.x = g_x;
     g.y = g_y;
-    g.following = g.live && g_cfg.gazeFollow && g_cfg.mode == Mode::Temporal && g_cfg.temporalArea < 0.995f;
+    g.following = g.live && g_cfg.gazeFollow && g_cfg.mode != Mode::Bilinear && g_cfg.gazeArea < 0.995f;
     g.calState = g_calState;
     g.calProgress = g_calState == kVuCalRunning ? (float)std::min(1.0, Seconds(g_calStart, now) / kCalEnd) : 0.0f;
     snprintf(g.calMessage, sizeof(g.calMessage), "%s", g_calMsg);

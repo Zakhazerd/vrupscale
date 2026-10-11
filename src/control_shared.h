@@ -92,7 +92,8 @@ typedef struct VuSettings {
     float gazeOffset[2];          // calibration: subtracted from the gaze direction's tangents (x right, y up)
     float eyeProj[8];             // each eye's projection as SteamVR reports it (tangents left, right, top, bottom;
                                   // left eye, then right); all 0 = not known yet
-    int32_t reserved[16];
+    float gazeArea;               // the area while Follow gaze is on (since 0.6.1; 0 from an older app = the default)
+    int32_t reserved[15];
 } VuSettings;
 
 typedef struct VuTexInfo {

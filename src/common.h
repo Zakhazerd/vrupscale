@@ -15,7 +15,7 @@
 #include <vector>
 #include <utility>
 
-#define VU_VERSION_STR "0.6.0"
+#define VU_VERSION_STR "0.6.1"
 
 namespace vu {
 
@@ -116,13 +116,18 @@ struct Config {
     float gazeOffset[2] = {};        // calibration (tangents, x right, y up), subtracted from the gaze
     float eyeProj[8] = {};           // per-eye projection tangents l, r, t, b (left, right eye), from SteamVR via the app
     float gazeDeadzone = 0.02f;      // the area moves once the gaze is this far (fraction of the width) from its centre
-    float temporalArea = 0.6f;       // width and height of the centred part with history (1 = everything)
+    float temporalArea = 0.6f;       // width and height of the part with history / FSR 1 (1 = everything) ...
+    float gazeArea = 0.4f;           // ... and the same while it follows the gaze (it is where you look: smaller does)
     int maxStreams = 4;              // temporal histories (one per eye texture lineage)
     bool linkPools = true;           // let rotating swap-chain textures of one eye share history
     float linkGapMs = 2.0f;          // never link textures bound closer together than this
     int probeWindowMs = 500;         // content (render size) detection: length of one observation window
     bool detectContent = true;       // find the part of each eye texture the game renders into
 };
+
+// The area that gets the full treatment (history in Temporal mode, FSR 1 in FSR mode): its own
+// value while it follows the gaze.
+inline float RegionArea(const Config &c) { return c.gazeFollow ? c.gazeArea : c.temporalArea; }
 
 extern Config g_cfg;
 extern volatile LONG g_cfgGen;       // bumped on every (re)load; invalidates cached decisions

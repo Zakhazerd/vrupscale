@@ -14,6 +14,9 @@
     X(FSR_BILIN_X0,    "upscale.hlsl",  "PASS=2;XFORM=0")                     \
     X(FSR_BILIN_X1,    "upscale.hlsl",  "PASS=2;XFORM=1")                     \
     X(FSR_BILIN_X2,    "upscale.hlsl",  "PASS=2;XFORM=2")                     \
+    X(FSR_OUTER_X0,    "upscale.hlsl",  "PASS=3;XFORM=0")                     \
+    X(FSR_OUTER_X1,    "upscale.hlsl",  "PASS=3;XFORM=1")                     \
+    X(FSR_OUTER_X2,    "upscale.hlsl",  "PASS=3;XFORM=2")                     \
     /* temporal path (shaders/temporal.hlsl) */                               \
     X(T_LUMA_X0,       "temporal.hlsl", "TPASS=0;XFORM=0")                    \
     X(T_LUMA_X1,       "temporal.hlsl", "TPASS=0;XFORM=1")                    \
