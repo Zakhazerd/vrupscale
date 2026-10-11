@@ -1,0 +1,37 @@
+#include <winver.h>
+#include <winuser.h>
+1 ICON "vrupscale.ico"
+// the app's typeface: Rubik (SIL OFL 1.1), built by tools/fonts.py
+201 RCDATA "fonts/rubik-400.ttf"
+202 RCDATA "fonts/rubik-500.ttf"
+203 RCDATA "fonts/rubik-700.ttf"
+204 RCDATA "fonts/rubik-800.ttf"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION VU_RC_VERSION
+PRODUCTVERSION VU_RC_VERSION
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "vrupscale"
+            VALUE "FileDescription", "vrupscale: install and control the SteamVR compositor upscaler"
+            VALUE "FileVersion", VU_RC_VERSION_STR
+            VALUE "InternalName", "vrupscale.exe"
+            VALUE "OriginalFilename", "vrupscale.exe"
+            VALUE "ProductName", "vrupscale"
+            VALUE "ProductVersion", VU_RC_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

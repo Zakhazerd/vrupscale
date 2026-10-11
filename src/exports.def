@@ -1,0 +1,34 @@
+LIBRARY dxgi.dll
+EXPORTS
+    CreateDXGIFactory = vu_thunk_CreateDXGIFactory
+    CreateDXGIFactory1 = vu_thunk_CreateDXGIFactory1
+    CreateDXGIFactory2 = vu_thunk_CreateDXGIFactory2
+    DXGIGetDebugInterface1 = vu_thunk_DXGIGetDebugInterface1
+    DXGIDeclareAdapterRemovalSupport = vu_thunk_DXGIDeclareAdapterRemovalSupport
+    DXGIDisableVBlankVirtualization = vu_thunk_DXGIDisableVBlankVirtualization
+    DXGID3D10CreateDevice = vu_thunk_DXGID3D10CreateDevice
+    DXGID3D10CreateLayeredDevice = vu_thunk_DXGID3D10CreateLayeredDevice
+    DXGID3D10ETWRundown = vu_thunk_DXGID3D10ETWRundown
+    DXGID3D10GetLayeredDeviceSize = vu_thunk_DXGID3D10GetLayeredDeviceSize
+    DXGID3D10RegisterLayers = vu_thunk_DXGID3D10RegisterLayers
+    DXGIDumpJournal = vu_thunk_DXGIDumpJournal
+    DXGIReportAdapterConfiguration = vu_thunk_DXGIReportAdapterConfiguration
+    CompatString = vu_thunk_CompatString
+    CompatValue = vu_thunk_CompatValue
+    ApplyCompatResolutionQuirking = vu_thunk_ApplyCompatResolutionQuirking
+    SetAppCompatStringPointer = vu_thunk_SetAppCompatStringPointer
+    UpdateHMDEmulationStatus = vu_thunk_UpdateHMDEmulationStatus
+    PIXBeginCapture = vu_thunk_PIXBeginCapture
+    PIXEndCapture = vu_thunk_PIXEndCapture
+    PIXGetCaptureState = vu_thunk_PIXGetCaptureState
+    VrUpscaleVersion
+    VrUpscaleGetStats
+    VrUpscaleRequestReload
+    VrUpscaleDebugStream
+    VrUpscaleDebugFlow
+    VrUpscaleDebugForceFlow
+    VrUpscaleDebugPassTimes
+    VrUpscaleDebugGate
+    VrUpscaleDebugHotkey
+    VrUpscaleDebugContent
+    VrUpscaleDebugPools
