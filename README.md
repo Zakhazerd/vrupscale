@@ -349,7 +349,7 @@ Tests: `test/fake_compositor.cpp` (+ `test/temporal_tests.inc`) is the functiona
 
 The app also has command-line modes for scripting: `--install [--force]`, `--uninstall`, `--steamvr <folder>`, `--set key=value`, `--status-file <file>`, `--settings <ini>`, `--channel <name>`; and self-tests: `--test-update` (the updater's zip reader, hash and version comparison), `--check-update` (asks GitHub, or `VRUPSCALE_UPDATE_URL`, and reports), `--test-game-resolution`, each with `--report <file>`.
 
-Releases: set `VU_VERSION_STR` in `src/common.h`, add a `### What changed in <version>` section to this README (it becomes the release's notes, which the app's Update button shows), commit, and push a tag `v<version>`. GitHub Actions (`.github/workflows/release.yml`) then builds everything with MinGW-w64 on Ubuntu and publishes the release: `vrupscale-<version>.zip`, its `.sha256`, and the source zip. The app's updater looks for exactly those names.
+Releases: set `VU_VERSION_STR` in `src/common.h`, add a `### What changed in <version>` section to this README (it becomes the release's notes, which the app's Update button shows), and push to `main`. When `main` has a version without a release, GitHub Actions (`.github/workflows/release.yml`) builds everything with MinGW-w64 on Ubuntu and publishes release `v<version>` at that commit: `vrupscale-<version>.zip`, its `.sha256`, and the source zip. The app's updater looks for exactly those names. Pushing a tag `v<version>` works too.
 
 Layout:
 - `src/exports.S`, `src/proxy.cpp`: dxgi forwarding

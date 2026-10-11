@@ -1,13 +1,22 @@
-# Pushing a tag v<version> (matching src/common.h) builds vrupscale and publishes it as a GitHub
-# release: the zip the app's updater downloads (stored uncompressed), its SHA-256, and the source.
+# Publishes a GitHub release for each new version: when main gets a VU_VERSION_STR (src/common.h)
+# that has no release yet, this builds vrupscale and creates release v<version> at that commit,
+# with the zip the app's updater downloads (stored uncompressed), its SHA-256, and the source.
+# The notes are the README's "What changed in <version>" section. (Pushing a tag v<version>
+# works too; a version that already has a release is skipped.)
 name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -15,28 +24,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MinGW-w64
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64
-
-      - name: Check the tag against the version
+      - name: Version, and whether it is released already
         id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VER=$(sed -n 's/^#define VU_VERSION_STR "\(.*\)"/\1/p' src/common.h)
-          if [ "v$VER" != "$GITHUB_REF_NAME" ]; then
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$VER" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match VU_VERSION_STR $VER in src/common.h"
             exit 1
           fi
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VER" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$VER is released already; nothing to do"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install MinGW-w64
+        if: steps.ver.outputs.skip != '1'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64
 
       - name: Build and package
+        if: steps.ver.outputs.skip != '1'
         run: sh tools/package.sh
 
       - name: Publish the release
+        if: steps.ver.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ github.token }}
           VER: ${{ steps.ver.outputs.ver }}
         run: |
           python3 tools/release_notes.py "$VER" > notes.md
           cat build/vrupscale-$VER.zip.sha256
-          gh release create "$GITHUB_REF_NAME" --title "vrupscale $VER" --notes-file notes.md \
+          sha256sum build/pkg/vrupscale-$VER/vrupscale.exe build/pkg/vrupscale-$VER/payload/dxgi.dll
+          gh release create "v$VER" --target "$GITHUB_SHA" --title "vrupscale $VER" --notes-file notes.md \
             "build/vrupscale-$VER.zip" "build/vrupscale-$VER.zip.sha256" "build/vrupscale-$VER-src.zip"
