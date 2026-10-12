@@ -9,6 +9,10 @@
 // picture (Region[z], centred or around the gaze), blending into OUTER's cheap upscale across a
 // band inside the area's edge; OUTER does the rest. Both are dispatched over their own extent.
 //
+// Every other pass covers Span: the game's picture and a band around it. When the game renders
+// into part of a larger texture (SteamVR's resolution lowered while it runs), the rest of the
+// proxy is never sampled by the compositor, so it is not written either.
+//
 // Every texture is addressed as a Texture2DArray so the same code handles plain eye textures and
 // Unity single-pass-instanced arrays (one dispatch, z = array slice).
 //
@@ -49,6 +53,7 @@ cbuffer Params : register(b0)
     uint4 Content;     // the picture in the output: x0, y0, x1, y1 (the band is only where the area ends inside it)
     uint4 Region[2];   // per dispatched slice (z 0, 1): the area, x, y, w, h (output px)
     uint4 Marks[2];    // per dispatched slice: gaze ring x, y | calibration cross x, y (output px; ~0 = none)
+    uint4 Span;        // what the passes over the picture cover (output px): x, y, w, h
 };
 
 #define FLAG_FINAL     4u   // this pass writes the proxy: apply the output transform
@@ -216,7 +221,7 @@ void EmitArea(uint2 pos, float3 c, float a)
   AF4 FsrRcasLoadF(ASU2 p)
   {
       // foveated: the scratch holds EASU's output in the area only
-      ASU2 lo = ASU2(0, 0), hi = ASU2(InSize) - ASU2(1, 1);
+      ASU2 lo = ASU2(Span.xy), hi = ASU2(Span.xy + Span.zw) - ASU2(1, 1);
       if (Fov.y & FOV_ON) {
           const uint4 r = RegionZ();
           lo = ASU2(r.xy);
@@ -233,13 +238,19 @@ void EmitArea(uint2 pos, float3 c, float a)
 
 void Process(uint2 pos)
 {
+    bool inArea = false;
 #if PASS == 0 || PASS == 1
     if (Fov.y & FOV_ON) {   // dispatched over the area: pos counts from its corner
         const uint4 r = RegionZ();
         if (any(pos >= r.zw)) return;
         pos += r.xy;
+        inArea = true;
     }
 #endif
+    if (!inArea) {          // dispatched over the span
+        if (any(pos >= Span.zw)) return;
+        pos += Span.xy;
+    }
     if (any(pos >= OutSize))
         return;
 

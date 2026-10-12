@@ -174,10 +174,13 @@ struct QuerySet {
     bool busy = false;
 };
 
-// Per-pass timestamps of one temporal run ([general] passTiming=1).
+// Per-pass timestamps of one temporal run ([general] passTiming=1), and a copy of the run's
+// decision (Ctrl: first, new frame, ...) to tell a new frame's update from a check of a frame
+// already processed (the compositor draws each texture of the app's swapchain every frame).
 constexpr int kTPasses = 9;
 struct PassQueries {
     Ref<ID3D11Query> dj, t[kTPasses + 1];
+    Ref<ID3D11Buffer> ctrl;   // staging
     bool busy = false;
 };
 
@@ -201,8 +204,10 @@ struct DevState {
     Ref<ID3D11Buffer> gateFp, gateArgs;
     Ref<ID3D11ShaderResourceView> gateFpSRV;
     Ref<ID3D11UnorderedAccessView> gateFpUAV, gateArgsUAV;
-    double passMs[kTPasses] = {};    // sums since the last stats line / debug read
-    int passRuns = 0;
+    double passMs[kTPasses] = {};    // sums over new frames' updates since the last stats line / debug read
+    int passRuns = 0;                // those updates
+    double checkMs = 0;              // runs that found a frame already processed: their whole time
+    int checkRuns = 0;
     bool ok = false;
     struct FmtOk { DXGI_FORMAT f; bool ok; };
     std::vector<FmtOk> uavFmts;
@@ -267,6 +272,10 @@ struct SpatialArea {
     UINT region[2][4] = {};             // per slice: x, y, w, h (proxy px)
     uint32_t marks[2][4] = { { ~0u, ~0u, ~0u, ~0u }, { ~0u, ~0u, ~0u, ~0u } };
 };
+// What the spatial path writes of a texture's proxy (output px: x, y, w, h): the game's picture
+// and a band around it when it renders into part of the texture, else all of it (also for a few
+// seconds after the app's notice of a resolution change, while the picture may grow).
+void SpatialSpan(const TexState *ts, LONGLONG now, uint32_t span[4]);
 bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialArea &a);
 
 // Content rectangles: reads finished observation windows and starts new ones (render tick).

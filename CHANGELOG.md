@@ -5,6 +5,9 @@ What changed in each version of vrupscale, newest first.
 ## 0.6.2
 
 - A **Change log** button shows this list. After an update, what's new since your last version is marked.
+- FSR 1 and Bilinear are much faster when the game renders smaller than its textures, as with **Set VRChat's resolution**.
+- Fixed: `passTiming` per-pass times read several times too low.
+- Fixed: an eye could stay on FSR 1 for 30 seconds after an earlier, brief **Temporal paused**.
 
 ## 0.6.1
 

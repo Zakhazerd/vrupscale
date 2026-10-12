@@ -49,9 +49,28 @@ void PollPassQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
         for (int i = 0; i <= kTPasses && ok; ++i)
             ok = ctx->GetData(q.t[i].Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
         for (int i = 0; i < kTPasses && ok; ++i) ok = t[i + 1] >= t[i];
+        // Was it a new frame's update? (copied before the disjoint query ended, so it is ready by now)
+        uint32_t ctrl[4] = {};
         if (ok) {
+            D3D11_MAPPED_SUBRESOURCE m;
+            HRESULT mr;
+            spins = 0;
+            while ((mr = ctx->Map(q.ctrl.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)) == DXGI_ERROR_WAS_STILL_DRAWING &&
+                   wait && ++spins < 200000)
+                Sleep(0);
+            if (mr == DXGI_ERROR_WAS_STILL_DRAWING) continue;   // (not yet: next time)
+            ok = SUCCEEDED(mr);
+            if (ok) {
+                memcpy(ctrl, m.pData, sizeof(ctrl));
+                ctx->Unmap(q.ctrl.Get(), 0);
+            }
+        }
+        if (ok && ctrl[1]) {
             for (int i = 0; i < kTPasses; ++i) ds->passMs[i] += double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency);
             ds->passRuns++;
+        } else if (ok) {
+            ds->checkMs += double(t[kTPasses] - t[0]) * 1000.0 / double(dj.Frequency);
+            ds->checkRuns++;
         }
         q.busy = false;
     }
@@ -88,6 +107,8 @@ namespace {
 
 float g_debugFlow[3] = {};   // test hook (VrUpscaleDebugForceFlow)
 
+bool CreateStaging(ID3D11Device *dev, Ref<ID3D11Buffer> &out, UINT bytes);
+
 PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 {
     PollPassQueries(ds, ctx, false);
@@ -97,6 +118,7 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
             D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, qt = { D3D11_QUERY_TIMESTAMP, 0 };
             bool ok = SUCCEEDED(ds->dev->CreateQuery(&qd, q.dj.Put()));
             for (auto &t : q.t) ok = ok && SUCCEEDED(ds->dev->CreateQuery(&qt, t.Put()));
+            ok = ok && CreateStaging(ds->dev.Get(), q.ctrl, 16);
             if (!ok) { q.dj.Reset(); return nullptr; }
         }
         return &q;
@@ -718,6 +740,7 @@ struct Pool {
     PoolDraw d[16];        // ring, oldest first from head
     int head = 0, n = 0;
     LONGLONG lastQpc = 0, mixedSince = 0, holdUntil = 0;
+    LONGLONG mixedSeen = 0;   // the last draw that found the eye mixed
     LONGLONG relinkQpc = 0;   // a texture of this eye last left its history for a new content rectangle
     uint32_t epoch = 0;       // tells a slot's pools apart when it is reused for another viewport
 };
@@ -945,6 +968,25 @@ void PlaceRegion(Stream *s, int side, TParams &p)
 }
 
 } // namespace
+
+void SpatialSpan(const TexState *ts, LONGLONG now, uint32_t span[4])
+{
+    const UINT ow = ts->plan.outW, oh = ts->plan.outH;
+    const LinkGeo g = ContentGeo(ts);
+    if (g.full || now < g_probeFastUntil) {
+        span[0] = span[1] = 0;
+        span[2] = ow;
+        span[3] = oh;
+        return;
+    }
+    const UINT m = (UINT)ceil(48.0 * std::max(ts->plan.scaleX, ts->plan.scaleY));   // as Temporal's OUTER band
+    const UINT x0 = g.ox > m ? g.ox - m : 0, y0 = g.oy > m ? g.oy - m : 0;
+    const UINT x1 = std::min(ow, g.ox + g.outW + m), y1 = std::min(oh, g.oy + g.outH + m);
+    span[0] = x0;
+    span[1] = y0;
+    span[2] = x1 - x0;
+    span[3] = y1 - y0;
+}
 
 bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialArea &a)
 {
@@ -1196,6 +1238,7 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     Indirect(SH_T_COPY, A_COPY);
     Mark();
     if (pq) {
+        ctx->CopyResource(pq->ctrl.Get(), s->ctrl.buf.Get());   // this run's decision (new frame or not)
         ctx->End(pq->dj.Get());
         pq->busy = mark == kTPasses + 1;
     }
@@ -1470,7 +1513,11 @@ bool PoolMixed(const StreamLink *link, const TexState *ts, LONGLONG now)
         return false;
     }
     InterlockedIncrement(&g_pausedDraws);
-    if (P.mixedSince == 0) {
+    // A new episode, also when the last one ended without a draw finding the eye unmixed (say the
+    // mode changed to FSR 1 meanwhile): an old start must not count towards the 10 s below.
+    const bool fresh = P.mixedSince == 0 || now - P.mixedSeen > g_qpf.QuadPart;
+    P.mixedSeen = now;
+    if (fresh) {
         P.mixedSince = now;
         LOGI("temporal: the textures drawn into the eye viewport (%d,%d %dx%d) are on different histories; FSR 1 for all "
              "of them until they share one", P.sig.vx, P.sig.vy, P.sig.vw, P.sig.vh);
@@ -1530,6 +1577,7 @@ void PoolStatus(int *pools, int *mixed)
         // a moment on the spatial path while an eye's textures move to a new history together is
         // not worth reporting; one that lasts is
         if (P.holdUntil > now.QuadPart || (P.n > 0 && P.mixedSince != 0 && now.QuadPart - P.mixedSince > g_qpf.QuadPart &&
+                                           now.QuadPart - P.mixedSeen <= g_qpf.QuadPart &&
                                            PoolInterleaved(P, last.fmt, last.texW, last.texH, now.QuadPart)))
             ++mx;
     }

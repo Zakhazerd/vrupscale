@@ -28,6 +28,7 @@ EXPORTS
     VrUpscaleDebugFlow
     VrUpscaleDebugForceFlow
     VrUpscaleDebugPassTimes
+    VrUpscaleDebugPassRuns
     VrUpscaleDebugGate
     VrUpscaleDebugHotkey
     VrUpscaleDebugContent

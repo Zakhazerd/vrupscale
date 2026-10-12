@@ -17,6 +17,8 @@ typedef void (*PFN_ForceFlow)(float, float, int);
 static PFN_ForceFlow g_forceFlow;
 typedef int (*PFN_PassTimes)(double *, const char **, int, int);
 static PFN_PassTimes g_passTimes;
+typedef void (*PFN_PassRuns)(int *, int *, double *);
+static PFN_PassRuns g_passRuns;
 typedef int (*PFN_DebugGate)(ID3D11Texture2D *, int, uint32_t *);
 static PFN_DebugGate g_debugGate;
 
@@ -560,6 +562,7 @@ static void LoadDebugExports()
     g_debugFlow = (PFN_DebugFlow)GetProcAddress(dxgi, "VrUpscaleDebugFlow");
     g_forceFlow = (PFN_ForceFlow)GetProcAddress(dxgi, "VrUpscaleDebugForceFlow");
     g_passTimes = (PFN_PassTimes)GetProcAddress(dxgi, "VrUpscaleDebugPassTimes");
+    g_passRuns = (PFN_PassRuns)GetProcAddress(dxgi, "VrUpscaleDebugPassRuns");
     g_debugGate = (PFN_DebugGate)GetProcAddress(dxgi, "VrUpscaleDebugGate");
 }
 
@@ -735,10 +738,15 @@ static void RunSwapchainPoolTest(Gfx &g, const Sequence &mov, const char *iniBas
 {
     printf("[swapchain drawn every frame, like SteamVR: 3 textures per eye, each app frame shown twice]\n");
     char ini[2048];
+    // with per-pass timing: the averages must be per new frame, not per draw
+    std::string timedBase(iniBase);
+    const size_t at = timedBase.find("[match]");
+    if (at != std::string::npos) timedBase.insert(at, "passTiming=1\n");
     snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=1\n",
-             iniBase, reqShared, F);
+             timedBase.c_str(), reqShared, F);
     WriteIni(ini);
     Pump(g);
+    if (g_passTimes) g_passTimes(nullptr, nullptr, 0, 1);   // nothing older
     EyeTarget tgt;
     EnsureEyeTarget(g, tgt, mov.ow, mov.oh);
     ID3D11Texture2D *tex[2][3] = {};
@@ -780,6 +788,17 @@ static void RunSwapchainPoolTest(Gfx &g, const Sequence &mov, const char *iniBas
     CHECK(s0[12] == (uint32_t)n + 1 && s1[12] == (uint32_t)n + 1,
           "history updates = new app frames, not draws (%u and %u updates for %d frames; %u draws each)", s0[12], s1[12], n + 1,
           s0[13]);
+    if (g_passRuns && g_passTimes) {
+        int upd = 0, chk = 0;
+        double chkMs = 0, pm[16] = {}, tot = 0;
+        const char *pn[16] = {};
+        g_passRuns(&upd, &chk, &chkMs);
+        const int np = g_passTimes(pm, pn, 16, 1);
+        for (int i = 0; i < np; ++i) tot += pm[i];
+        CHECK(np > 0 && upd >= 1 && upd <= 2 * (n + 1) && chk >= 1 && chkMs < 0.5 * tot,
+              "pass timing: new frames' updates averaged apart from the checks of frames already processed "
+              "(%d updates timed, %.3f ms each; %d checks, %.3f ms each)", upd, tot, chk, chkMs);
+    }
     // what the eye shows is the newest frame
     Image out = DrawEye(g, tgt, v[0][n % 3], 0, nullptr, true);
     const double now = Compare(out, mov.gt[0][n]).psnr, before = Compare(out, mov.gt[0][n - 1]).psnr;
@@ -1199,6 +1218,122 @@ static void RunResizedPoolTest(Gfx &g, const World &world, const char *iniBase, 
 // must be found within a fraction of the time.
 
 struct SwitchPhase { int frames = 0, followMs = -1, pausedDraws = 0, reported = 0; double early = 0, later = 0; };
+
+// ---------------------------------------------------------------------------------------------
+// The spatial path when the game renders into part of a larger texture (SteamVR's resolution
+// lowered while it runs, as Set VRChat's resolution does): only the picture and a band around it
+// are upscaled, so the result is what a texture holding just the picture gives, and so is the GPU
+// time (before 0.6.2 the passes outside the area covered the whole proxy: at 2x, 4 times the picture).
+
+static void RunSpatialCornerTest(Gfx &g, const World &world, const char *iniBase, const char *reqShared, float F, UINT misc)
+{
+    printf("[FSR 1 and bilinear when the game renders into the corner of a larger texture]\n");
+    HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+    auto debugContent = (int (*)(ID3D11Texture2D *, uint32_t *))GetProcAddress(dxgi, "VrUpscaleDebugContent");
+    CHECK(debugContent != nullptr, "content debug export present");
+    if (!debugContent) return;
+    const int W = 400, H = 440, TW = 2 * W, TH = 2 * H;   // the picture: a quarter of the texture
+    const int OW = (int)lroundf(W * F), OH = (int)lroundf(H * F), N = 40;
+    Sequence seq = MakeSequence(world, W, H, OW, OH, N, true, 3131);
+    EyeTarget tgt;
+    EnsureEyeTarget(g, tgt, OW, OH);
+    ID3D11Texture2D *exact[2] = {}, *big[2] = {};
+    ID3D11ShaderResourceView *ve[2] = {}, *vb[2] = {};
+    for (int e = 0; e < 2; ++e) {
+        exact[e] = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, { seq.in[e][0] }, misc);
+        ve[e] = MakeView(g, exact[e], DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, -1);
+        SceneFrame old = seq.f[0];   // what the texture held before: a larger picture, stale outside the corner now
+        old.ox += 23.0f;
+        Image stale = RenderScene(world, old, e, TW, TH, 0.5f);
+        big[e] = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, { stale }, misc);
+        vb[e] = MakeView(g, big[e], DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, -1);
+    }
+    char ini[2048];
+    auto Mode = [&](const char *mode, float area) {
+        snprintf(ini, sizeof(ini),
+                 "%srequireShared=%s\n[upscale]\nmode=%s\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=%.2f\nprobeWindowMs=100\n",
+                 iniBase, reqShared, mode, F, area);
+        WriteIni(ini);
+        Pump(g);
+    };
+    // a new frame into both; each eye draws the exact texture, then the corner of the big one
+    auto Frame = [&](int i, Image *outE, Image *outB) {
+        for (int e = 0; e < 2; ++e) {
+            Upload1(g, exact[e], seq.in[e][i]);
+            UploadCorner(g, big[e], seq.in[e][i]);
+        }
+        for (int e = 0; e < 2; ++e) {
+            Image x = DrawEye(g, tgt, ve[e], e, nullptr, outE && e == 0);
+            Image y = DrawEye(g, tgt, vb[e], e, nullptr, outB && e == 0, 0.5f, 0.5f);
+            if (outE && e == 0) *outE = x;
+            if (outB && e == 0) *outB = y;
+        }
+        Sleep(25);
+    };
+    Mode("fsr", 0.6f);
+    int f = 0;
+    bool found = false;
+    for (; f < N - 12 && !found; ++f) {
+        Frame(f, nullptr, nullptr);
+        found = true;
+        for (int e = 0; e < 2; ++e) {
+            uint32_t c[8] = {};
+            found = found && debugContent(big[e], c) && c[4] && c[0] == 0 && c[1] == 0 && c[2] == (uint32_t)W && c[3] == (uint32_t)H;
+        }
+    }
+    CHECK(found, "the %dx%d picture is found in the corner of the %dx%d textures (%d frames)", W, H, TW, TH, f);
+
+    // the corner of the big texture shows what the exact one does (away from the picture's right
+    // and bottom edges, where the filters read the stale pixels beyond it instead of clamping)
+    auto Same = [&](const char *what) {
+        Image a, b;
+        Frame(f++, &a, &b);
+        double worst = 0;
+        for (int y = 0; y < OH - 10; ++y)
+            for (int x = 0; x < OW - 10; ++x)
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, (double)fabsf(a.at(x, y)[c] - b.at(x, y)[c]));
+        CHECK(AllFinite(b) && worst <= 1.5 / 255.0, "%s: the picture in the corner is upscaled as on its own (largest difference %.1f/255)",
+              what, worst * 255.0);
+    };
+    Same("FSR 1 in the area");
+    Mode("fsr", 1.0f);
+    Frame(f++, nullptr, nullptr);
+    Same("FSR 1 over the whole picture");
+    Mode("bilinear", 1.0f);
+    Frame(f++, nullptr, nullptr);
+    Same("bilinear");
+
+    // GPU time per new frame and eye, one kind of texture drawn at a time (temporal too, for comparison)
+    auto Time = [&](const char *mode, bool corner) {
+        Mode(mode, 0.6f);
+        double ms = 0;
+        const int warm = 6, timed = 5;   // (a mode's first frames set up its histories)
+        for (int k = 0; k < warm + timed; ++k) {
+            const int i = f++ % N;
+            for (int e = 0; e < 2; ++e) {
+                if (corner) UploadCorner(g, big[e], seq.in[e][i]);
+                else Upload1(g, exact[e], seq.in[e][i]);
+            }
+            for (int e = 0; e < 2; ++e) {
+                double t = 0;
+                DrawEye(g, tgt, corner ? vb[e] : ve[e], e, &t, false, corner ? 0.5f : 1.0f, corner ? 0.5f : 1.0f);
+                if (k >= warm) ms += t;
+            }
+            Sleep(25);
+        }
+        return ms / (2 * timed);
+    };
+    const bool noT = EnvStr("VRUPSCALE_TEST_NOTEMPORAL")[0] == '1';
+    const double fE = Time("fsr", false), fB = Time("fsr", true), tE = noT ? 0 : Time("temporal", false), tB = noT ? 0 : Time("temporal", true);
+    printf("         GPU ms per new frame and eye (area 0.6): FSR 1 %.3f for the picture alone, %.3f in the corner; temporal %.3f, %.3f\n",
+           fE, fB, tE, tB);
+    CHECK(fB < 1.5 * fE, "FSR 1 costs about the picture's size, not the texture's (%.2fx)", fE > 0 ? fB / fE : 0.0);
+
+    ClearAll(g);
+    for (int e = 0; e < 2; ++e) { SafeRelease(ve[e]); SafeRelease(vb[e]); SafeRelease(exact[e]); SafeRelease(big[e]); }
+    tgt.Release();
+    Settle(g);
+}
 
 static void RunResolutionSwitchTest(Gfx &g, const World &world, const char *iniBase, const char *reqShared, float F, UINT misc)
 {
@@ -1701,6 +1836,17 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
         return;
     }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "corner") == 0 || strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "cornerswitch") == 0) {
+        RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
+        if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "cornerswitch") == 0) RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
+        return;
+    }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "rcs") == 0) {
+        RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
+        if (EnvStr("VRUPSCALE_TEST_NOCORNER")[0] != '1') RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
+        RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
+        return;
+    }
     const int seqFrames = EnvStr("VRUPSCALE_TEST_FRAMES")[0] ? std::max(12, atoi(EnvStr("VRUPSCALE_TEST_FRAMES"))) : 24;
     Sequence mov = MakeSequence(world, W, H, OW, OH, seqFrames, true, 777);
     Sequence still = MakeSequence(world, W, H, OW, OH, 4, false, 1);
@@ -1800,6 +1946,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
         RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
         RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
+        RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
         RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
         ClearAll(g);
         SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
@@ -2041,6 +2188,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     Settle(g);
     RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
     RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
+    RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
     RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
     RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
     RunNativeTest(g, world, tIniBase, reqShared, misc);

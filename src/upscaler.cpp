@@ -57,8 +57,9 @@ struct Params {
     uint32_t content[4];    // the picture in the output: x0, y0, x1, y1
     uint32_t region[2][4];  // per dispatched slice: the area x, y, w, h
     uint32_t marks[2][4];   // per dispatched slice: gaze ring x, y | calibration cross x, y (~0u = none)
+    uint32_t span[4];       // what the passes over the picture cover: x, y, w, h (SpatialSpan)
 };
-static_assert(sizeof(Params) == 192, "cbuffer layout must match upscale.hlsl");
+static_assert(sizeof(Params) == 208, "cbuffer layout must match upscale.hlsl");
 constexpr uint32_t FOV_ON = 1, FOV_BILINEAR = 2;
 
 struct RejectRecord { LONG cfgGen; LONG markGen; int token; int unticked; };   // token: row in the app's texture list
@@ -924,7 +925,10 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     const UINT w = ts->src.Width, h = ts->src.Height, slices = ts->src.ArraySize;
     const UINT first = job.first, count = job.count;
     const UINT ow = ts->plan.outW, oh = ts->plan.outH;
-    const UINT gx = (ow + 15) / 16, gy = (oh + 15) / 16;
+    // the game's picture and a band around it (all of the proxy when it fills the texture)
+    uint32_t span[4];
+    SpatialSpan(ts, now, span);
+    const UINT gx = (span[2] + 15) / 16, gy = (span[3] + 15) / 16;
     const int x = ts->plan.xform;
     const float sharp = g_cfg.sharpness;
     const bool fsr = g_cfg.mode != Mode::Bilinear;   // temporal mode falls back to FSR 1
@@ -940,6 +944,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         memcpy(q.content, area.content, sizeof(q.content));
         memcpy(q.region, area.region, sizeof(q.region));
         memcpy(q.marks, area.marks, sizeof(q.marks));   // (all ~0 unless FSR 1 shows the gaze)
+        memcpy(q.span, span, sizeof(q.span));
     };
 
     // Upscale only if the content changed since this proxy range was written (the compositor draws
@@ -954,7 +959,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         if (RunContentGate(ctx, ds, ts, ve->srcRead.Get(), first, count, x, g, g.outGen != g_outGen, ax, ay, count, gx, gy))
             gateArgs = ds->gateArgs.Get();
     }
-    // entries 0 and 1: EASU and RCAS (over the area when foveated), 2: OUTER (the whole output)
+    // entries 0 and 1: EASU and RCAS (over the area when foveated, else the span), 2: OUTER (the span)
     auto Run = [&](UINT argOffset) {
         if (gateArgs) ctx->DispatchIndirect(gateArgs, argOffset);
         else if (argOffset == 24) ctx->Dispatch(gx, gy, count);
@@ -1014,9 +1019,9 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     }
 
     if (ts->upscales == 0)
-        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s)", w, h, first, first + count - 1, ow, oh,
-             fsr ? "EASU" : "bilinear", rcas ? "+RCAS" : "", fov ? ", in the area only" : "");
-    (void)now;
+        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s), writing %ux%u at %u,%u", w, h, first,
+             first + count - 1, ow, oh, fsr ? "EASU" : "bilinear", rcas ? "+RCAS" : "", fov ? ", in the area only" : "", span[2],
+             span[3], span[0], span[1]);
     ts->upscales++;
     InterlockedIncrement(&g_stats.upscales);
     InterlockedIncrement(&g_iv.upscales);
@@ -1219,6 +1224,9 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
     TemporalLogStats(ctx, dev.Get(), seconds);
     if (DevState *ds = GetDevState(dev.Get())) {
         PollPassQueries(ds, ctx, false);
+        // Per new app frame and eye: the compositor also runs a stream for every draw of a texture
+        // whose frame was processed already (each swapchain texture, every display frame); those
+        // checks are counted apart, or they would water the averages down several times over.
         if (ds->passRuns > 0) {
             char line[512];
             int len = 0;
@@ -1227,10 +1235,16 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
             for (int i = 0; i < kTPasses && len < (int)sizeof(line) - 40; ++i)
                 len += snprintf(line + len, sizeof(line) - len, "%s%s %.3f", i ? ", " : "", kTPassNames[i],
                                 ds->passMs[i] / ds->passRuns);
-            LOGI("stats:   temporal passes, GPU ms per eye (%d runs, total %.3f): %s", ds->passRuns, total / ds->passRuns, line);
-            for (auto &v : ds->passMs) v = 0;
-            ds->passRuns = 0;
+            LOGI("stats:   temporal passes, GPU ms per new frame and eye (%d updates, total %.3f): %s", ds->passRuns,
+                 total / ds->passRuns, line);
         }
+        if (ds->checkRuns > 0)
+            LOGI("stats:   temporal checks of a frame already processed: %d, %.3f ms each", ds->checkRuns,
+                 ds->checkMs / ds->checkRuns);
+        for (auto &v : ds->passMs) v = 0;
+        ds->passRuns = 0;
+        ds->checkMs = 0;
+        ds->checkRuns = 0;
     }
 }
 
@@ -1777,8 +1791,8 @@ void OnCSSetShaderResources(ID3D11DeviceContext *, UINT num, ID3D11ShaderResourc
 } // namespace vu
 
 // ---------------------------------------------------------------------------------------------
-// Test / diagnostics hook: mean GPU time per temporal run of each pass group, collected with
-// [general] passTiming=1 since the last reset. Blocks until pending queries are readable, so call
+// Test / diagnostics hook: mean GPU time per new frame's temporal update (one eye) of each pass
+// group, collected with [general] passTiming=1 since the last reset. Blocks until pending queries are readable, so call
 // it from the thread that owns the immediate context. Returns the number of pass groups (and
 // fills names/ms up to max), or 0 when nothing was collected.
 // Self-test: acts as if Ctrl+F1+idx were pressed (applied on the next render-thread tick, like a
@@ -1804,6 +1818,8 @@ extern "C" __declspec(dllexport) int VrUpscaleDebugPassTimes(double *ms, const c
         if (reset) {
             for (auto &v : ds->passMs) v = 0;
             ds->passRuns = 0;
+            ds->checkMs = 0;
+            ds->checkRuns = 0;
         }
     }
     ReleaseSRWLockShared(&g_devLock);
@@ -1812,6 +1828,30 @@ extern "C" __declspec(dllexport) int VrUpscaleDebugPassTimes(double *ms, const c
         if (names) names[i] = kTPassNames[i];
     }
     return runs ? kTPasses : 0;
+}
+
+// Test hook: how many timed temporal runs were new frames' updates and how many were checks of a
+// frame already processed (and those checks' mean GPU time), since the last reset. Waits like
+// VrUpscaleDebugPassTimes; resets nothing.
+extern "C" __declspec(dllexport) void VrUpscaleDebugPassRuns(int *updates, int *checks, double *checkMs)
+{
+    using namespace vu;
+    int u = 0, c = 0;
+    double cm = 0;
+    AcquireSRWLockShared(&g_devLock);
+    for (int d = 0; d < g_devCount; ++d) {
+        DevState *ds = g_devs[d];
+        Ref<ID3D11DeviceContext> ctx;
+        ds->dev->GetImmediateContext(ctx.Put());
+        PollPassQueries(ds, ctx.Get(), true);
+        u += ds->passRuns;
+        c += ds->checkRuns;
+        cm += ds->checkMs;
+    }
+    ReleaseSRWLockShared(&g_devLock);
+    if (updates) *updates = u;
+    if (checks) *checks = c;
+    if (checkMs) *checkMs = c ? cm / c : 0.0;
 }
 
 // Test hook: blocking read of a texture's spatial content-check counters. out[0] = upscales the
