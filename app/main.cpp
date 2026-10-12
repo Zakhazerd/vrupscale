@@ -841,7 +841,7 @@ void RefreshStatus()
             else if (g_st.gpuMsPerSec >= 0)
                 gpu = Fmt(L"GPU %.1f%% busy upscaling", g_st.gpuMsPerSec / 10.0f);
             else
-                gpu = L"GPU time not measured (needs passTiming=0)";
+                gpu = L"GPU time: no frames timed in the last seconds";
             detail = Fmt(L"Upscaling %s, %s.\nvrupscale %s · ", sizes.c_str(), mode, ver.c_str());
             if (temporal) detail += Fmt(L"%.0f new frames/s · ", rate);
             detail += gpu;

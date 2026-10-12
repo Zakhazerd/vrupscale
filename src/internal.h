@@ -169,19 +169,26 @@ protected:
     ~ViewEntry() override;
 };
 
+// GPU time of one batch of upscale work (the app's GPU figure): a disjoint query and two
+// timestamps. The temporal runs in the batch take their per-pass timestamps inside it.
 struct QuerySet {
     Ref<ID3D11Query> dj, t0, t1;
     bool busy = false;
+    uint32_t serial = 0;      // bumped for every batch it times (PassQueries refer to it)
 };
 
-// Per-pass timestamps of one temporal run ([general] passTiming=1), and a copy of the run's
-// decision (Ctrl: first, new frame, ...) to tell a new frame's update from a check of a frame
+// Per-pass timestamps of one temporal run, inside its batch's disjoint query, and a copy of the
+// run's decision (Ctrl: first, new frame, ...) to tell a new frame's update from a check of a frame
 // already processed (the compositor draws each texture of the app's swapchain every frame).
 constexpr int kTPasses = 9;
 struct PassQueries {
-    Ref<ID3D11Query> dj, t[kTPasses + 1];
+    Ref<ID3D11Query> t[kTPasses + 1];
     Ref<ID3D11Buffer> ctrl;   // staging
     bool busy = false;
+    int batch = -1;           // the QuerySet (index in DevState::q) of the batch the run was in
+    uint32_t batchSerial = 0;
+    bool batchRead = false;   // that batch's disjoint query has been read:
+    UINT64 freq = 0;          // its timestamp frequency, 0 if the clock was disjoint
 };
 
 struct DevState {
@@ -200,6 +207,7 @@ struct DevState {
     double gpuEma = -1;            // for the app's status (not reset by the stats line)
     DWORD gpuEmaTick = 0;
     PassQueries pq[8];
+    int activeBatch = -1;          // the QuerySet timing the batch being recorded now (-1: none)
     // content check of the spatial path: fingerprint and the indirect args it leaves (used at once)
     Ref<ID3D11Buffer> gateFp, gateArgs;
     Ref<ID3D11ShaderResourceView> gateFpSRV;
@@ -248,8 +256,11 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
 void ReleaseStreamRef(Stream *s);
 void TemporalSweep();
 void TemporalResetAll(const char *why);
-// [general] passTiming: names of the timed temporal pass groups, and collection of finished query
-// sets into ds->passMs (wait = block until every pending set is readable; tests only).
+// Per-pass GPU times of the temporal runs (always collected when gpuTiming is on): names of the
+// timed pass groups, and collection of finished query sets into ds->passMs once their batch's
+// disjoint query was read (wait = block until every pending set is readable; tests only).
+// PollQueries reads the batch queries (wait likewise).
+void PollQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait = false);
 extern const char *const kTPassNames[kTPasses];
 extern const UINT kTParamsBytes;   // size of the temporal passes' constant buffer
 // Bumped by every settings change: proxies are repainted even if their source did not change.

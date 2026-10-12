@@ -878,12 +878,20 @@ bool EnsureScratch(DevState *ds, UINT w, UINT h, UINT slices)
     return true;
 }
 
-void PollQueries(DevState *ds, ID3D11DeviceContext *ctx)
+} // namespace
+
+void PollQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
 {
-    for (auto &q : ds->q) {
+    for (int i = 0; i < (int)(sizeof(ds->q) / sizeof(ds->q[0])); ++i) {
+        QuerySet &q = ds->q[i];
         if (!q.busy) continue;
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-        if (ctx->GetData(q.dj.Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        HRESULT hr;
+        int spins = 0;
+        while ((hr = ctx->GetData(q.dj.Get(), &dj, sizeof(dj), wait ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE && wait &&
+               ++spins < 200000)
+            Sleep(0);
+        if (hr != S_OK) continue;
         UINT64 a = 0, b = 0;
         bool okA = ctx->GetData(q.t0.Get(), &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
         bool okB = ctx->GetData(q.t1.Get(), &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
@@ -895,15 +903,26 @@ void PollQueries(DevState *ds, ID3D11DeviceContext *ctx)
             ds->gpuEma = ds->gpuEma < 0 ? ms : 0.9 * ds->gpuEma + 0.1 * ms;
             ds->gpuEmaTick = GetTickCount();
         }
+        // the temporal runs timed inside this batch can be read now
+        for (auto &p : ds->pq)
+            if (p.busy && !p.batchRead && p.batch == i && p.batchSerial == q.serial) {
+                p.batchRead = true;
+                p.freq = dj.Disjoint ? 0 : dj.Frequency;
+            }
         q.busy = false;
     }
 }
+
+namespace {
 
 QuerySet *AcquireQuerySet(DevState *ds, ID3D11DeviceContext *ctx)
 {
     PollQueries(ds, ctx);
     for (auto &q : ds->q)
-        if (!q.busy && q.dj) return &q;
+        if (!q.busy && q.dj) {
+            q.serial++;
+            return &q;
+        }
     return nullptr;
 }
 
@@ -1055,19 +1074,21 @@ void RunJobs(CtxState *cs, SJob *spatial, int ns, TJob *tj, int nt, LONGLONG now
     ID3D11ShaderResourceView *oldPS[kSlots] = {};
     if (nps > 0) ctx->PSGetShaderResources(0, nps, oldPS);
 
-    // With passTiming the temporal passes carry their own disjoint query; don't nest another.
-    // Deferred contexts cannot read query results, so only immediate-context work is timed.
-    QuerySet *qs = (cs->immediate && g_cfg.gpuTiming && !g_cfg.passTiming) ? AcquireQuerySet(ds, ctx) : nullptr;
+    // Deferred contexts cannot read query results, so only immediate-context work is timed. The
+    // temporal runs take their per-pass timestamps inside this batch's disjoint query.
+    QuerySet *qs = (cs->immediate && g_cfg.gpuTiming) ? AcquireQuerySet(ds, ctx) : nullptr;
     if (cs->immediate) InterlockedIncrement(&g_jobBatches);
     if (qs) {
         ctx->Begin(qs->dj.Get());
         ctx->End(qs->t0.Get());
+        ds->activeBatch = (int)(qs - ds->q);
     }
     ID3D11SamplerState *samp = ds->samp.Get();
     ctx->CSSetSamplers(0, 1, &samp);
 
     for (int i = 0; i < ns; ++i) SpatialUpscale(ctx, ds, spatial[i], now);
     for (int i = 0; i < nt; ++i) RunStream(ctx, ds, tj[i].link, tj[i].ve, now);
+    ds->activeBatch = -1;
 
     if (qs) {
         ctx->End(qs->t1.Get());
@@ -1223,6 +1244,7 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
     ctx->GetDevice(dev.Put());
     TemporalLogStats(ctx, dev.Get(), seconds);
     if (DevState *ds = GetDevState(dev.Get())) {
+        PollQueries(ds, ctx);
         PollPassQueries(ds, ctx, false);
         // Per new app frame and eye: the compositor also runs a stream for every draw of a texture
         // whose frame was processed already (each swapchain texture, every display frame); those
@@ -1792,7 +1814,7 @@ void OnCSSetShaderResources(ID3D11DeviceContext *, UINT num, ID3D11ShaderResourc
 
 // ---------------------------------------------------------------------------------------------
 // Test / diagnostics hook: mean GPU time per new frame's temporal update (one eye) of each pass
-// group, collected with [general] passTiming=1 since the last reset. Blocks until pending queries are readable, so call
+// group, collected since the last reset. Blocks until pending queries are readable, so call
 // it from the thread that owns the immediate context. Returns the number of pass groups (and
 // fills names/ms up to max), or 0 when nothing was collected.
 // Self-test: acts as if Ctrl+F1+idx were pressed (applied on the next render-thread tick, like a
@@ -1812,6 +1834,7 @@ extern "C" __declspec(dllexport) int VrUpscaleDebugPassTimes(double *ms, const c
         DevState *ds = g_devs[d];
         Ref<ID3D11DeviceContext> ctx;
         ds->dev->GetImmediateContext(ctx.Put());
+        PollQueries(ds, ctx.Get(), true);   // (the batches first: a run's times are read after its batch's)
         PollPassQueries(ds, ctx.Get(), true);
         for (int i = 0; i < kTPasses; ++i) sum[i] += ds->passMs[i];
         runs += ds->passRuns;
@@ -1843,6 +1866,7 @@ extern "C" __declspec(dllexport) void VrUpscaleDebugPassRuns(int *updates, int *
         DevState *ds = g_devs[d];
         Ref<ID3D11DeviceContext> ctx;
         ds->dev->GetImmediateContext(ctx.Put());
+        PollQueries(ds, ctx.Get(), true);   // (the batches first: a run's times are read after its batch's)
         PollPassQueries(ds, ctx.Get(), true);
         u += ds->passRuns;
         c += ds->checkRuns;

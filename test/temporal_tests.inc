@@ -738,15 +738,11 @@ static void RunSwapchainPoolTest(Gfx &g, const Sequence &mov, const char *iniBas
 {
     printf("[swapchain drawn every frame, like SteamVR: 3 textures per eye, each app frame shown twice]\n");
     char ini[2048];
-    // with per-pass timing: the averages must be per new frame, not per draw
-    std::string timedBase(iniBase);
-    const size_t at = timedBase.find("[match]");
-    if (at != std::string::npos) timedBase.insert(at, "passTiming=1\n");
     snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=1\n",
-             timedBase.c_str(), reqShared, F);
+             iniBase, reqShared, F);
     WriteIni(ini);
     Pump(g);
-    if (g_passTimes) g_passTimes(nullptr, nullptr, 0, 1);   // nothing older
+    if (g_passTimes) g_passTimes(nullptr, nullptr, 0, 1);   // nothing older (per-pass times: per new frame, not per draw)
     EyeTarget tgt;
     EnsureEyeTarget(g, tgt, mov.ow, mov.oh);
     ID3D11Texture2D *tex[2][3] = {};
@@ -2318,12 +2314,14 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
     };
 
     // the last run repeats foveated temporal with per-pass timestamps (kept out of the table: they add a little)
-    enum { kOff, kBilinear, kFsr, kFsrFov, kTemporalFull, kTemporalFov, kTemporalFovBil, kPerPass, kRuns };
+    // ("+ GPU timing" is the default use: vrupscale's own queries for the app's GPU figure and the
+    // per-pass times; the other rows switch them off so the harness's queries time the frame alone)
+    enum { kOff, kBilinear, kFsr, kFsrFov, kTemporalFull, kTemporalFov, kTemporalFovBil, kTemporalFovTimed, kPerPass, kRuns };
     const char *names[kRuns] = { "off", "bilinear", "fsr, whole image", "fsr, area 0.6", "temporal, whole image", "temporal, area 0.6",
-                                 "  + bilinear edges", "per-pass timestamps" };
+                                 "  + bilinear edges", "  + GPU timing", "per-pass timestamps" };
     const char *modeIni[kRuns] = { "enabled=0\n", "mode=bilinear\n", "mode=fsr\n", "mode=fsr\n", "mode=temporal\n", "mode=temporal\n",
-                                   "mode=temporal\n", "mode=temporal\n" };
-    const char *areaIni[kRuns] = { "1", "1", "1", "0.6", "1", "0.6", "0.6\nbilinearEdges=1", "0.6" };
+                                   "mode=temporal\n", "mode=temporal\n", "mode=temporal\n" };
+    const char *areaIni[kRuns] = { "1", "1", "1", "0.6", "1", "0.6", "0.6\nbilinearEdges=1", "0.6", "0.6" };
     double mean[kRuns] = {}, med[kRuns] = {};
     uint64_t newFrames[kRuns] = {};
     uint32_t serial = 1;
@@ -2335,8 +2333,8 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
     for (int m = 0; m < runs; ++m) {
         const bool perPass = m == kPerPass;
         snprintf(ini, sizeof(ini),
-                 "[general]\nlogLevel=1\nstatsIntervalSec=0\nhotkeys=0\ngpuTiming=0\npassTiming=%d\n[match]\nrequireShared=%s\n"
-                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n[temporal]\ntemporalArea=%s\n", perPass ? 1 : 0, reqShared,
+                 "[general]\nlogLevel=1\nstatsIntervalSec=0\nhotkeys=0\ngpuTiming=%d\n[match]\nrequireShared=%s\n"
+                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n[temporal]\ntemporalArea=%s\n", (perPass || m == kTemporalFovTimed) ? 1 : 0, reqShared,
                  modeIni[m], (double)OH / (double)H, areaIni[m]);
         WriteIni(ini);
         Pump(g);
@@ -2448,6 +2446,9 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
         printf("         foveation (area 0.6) costs %.0f%% of whole-image temporal\n", full > 0 ? 100.0 * fov / full : 0.0);
         const double bil = med[kTemporalFovBil] - med[kOff];
         printf("         bilinear edges (area 0.6): %+.3f ms per frame (%+.0f%%)\n", bil - fov, fov > 0 ? 100.0 * (bil - fov) / fov : 0.0);
+        const double timed = med[kTemporalFovTimed] - med[kOff];
+        printf("         vrupscale's own GPU timing, per-pass included (area 0.6): %+.3f ms per frame (%+.1f%%)\n", timed - fov,
+               fov > 0 ? 100.0 * (timed - fov) / fov : 0.0);
         CHECK(fov < full, "foveated temporal is cheaper than whole-image temporal (%.3f vs %.3f ms)", fov, full);
         const double fsrFull = med[kFsr] - med[kOff], fsrFov = med[kFsrFov] - med[kOff];
         printf("         FSR 1 in the area (0.6) costs %.0f%% of whole-image FSR 1\n", fsrFull > 0 ? 100.0 * fsrFov / fsrFull : 0.0);

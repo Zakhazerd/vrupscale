@@ -94,7 +94,6 @@ bool LoadConfig(Config &c)
     c.statsIntervalSec = ReadInt(L"general", L"statsIntervalSec", d.statsIntervalSec);
     c.hotkeys = ReadBool(L"general", L"hotkeys", d.hotkeys);
     c.gpuTiming = ReadBool(L"general", L"gpuTiming", d.gpuTiming);
-    c.passTiming = ReadBool(L"general", L"passTiming", d.passTiming);
 
     c.enabled = ReadBool(L"upscale", L"enabled", d.enabled);
     std::wstring mode = ReadStr(L"upscale", L"mode", L"temporal");
@@ -226,8 +225,7 @@ void PrintConfig(const Config &c)
          c.onlySizes.size(), c.excludeSizes.size());
     for (auto &s : c.onlySizes) LOGI("config:   onlySize %dx%d", s.w, s.h);
     for (auto &s : c.excludeSizes) LOGI("config:   excludeSize %dx%d", s.w, s.h);
-    LOGI("config: logLevel=%d statsIntervalSec=%d hotkeys=%d gpuTiming=%d passTiming=%d", c.logLevel, c.statsIntervalSec,
-         c.hotkeys, c.gpuTiming, c.passTiming);
+    LOGI("config: logLevel=%d statsIntervalSec=%d hotkeys=%d gpuTiming=%d", c.logLevel, c.statsIntervalSec, c.hotkeys, c.gpuTiming);
 }
 
 const char *ModeName(Mode m)

@@ -6,6 +6,8 @@ What changed in each version of vrupscale, newest first.
 
 - The app always sets SteamVR's resolution while VRChat runs; the option is gone. The resolution you set in SteamVR, VRChat's own included, is what you see, and VRChat renders the preset's share of it.
 - Fixed: raising VRChat's own resolution made the app lower SteamVR's further, so you still saw the old resolution.
+- Per-pass GPU times are always in the log, alongside the app's GPU figure; the `passTiming` setting is gone.
+- Fixed: the app said its GPU time "needs passTiming=0" whenever nothing had been timed for a few seconds.
 
 ## 0.6.2
 

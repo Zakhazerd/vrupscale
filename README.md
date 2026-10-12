@@ -169,7 +169,7 @@ This test content is deliberately hard: heavily aliased, with sub-pixel detail e
 
 `selftest\selftest.cmd` runs the full test harness against your real GPU and D3D11, including real cross-process shared textures. It runs twice, the second time recording into command lists like SteamVR, and takes a few minutes. Expect `0 failed` for both parts (171 and 173 checks). The results (GPU name, quality tables, timings, pass/fail) are saved to `selftest\selftest_results.txt`; that is the file to send back.
 
-The performance section measures the GPU cost at two sizes (Index-like, 1561×1735 ×2 → 2014×2238, and a high-resolution headset, 2756×2756 ×2 → 3555×3555) while a stand-in for the game keeps the GPU busy. It reports what bilinear, FSR 1 (whole image and at the 60% area) and temporal (whole image, at the 60% area, and with Bilinear edges) add per frame for both eyes, with a per-pass breakdown of temporal at the 60% area. Compare the added cost with your frame budget (11.1 ms at 90 Hz).
+The performance section measures the GPU cost at two sizes (Index-like, 1561×1735 ×2 → 2014×2238, and a high-resolution headset, 2756×2756 ×2 → 3555×3555) while a stand-in for the game keeps the GPU busy. It reports what bilinear, FSR 1 (whole image and at the 60% area) and temporal (whole image, at the 60% area, with Bilinear edges, and with vrupscale's own GPU timing on, as in use) add per frame for both eyes, with a per-pass breakdown of temporal at the 60% area. Compare the added cost with your frame budget (11.1 ms at 90 Hz).
 
 ## If something goes wrong
 
@@ -187,7 +187,7 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 
 **Ghosting or smearing:** on moving avatars, lower **Moving objects** (0 turns history off on them). Elsewhere, lower **History strength** (say 0.50) or **Motion tolerance** (say 0.90). Note when it happens (turning, walking, avatars moving) and send the log.
 
-**Frame drops that weren't there with FSR 1:** check the GPU time in the app's status line. Make sure **Sharp history** is off, switch **Bilinear edges** on, lower **Temporal area** (at 40% it covers 16% of the pixels instead of 36%), use a lower resolution in SteamVR (vrupscale's cost follows it), or switch to FSR 1. The compositor's work has to fit into the short time before each display refresh; if it doesn't, SteamVR drops frames even when the GPU has time to spare elsewhere. For a breakdown, set `passTiming=1` under `[general]` in the settings file and send the log.
+**Frame drops that weren't there with FSR 1:** check the GPU time in the app's status line. Make sure **Sharp history** is off, switch **Bilinear edges** on, lower **Temporal area** (at 40% it covers 16% of the pixels instead of 36%), use a lower resolution in SteamVR (vrupscale's cost follows it), or switch to FSR 1. The compositor's work has to fit into the short time before each display refresh; if it doesn't, SteamVR drops frames even when the GPU has time to spare elsewhere. The log breaks the GPU time down per pass every 10 seconds: send it.
 
 **The image is cropped to one corner or zoomed in:** the compositor reads that texture with integer texel fetches instead of UVs. Untick its size and send the log.
 
@@ -197,7 +197,7 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 
 `%LOCALAPPDATA%\vrupscale\vrupscale.ini`. The app writes the keys it shows; the upscaler re-reads the file within a second of a change, so editing it by hand works too. Keys the app doesn't show:
 - `[general] active=0` – the upscaler does nothing but pass calls on to Windows' own `dxgi.dll` (read when SteamVR starts).
-- `[general] logLevel` (0 errors, 1 info, 2 verbose); `statsIntervalSec` (a stats line every N seconds, 0 off); `passTiming=1` (temporal mode's GPU time per pass in the stats line, per new frame and eye, with the quick checks of frames already processed listed apart; the app's GPU figure isn't measured meanwhile).
+- `[general] logLevel` (0 errors, 1 info, 2 verbose); `statsIntervalSec` (default 10: a stats line in the log every N seconds, 0 off). The stats line includes temporal mode's GPU time per pass, per new frame and eye, with the quick checks of frames already processed listed apart. `gpuTiming=0` turns off all of vrupscale's GPU timing (the app's GPU figure and the per-pass times).
 - `[match]` – rules for what counts as an eye texture: `minWidth`, `minHeight`, `minAspect`, `maxAspect`, `requireShared`, `onlySizes` / `excludeSizes` (comma-separated `WxH`), `maxArraySize`.
 - `[upscale] upscaleFactor` – the **Scaling** preset's factor. Any value from 1.00 to 3.00 works; one that isn't a preset shows as Custom in the app, and one within 0.02 of a preset is moved onto it when the app starts.
 - `[eyes]` – `followGaze`, `showGaze` (the app's switches); `offsetX` / `offsetY` (the calibration: tangents of the angle taken off the tracker's reading, x right, y up); `projection` (each eye's field of view as SteamVR reports it: tangents left, right, top, bottom, left eye then right; written by the app); `deadzone` (default 0.02: how far the gaze must move from the area's centre, as a fraction of the width, before the area follows).

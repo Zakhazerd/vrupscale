@@ -85,8 +85,8 @@ struct Config {
     int logLevel = 1;
     int statsIntervalSec = 10;
     bool hotkeys = true;
-    bool gpuTiming = true;           // timestamp queries around our dispatches (for the stats line)
-    bool passTiming = false;         // per-pass GPU times of the temporal path (stats line; diagnostics)
+    bool gpuTiming = true;           // timestamp queries around our dispatches: the app's GPU figure and the
+                                     // stats line's per-pass times of the temporal path
 
     // [temporal]
     float maxWeight = 1.0f;          // history weight cap (current sample = 1); more = steadier but softer

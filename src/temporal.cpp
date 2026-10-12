@@ -37,24 +37,20 @@ const char *const kTPassNames[kTPasses] = { "luma+decide", "pyramid", "search", 
 void PollPassQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
 {
     for (auto &q : ds->pq) {
-        if (!q.busy) continue;
-        const UINT flags = wait ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH;
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-        HRESULT hr;
-        int spins = 0;
-        while ((hr = ctx->GetData(q.dj.Get(), &dj, sizeof(dj), flags)) == S_FALSE && wait && ++spins < 200000) Sleep(0);
-        if (hr != S_OK) continue;
+        // read once the batch's disjoint query was (PollQueries): its frequency, and whether the
+        // clock stayed steady
+        if (!q.busy || !q.batchRead) continue;
         UINT64 t[kTPasses + 1] = {};
-        bool ok = !dj.Disjoint && dj.Frequency;
+        bool ok = q.freq != 0;
         for (int i = 0; i <= kTPasses && ok; ++i)
             ok = ctx->GetData(q.t[i].Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
         for (int i = 0; i < kTPasses && ok; ++i) ok = t[i + 1] >= t[i];
-        // Was it a new frame's update? (copied before the disjoint query ended, so it is ready by now)
+        // Was it a new frame's update? (copied before the batch's disjoint query ended, so it is ready by now)
         uint32_t ctrl[4] = {};
         if (ok) {
             D3D11_MAPPED_SUBRESOURCE m;
             HRESULT mr;
-            spins = 0;
+            int spins = 0;
             while ((mr = ctx->Map(q.ctrl.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)) == DXGI_ERROR_WAS_STILL_DRAWING &&
                    wait && ++spins < 200000)
                 Sleep(0);
@@ -66,10 +62,10 @@ void PollPassQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
             }
         }
         if (ok && ctrl[1]) {
-            for (int i = 0; i < kTPasses; ++i) ds->passMs[i] += double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency);
+            for (int i = 0; i < kTPasses; ++i) ds->passMs[i] += double(t[i + 1] - t[i]) * 1000.0 / double(q.freq);
             ds->passRuns++;
         } else if (ok) {
-            ds->checkMs += double(t[kTPasses] - t[0]) * 1000.0 / double(dj.Frequency);
+            ds->checkMs += double(t[kTPasses] - t[0]) * 1000.0 / double(q.freq);
             ds->checkRuns++;
         }
         q.busy = false;
@@ -114,12 +110,12 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
     PollPassQueries(ds, ctx, false);
     for (auto &q : ds->pq) {
         if (q.busy) continue;
-        if (!q.dj) {
-            D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, qt = { D3D11_QUERY_TIMESTAMP, 0 };
-            bool ok = SUCCEEDED(ds->dev->CreateQuery(&qd, q.dj.Put()));
+        if (!q.ctrl) {
+            D3D11_QUERY_DESC qt = { D3D11_QUERY_TIMESTAMP, 0 };
+            bool ok = true;
             for (auto &t : q.t) ok = ok && SUCCEEDED(ds->dev->CreateQuery(&qt, t.Put()));
             ok = ok && CreateStaging(ds->dev.Get(), q.ctrl, 16);
-            if (!ok) { q.dj.Reset(); return nullptr; }
+            if (!ok) { q.ctrl.Reset(); return nullptr; }
         }
         return &q;
     }
@@ -1151,13 +1147,19 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     ID3D11Buffer *cb = ds->tcb.Get();
     ctx->CSSetConstantBuffers(0, 1, &cb);
 
-    PassQueries *pq = (g_cfg.passTiming && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? AcquirePassQueries(ds, ctx)
-                                                                                           : nullptr;
+    // per-pass timestamps, inside the timed batch this run is part of (none: not timed)
+    PassQueries *pq = (ds->activeBatch >= 0 && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? AcquirePassQueries(ds, ctx)
+                                                                                                : nullptr;
+    if (pq) {
+        pq->batch = ds->activeBatch;
+        pq->batchSerial = ds->q[ds->activeBatch].serial;
+        pq->batchRead = false;
+        pq->freq = 0;
+    }
     int mark = 0;
     auto Mark = [&]() {
         if (pq && mark <= kTPasses) ctx->End(pq->t[mark++].Get());
     };
-    if (pq) ctx->Begin(pq->dj.Get());
     Mark();
 
     ID3D11Buffer *args = s->args.buf.Get();
@@ -1239,7 +1241,6 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     Mark();
     if (pq) {
         ctx->CopyResource(pq->ctrl.Get(), s->ctrl.buf.Get());   // this run's decision (new frame or not)
-        ctx->End(pq->dj.Get());
         pq->busy = mark == kTPasses + 1;
     }
 
