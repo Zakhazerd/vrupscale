@@ -118,6 +118,8 @@ struct Config {
     float gazeDeadzone = 0.02f;      // the area moves once the gaze is this far (fraction of the width) from its centre
     float temporalArea = 0.6f;       // width and height of the part with history / FSR 1 (1 = everything) ...
     float gazeArea = 0.4f;           // ... and the same while it follows the gaze (it is where you look: smaller does)
+    float sharpArea = 0.6f;          // [upscale] width and height of the part RCAS sharpens (at least the area above) ...
+    float gazeSharpArea = 0.4f;      // ... and the same while the area follows the gaze
     int maxStreams = 4;              // temporal histories (one per eye texture lineage)
     bool linkPools = true;           // let rotating swap-chain textures of one eye share history
     float linkGapMs = 2.0f;          // never link textures bound closer together than this
@@ -128,6 +130,14 @@ struct Config {
 // The area that gets the full treatment (history in Temporal mode, FSR 1 in FSR mode): its own
 // value while it follows the gaze.
 inline float RegionArea(const Config &c) { return c.gazeFollow ? c.gazeArea : c.temporalArea; }
+
+// The part RCAS sharpens (the Sharpness area), centred on that area: at least the area itself.
+// Outside the area it sharpens the spatial upscale.
+inline float SharpArea(const Config &c)
+{
+    const float s = c.gazeFollow ? c.gazeSharpArea : c.sharpArea, r = RegionArea(c);
+    return s > r ? s : r;
+}
 
 extern Config g_cfg;
 extern volatile LONG g_cfgGen;       // bumped on every (re)load; invalidates cached decisions

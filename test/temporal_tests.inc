@@ -724,6 +724,116 @@ static void RunFoveatedFsrTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, cons
     g_fovBand = 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Sharpness area: RCAS beyond the temporal area, over the spatial upscale there. Checked against a
+// CPU port of FSR 1's RCAS applied to the plain upscale (the output with the sharpness area at the
+// temporal area's size, which leaves everything outside the area unsharpened).
+
+static float PrxMedRcp(float a)   // ffx_a.h APrxMedRcpF1
+{
+    uint32_t u;
+    memcpy(&u, &a, 4);
+    u = 0x7ef19fffu - u;
+    float b;
+    memcpy(&b, &u, 4);
+    return b * (-b * a + 2.0f);
+}
+
+// ffx_fsr1.h FsrRcasF at (x, y), edges clamped; fminf / fmaxf return the other operand for a NaN, as the GPU's min / max do
+static void RcasCpu(const Image &im, int x, int y, float sharpness, float out[3])
+{
+    auto P = [&](int xx, int yy) { return im.at(std::max(0, std::min(im.w - 1, xx)), std::max(0, std::min(im.h - 1, yy))); };
+    const float *b = P(x, y - 1), *d = P(x - 1, y), *e = P(x, y), *f = P(x + 1, y), *h = P(x, y + 1);
+    float lobeC = -1e9f;
+    for (int c = 0; c < 3; ++c) {
+        const float mn4 = fminf(fminf(b[c], d[c]), fminf(f[c], h[c])), mx4 = fmaxf(fmaxf(b[c], d[c]), fmaxf(f[c], h[c]));
+        const float hitMin = fminf(mn4, e[c]) * (1.0f / (4.0f * mx4));
+        const float hitMax = (1.0f - fmaxf(mx4, e[c])) * (1.0f / (4.0f * mn4 - 4.0f));
+        lobeC = fmaxf(lobeC, fmaxf(-hitMin, hitMax));
+    }
+    const float con = exp2f(-(2.0f - 2.0f * sharpness));
+    const float lobe = fmaxf(-(0.25f - 1.0f / 16.0f), fminf(lobeC, 0.0f)) * con;
+    const float rcpL = PrxMedRcp(4.0f * lobe + 1.0f);
+    for (int c = 0; c < 3; ++c) out[c] = (lobe * (b[c] + d[c] + h[c] + f[c]) + e[c]) * rcpL;
+}
+
+static void RunSharpnessAreaTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, const char *iniBase, const char *reqShared, float F,
+                                 UINT misc, const char *outDir)
+{
+    const float area = 0.5f, part = 0.8f, sharp = 0.5f;
+    SetFovRegion(mov.ow, mov.oh, area);
+    const int *R = g_fovRect, B = g_fovBand;
+    // the sharpening area at `part`: centred on the area (mirrors PlaceSpatialArea / temporal.hlsl's SharpRect)
+    auto side = [&](int out, float a) {
+        int r = (int)ceilf((float)out * a / 16.0f) * 16;
+        return r + 32 >= out ? out : r;
+    };
+    const int sw = side(mov.ow, part), sh = side(mov.oh, part);
+    const int sx = std::max(0, std::min((R[0] + R[2]) / 2 - sw / 2, mov.ow - sw));
+    const int sy = std::max(0, std::min((R[1] + R[3]) / 2 - sh / 2, mov.oh - sh));
+    const int S[4] = { sx, sy, sx + sw, sy + sh };
+    printf("[sharpness area: RCAS beyond the area (area %.1f: %dx%d; sharpness area %.1f: %dx%d, and all)]\n", area, R[2] - R[0],
+           R[3] - R[1], part, sw, sh);
+    std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
+    ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
+    ID3D11ShaderResourceView *views[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+                                           MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
+    char ini[2048];
+    auto Shot = [&](const char *mode, float sa) {
+        snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=%s\nupscaleFactor=%.2f\nsharpness=%.2f\nsharpnessArea=%.2f\n"
+                 "[temporal]\ntemporalArea=%.2f\n", iniBase, reqShared, mode, F, sharp, sa, area);
+        WriteIni(ini);
+        Pump(g);
+        UploadSlices(g, app, mov.in[0][5], mov.in[1][5]);
+        DrawEye(g, tgt, views[1], 1, nullptr, false);
+        return DrawEye(g, tgt, views[0], 0, nullptr, true);
+    };
+    for (const char *mode : { "fsr", "temporal" }) {
+        const char *name = strcmp(mode, "fsr") == 0 ? "FSR 1" : "Temporal";
+        const Image a = Shot(mode, area), all = Shot(mode, 1.0f), c = Shot(mode, part);
+        const int core[4] = { R[0] + B + 2, R[1] + B + 2, R[2] - B - 2, R[3] - B - 2 };
+        const int sCore[4] = { S[0] + B + 2, S[1] + B + 2, S[2] - B - 2, S[3] - B - 2 };
+        double refMax = 0, refSum = 0, chgSum = 0, coreMax = 0, inMax = 0, outMax = 0;
+        long n = 0;
+        for (int y = 0; y < mov.oh; ++y)
+            for (int x = 0; x < mov.ow; ++x) {
+                const bool outside = !InRect(x, y, R, 2);   // (RCAS there reads only pixels outside the area)
+                float ref[3] = {};
+                if (outside) RcasCpu(a, x, y, sharp, ref);
+                for (int k = 0; k < 3; ++k) {
+                    const float va = a.at(x, y)[k], vall = all.at(x, y)[k], vc = c.at(x, y)[k];
+                    if (outside) {
+                        const double d = fabs((double)vall - std::max(0.0f, std::min(1.0f, ref[k])));
+                        refMax = std::max(refMax, d);
+                        refSum += d;
+                        chgSum += fabs((double)vall - va);
+                    }
+                    if (InRect(x, y, core, 0)) coreMax = std::max(coreMax, (double)fabsf(vall - va) + fabsf(vc - va));
+                    if (InRect(x, y, sCore, 0) && outside) inMax = std::max(inMax, (double)fabsf(vc - vall));
+                    if (!InRect(x, y, S, 2)) outMax = std::max(outMax, (double)fabsf(vc - va));
+                }
+                if (outside) n += 3;
+            }
+        printf("         %-8s sharpness area all, outside the area: RCAS of the plain upscale to within %.2f/255 on average (largest "
+               "%.1f/255); it changed the plain upscale by %.2f/255 on average\n", name, refSum / n * 255.0, refMax * 255.0,
+               chgSum / n * 255.0);
+        CHECK(AllFinite(all) && AllFinite(c), "%s, sharpness area: output finite and in range", name);
+        CHECK(chgSum / n > 0.5 / 255.0 && refSum / n < 0.35 / 255.0 && refMax <= 2.5 / 255.0,
+              "%s, sharpness area all: outside the area, FSR 1's RCAS over the spatial upscale (%.2f/255 from a CPU RCAS on average)",
+              name, refSum / n * 255.0);
+        CHECK(coreMax <= 1.5 / 255.0, "%s, sharpness area: the area itself is unchanged (largest difference %.1f/255)", name, coreMax * 255.0);
+        CHECK(inMax <= 1.5 / 255.0 && outMax <= 1.5 / 255.0,
+              "%s, sharpness area %.1f: sharpened inside it as with all (%.1f/255), plain outside it (%.1f/255)", name, part,
+              inMax * 255.0, outMax * 255.0);
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s\\sharp_area_%s.ppm", outDir, mode); SavePpm(c, path);
+    }
+    ClearAll(g);
+    SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
+    Settle(g);
+    g_fovBand = 0;
+}
+
 static void Upload1(Gfx &g, ID3D11Texture2D *t, const Image &im)
 {
     std::vector<uint8_t> bytes(size_t(im.w) * im.h * 4);
@@ -1853,6 +1963,13 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
         return;
     }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "sharparea") == 0) {
+        EyeTarget t1;
+        EnsureEyeTarget(g, t1, OW, OH);
+        RunSharpnessAreaTest(g, t1, mov, tIniBase, reqShared, F, misc, outDir);
+        t1.Release();
+        return;
+    }
 
     std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
     ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
@@ -1943,6 +2060,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     if (qualityOnly) {
         RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
         RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
+        RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
         RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
         RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
         RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
@@ -1985,6 +2103,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
 
     RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
     RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
+    RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
 
     // ---- still scene: no extra information, must not be worse than FSR 1 by much
     printf("[temporal: still scene]\n");
@@ -2316,12 +2435,14 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
     // the last run repeats foveated temporal with per-pass timestamps (kept out of the table: they add a little)
     // ("+ GPU timing" is the default use: vrupscale's own queries for the app's GPU figure and the
     // per-pass times; the other rows switch them off so the harness's queries time the frame alone)
-    enum { kOff, kBilinear, kFsr, kFsrFov, kTemporalFull, kTemporalFov, kTemporalFovBil, kTemporalFovTimed, kPerPass, kRuns };
-    const char *names[kRuns] = { "off", "bilinear", "fsr, whole image", "fsr, area 0.6", "temporal, whole image", "temporal, area 0.6",
-                                 "  + bilinear edges", "  + GPU timing", "per-pass timestamps" };
-    const char *modeIni[kRuns] = { "enabled=0\n", "mode=bilinear\n", "mode=fsr\n", "mode=fsr\n", "mode=temporal\n", "mode=temporal\n",
-                                   "mode=temporal\n", "mode=temporal\n", "mode=temporal\n" };
-    const char *areaIni[kRuns] = { "1", "1", "1", "0.6", "1", "0.6", "0.6\nbilinearEdges=1", "0.6", "0.6" };
+    enum { kOff, kBilinear, kFsr, kFsrFov, kFsrFovSharp, kTemporalFull, kTemporalFov, kTemporalFovBil, kTemporalFovSharp,
+           kTemporalFovTimed, kPerPass, kRuns };
+    const char *names[kRuns] = { "off", "bilinear", "fsr, whole image", "fsr, area 0.6", "  + sharpness area all", "temporal, whole image",
+                                 "temporal, area 0.6", "  + bilinear edges", "  + sharpness area all", "  + GPU timing", "per-pass timestamps" };
+    const char *modeIni[kRuns] = { "enabled=0\n", "mode=bilinear\n", "mode=fsr\n", "mode=fsr\n", "mode=fsr\n", "mode=temporal\n",
+                                   "mode=temporal\n", "mode=temporal\n", "mode=temporal\n", "mode=temporal\n", "mode=temporal\n" };
+    const char *areaIni[kRuns] = { "1", "1", "1", "0.6", "0.6", "1", "0.6", "0.6\nbilinearEdges=1", "0.6", "0.6", "0.6" };
+    const char *sharpIni[kRuns] = { "", "", "", "", "sharpnessArea=1\n", "", "", "", "sharpnessArea=1\n", "", "" };
     double mean[kRuns] = {}, med[kRuns] = {};
     uint64_t newFrames[kRuns] = {};
     uint32_t serial = 1;
@@ -2334,8 +2455,8 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
         const bool perPass = m == kPerPass;
         snprintf(ini, sizeof(ini),
                  "[general]\nlogLevel=1\nstatsIntervalSec=0\nhotkeys=0\ngpuTiming=%d\n[match]\nrequireShared=%s\n"
-                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n[temporal]\ntemporalArea=%s\n", (perPass || m == kTemporalFovTimed) ? 1 : 0, reqShared,
-                 modeIni[m], (double)OH / (double)H, areaIni[m]);
+                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n%s[temporal]\ntemporalArea=%s\n", (perPass || m == kTemporalFovTimed) ? 1 : 0,
+                 reqShared, modeIni[m], (double)OH / (double)H, sharpIni[m], areaIni[m]);
         WriteIni(ini);
         Pump(g);
         if (perPass) g_passTimes(nullptr, nullptr, 0, 1);   // discard anything older
@@ -2446,6 +2567,10 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
         printf("         foveation (area 0.6) costs %.0f%% of whole-image temporal\n", full > 0 ? 100.0 * fov / full : 0.0);
         const double bil = med[kTemporalFovBil] - med[kOff];
         printf("         bilinear edges (area 0.6): %+.3f ms per frame (%+.0f%%)\n", bil - fov, fov > 0 ? 100.0 * (bil - fov) / fov : 0.0);
+        const double tSharp = med[kTemporalFovSharp] - med[kOff], fSharp = med[kFsrFovSharp] - med[kOff];
+        const double fsrFov0 = med[kFsrFov] - med[kOff];
+        printf("         sharpness area all (area 0.6): FSR 1 %+.3f ms per frame (%+.0f%%), temporal %+.3f ms (%+.0f%%)\n", fSharp - fsrFov0,
+               fsrFov0 > 0 ? 100.0 * (fSharp - fsrFov0) / fsrFov0 : 0.0, tSharp - fov, fov > 0 ? 100.0 * (tSharp - fov) / fov : 0.0);
         const double timed = med[kTemporalFovTimed] - med[kOff];
         printf("         vrupscale's own GPU timing, per-pass included (area 0.6): %+.3f ms per frame (%+.1f%%)\n", timed - fov,
                fov > 0 ? 100.0 * (timed - fov) / fov : 0.0);

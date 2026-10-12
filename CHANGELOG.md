@@ -6,6 +6,7 @@ What changed in each version of vrupscale, newest first.
 
 - The app starts with SteamVR, minimized, and closes when SteamVR does. It adds itself to SteamVR's startup apps the first time SteamVR runs while it is open. **Start with SteamVR** switches this off.
 - SteamVR's resolution is no longer lowered while vrupscale isn't installed in SteamVR.
+- **Sharpness area**: sharpening can reach past the Temporal area, up to the whole picture. It starts at the Temporal area's defaults, 60% (40% while following your gaze).
 
 ## 0.6.3
 

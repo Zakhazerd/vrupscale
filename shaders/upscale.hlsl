@@ -4,10 +4,15 @@
 //   PASS 1  RCAS      FSR1 robust contrast-adaptive sharpening  scratch -> proxy
 //   PASS 2  BILINEAR  plain bilinear upscale (A/B baseline)     source  -> proxy
 //   PASS 3  OUTER     outside the area: Catmull-Rom (or bilinear) from the source -> proxy
+//                     (OSHARP: and RCAS over that in the sharpening area)
 //
 // The area (as in temporal.hlsl): with FOV_ON, EASU and RCAS cover only an area of each eye's
 // picture (Region[z], centred or around the gaze), blending into OUTER's cheap upscale across a
 // band inside the area's edge; OUTER does the rest. Both are dispatched over their own extent.
+//
+// The sharpening area (Sharp[z], the Sharpness area setting) holds the area and may reach further.
+// With FOV_SHARP it does: OUTER sharpens its upscale with RCAS there (fading out across a band
+// inside the sharpening area's edge), and the area's band blends into that sharpened upscale.
 //
 // Every other pass covers Span: the game's picture and a band around it. When the game renders
 // into part of a larger texture (SteamVR's resolution lowered while it runs), the rest of the
@@ -33,6 +38,9 @@
 #ifndef XFORM
 #define XFORM 0
 #endif
+#ifndef OSHARP       // OUTER: 1 = RCAS over the spatial upscale inside the sharpening area
+#define OSHARP 0
+#endif
 
 #define A_GPU 1
 #define A_HLSL 1
@@ -54,12 +62,14 @@ cbuffer Params : register(b0)
     uint4 Region[2];   // per dispatched slice (z 0, 1): the area, x, y, w, h (output px)
     uint4 Marks[2];    // per dispatched slice: gaze ring x, y | calibration cross x, y (output px; ~0 = none)
     uint4 Span;        // what the passes over the picture cover (output px): x, y, w, h
+    uint4 Sharp[2];    // per dispatched slice: the sharpening area, x, y, w, h (output px; holds Region)
 };
 
 #define FLAG_FINAL     4u   // this pass writes the proxy: apply the output transform
 #define FLAG_TINT      8u   // debug: tint processed output magenta (the area) and blue (outside it)
 #define FOV_ON         1u   // EASU / RCAS cover Region only, OUTER the rest
 #define FOV_BILINEAR   2u   // OUTER and the band: bilinear instead of Catmull-Rom
+#define FOV_SHARP      4u   // the sharpening area reaches past the area (Con0: RCAS's constants in every pass)
 
 SamplerState            LinearClamp : register(s0);
 Texture2DArray<float4>  Src         : register(t0);
@@ -150,9 +160,10 @@ void EmitW(uint2 pos, float3 c, float a, float t)
 void Emit(uint2 pos, float3 c, float a) { EmitW(pos, c, a, 1.0); }
 
 uint4 RegionZ() { return Region[min(gZ, 1u)]; }
+uint4 SharpZ() { return Sharp[min(gZ, 1u)]; }
 
-// 1 inside the area, falling smoothly to 0 across the band at its inner edges (edges on the
-// picture's border need no blending).
+// 1 inside the area r, falling smoothly to 0 across the band at its inner edges (edges on the
+// picture's border need no blending); 0 outside it.
 float CentreWeight(uint2 g, uint4 r)
 {
     const float band = float(Fov.x);
@@ -197,29 +208,17 @@ float4 Spatial(uint2 g)
     return float4(saturate(InXform3(max(c / ws, 0.0))), ctr.a);
 }
 
-// The area's result at pos, blended into the spatial upscale across the band; then written.
-void EmitArea(uint2 pos, float3 c, float a)
-{
-    float t = 1.0;
-    if ((Fov.y & FOV_ON) && (Flags & FLAG_FINAL)) {
-        t = CentreWeight(pos, RegionZ());
-        if (t < 1.0) {
-            float4 sp = Spatial(pos);
-            c = lerp(sp.rgb, c, t);
-            a = sp.a;
-        }
-    }
-    EmitW(pos, c, a, t);
-}
-
 #if PASS == 0
   AF4 FsrEasuRF(AF2 p) { return InXform4(Src.GatherRed  (LinearClamp, float3(p, gSlice))); }
   AF4 FsrEasuGF(AF2 p) { return InXform4(Src.GatherGreen(LinearClamp, float3(p, gSlice))); }
   AF4 FsrEasuBF(AF2 p) { return InXform4(Src.GatherBlue (LinearClamp, float3(p, gSlice))); }
   #define FSR_EASU_F 1
 #elif PASS == 1
+  static bool gRcasSpatial = false;   // RCAS over the spatial upscale (computed here) instead of the scratch
   AF4 FsrRcasLoadF(ASU2 p)
   {
+      if (gRcasSpatial)
+          return Spatial(uint2(clamp(p, ASU2(Content.xy), ASU2(Content.zw) - ASU2(1, 1))));
       // foveated: the scratch holds EASU's output in the area only
       ASU2 lo = ASU2(Span.xy), hi = ASU2(Span.xy + Span.zw) - ASU2(1, 1);
       if (Fov.y & FOV_ON) {
@@ -232,9 +231,46 @@ void EmitArea(uint2 pos, float3 c, float a)
   }
   void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
   #define FSR_RCAS_F 1
+#elif PASS == 3 && OSHARP
+  // OUTER's 16x16 tile of the spatial upscale with a 1-pixel apron (filled once per group), for RCAS
+  groupshared float4 gsT[18 * 18];
+  static int2 gsOrg;   // the output pixel at gsT[0]
+  AF4 FsrRcasLoadF(ASU2 p)
+  {
+      const int2 q = clamp(int2(p) - gsOrg, 0, 17);
+      return gsT[q.y * 18 + q.x];
+  }
+  void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+  #define FSR_RCAS_F 1
 #endif
 
 #include "ffx_fsr1.h"
+
+// The area's result at pos, blended into the spatial upscale across the band (sharpened where the
+// sharpening area reaches past the area, as OUTER does next to it); then written.
+void EmitArea(uint2 pos, float3 c, float a)
+{
+    float t = 1.0;
+    if ((Fov.y & FOV_ON) && (Flags & FLAG_FINAL)) {
+        t = CentreWeight(pos, RegionZ());
+        if (t < 1.0) {
+            float4 sp = Spatial(pos);
+#if PASS == 1
+            const float ws = (Fov.y & FOV_SHARP) ? CentreWeight(pos, SharpZ()) : 0.0;
+            if (ws > 0.0) {
+                AF3 s3;
+                gRcasSpatial = true;
+                FsrRcasF(s3.r, s3.g, s3.b, pos, Con0);
+                gRcasSpatial = false;
+                sp.rgb = lerp(sp.rgb, s3, ws);
+            }
+#endif
+            c = lerp(sp.rgb, c, t);
+            a = sp.a;
+        }
+    }
+    EmitW(pos, c, a, t);
+}
 
 void Process(uint2 pos)
 {
@@ -277,6 +313,34 @@ void Process(uint2 pos)
 #endif
 }
 
+#if PASS == 3 && OSHARP
+// OUTER with the sharpening area: the spatial upscale, and in the sharpening area RCAS over it
+// (blended out across the band inside its edges). Outside the picture (the band around it in the
+// span) the plain upscale, as always.
+void OuterSharp(uint2 pos, bool tile)
+{
+    if (any(pos >= Span.zw)) return;
+    pos += Span.xy;
+    if (any(pos >= OutSize)) return;
+    const uint4 r = RegionZ();
+    if (all(pos >= r.xy) && all(pos < r.xy + r.zw)) return;   // EASU / RCAS write the area
+    float4 sp;
+    if (tile && all(pos >= Content.xy) && all(pos < Content.zw)) {
+        const int2 q = int2(pos) - gsOrg;
+        sp = gsT[q.y * 18 + q.x];
+        const float ws = CentreWeight(pos, SharpZ());
+        if (ws > 0.0) {
+            AF3 s3;
+            FsrRcasF(s3.r, s3.g, s3.b, pos, Con0);
+            sp.rgb = lerp(sp.rgb, s3, ws);
+        }
+    } else {
+        sp = Spatial(pos);
+    }
+    EmitW(pos, sp.rgb, sp.a, 0.0);
+}
+#endif
+
 [numthreads(64, 1, 1)]
 void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
@@ -284,6 +348,27 @@ void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
     gZ = gid.z;
     // 64 threads cover a 16x16 tile as four 8x8 quads (AMD's PS-like swizzle).
     AU2 gxy = ARmp8x8(lt.x) + AU2(gid.x << 4u, gid.y << 4u);
+#if PASS == 3 && OSHARP
+    // a tile next to or in the sharpening area: its upscale (and the apron, clamped to the picture)
+    // goes to groupshared memory first, so that RCAS reads each pixel once computed
+    const int2 T = int2(Span.xy) + int2(gid.xy) * 16;
+    gsOrg = T - 1;
+    const int4 s = int4(SharpZ());
+    const bool tile = T.x - 1 < s.x + s.z && T.x + 17 > s.x && T.y - 1 < s.y + s.w && T.y + 17 > s.y;
+    if (tile)
+        for (uint i = lt.x; i < 18u * 18u; i += 64u) {
+            const int2 q = clamp(gsOrg + int2(i % 18u, i / 18u), int2(Content.xy), int2(Content.zw) - 1);
+            gsT[i] = Spatial(uint2(q));
+        }
+    GroupMemoryBarrierWithGroupSync();
+    OuterSharp(gxy, tile);
+    gxy.x += 8u;
+    OuterSharp(gxy, tile);
+    gxy.y += 8u;
+    OuterSharp(gxy, tile);
+    gxy.x -= 8u;
+    OuterSharp(gxy, tile);
+#else
     Process(gxy);
     gxy.x += 8u;
     Process(gxy);
@@ -291,4 +376,5 @@ void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
     Process(gxy);
     gxy.x -= 8u;
     Process(gxy);
+#endif
 }

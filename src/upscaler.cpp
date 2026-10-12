@@ -58,9 +58,10 @@ struct Params {
     uint32_t region[2][4];  // per dispatched slice: the area x, y, w, h
     uint32_t marks[2][4];   // per dispatched slice: gaze ring x, y | calibration cross x, y (~0u = none)
     uint32_t span[4];       // what the passes over the picture cover: x, y, w, h (SpatialSpan)
+    uint32_t sharp[2][4];   // per dispatched slice: the sharpening area x, y, w, h (holds the area)
 };
-static_assert(sizeof(Params) == 208, "cbuffer layout must match upscale.hlsl");
-constexpr uint32_t FOV_ON = 1, FOV_BILINEAR = 2;
+static_assert(sizeof(Params) == 240, "cbuffer layout must match upscale.hlsl");
+constexpr uint32_t FOV_ON = 1, FOV_BILINEAR = 2, FOV_SHARP = 4;
 
 struct RejectRecord { LONG cfgGen; LONG markGen; int token; int unticked; };   // token: row in the app's texture list
 // on textures: UINT32 = g_cfgGen when it was found to be one of the game's eye textures: upscaled even
@@ -956,14 +957,22 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     SpatialArea area;
     const bool fov = fsr && PlaceSpatialArea(ts, first, count, job.side, area);
     const UINT ax = fov ? (area.region[0][2] + 15) / 16 : gx, ay = fov ? (area.region[0][3] + 15) / 16 : gy;
+    bool rcas = fsr && sharp > 0.0f;
+    if (rcas && !EnsureScratch(ds, ow, oh, slices)) rcas = false;
+    // RCAS beyond the area too (the Sharpness area): OUTER sharpens its upscale there, and the area's
+    // band blends into that
+    const bool sharpOut = rcas && fov && area.sharpBeyond;
+    uint32_t rcasCon[4];
+    FsrRcasCon(rcasCon, 2.0f - 2.0f * sharp);
     auto Common = [&](Params &q) {
         q.fov[0] = area.band;
-        q.fov[1] = fov ? FOV_ON | (g_cfg.bilinearEdges ? FOV_BILINEAR : 0u) : 0u;
+        q.fov[1] = fov ? FOV_ON | (g_cfg.bilinearEdges ? FOV_BILINEAR : 0u) | (sharpOut ? FOV_SHARP : 0u) : 0u;
         q.fov[2] = w; q.fov[3] = h;
         memcpy(q.content, area.content, sizeof(q.content));
         memcpy(q.region, area.region, sizeof(q.region));
         memcpy(q.marks, area.marks, sizeof(q.marks));   // (all ~0 unless FSR 1 shows the gaze)
         memcpy(q.span, span, sizeof(q.span));
+        memcpy(q.sharp, area.sharp, sizeof(q.sharp));
     };
 
     // Upscale only if the content changed since this proxy range was written (the compositor draws
@@ -987,9 +996,6 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     ID3D11Buffer *cb = ds->cb.Get();
     ctx->CSSetConstantBuffers(0, 1, &cb);
 
-    bool rcas = fsr && sharp > 0.0f;
-    if (rcas && !EnsureScratch(ds, ow, oh, slices)) rcas = false;
-
     Params p = {};
     p.outSize[0] = ow; p.outSize[1] = oh;
     p.inSize[0] = w; p.inSize[1] = h;
@@ -1010,7 +1016,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
 
     if (rcas) {
         Params r = {};
-        FsrRcasCon(r.con0, 2.0f - 2.0f * sharp);
+        memcpy(r.con0, rcasCon, sizeof(r.con0));
         r.outSize[0] = ow; r.outSize[1] = oh;
         r.inSize[0] = ow; r.inSize[1] = oh;
         r.flags = finalFlags;   // scratch already holds perceptual values; only the output transform applies
@@ -1023,24 +1029,25 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         }
     }
 
-    if (fov) {   // outside the area: this frame alone, Catmull-Rom (or bilinear)
+    if (fov) {   // outside the area: this frame alone, Catmull-Rom (or bilinear), sharpened in the sharpening area
         Params o = {};
+        if (sharpOut) memcpy(o.con0, rcasCon, sizeof(o.con0));
         o.outSize[0] = ow; o.outSize[1] = oh;
         o.inSize[0] = w; o.inSize[1] = h;
         o.flags = finalFlags;
         o.pad[0] = first;
         Common(o);
         if (WriteParams(ctx, ds, o)) {
-            ctx->CSSetShader(ds->cs[SH_FSR_OUTER_X0 + x].Get(), nullptr, 0);
+            ctx->CSSetShader(ds->cs[(sharpOut ? SH_FSR_OUTSH_X0 : SH_FSR_OUTER_X0) + x].Get(), nullptr, 0);
             BindCS(ctx, { ve->srcRead.Get(), ve->srcRead.Get() }, { ts->proxyUAV.Get() });
             Run(24);
         }
     }
 
     if (ts->upscales == 0)
-        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s), writing %ux%u at %u,%u", w, h, first,
-             first + count - 1, ow, oh, fsr ? "EASU" : "bilinear", rcas ? "+RCAS" : "", fov ? ", in the area only" : "", span[2],
-             span[3], span[0], span[1]);
+        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s%s), writing %ux%u at %u,%u", w, h, first,
+             first + count - 1, ow, oh, fsr ? "EASU" : "bilinear", rcas ? "+RCAS" : "", fov ? ", in the area only" : "",
+             sharpOut ? ", RCAS beyond it" : "", span[2], span[3], span[0], span[1]);
     ts->upscales++;
     InterlockedIncrement(&g_stats.upscales);
     InterlockedIncrement(&g_iv.upscales);
@@ -1373,10 +1380,11 @@ void ApplyConfig(const Config &nc, const char *source)
     size_t len = 0;
     for (auto &e : nc.excludeSizes)
         if (len < sizeof(excl) - 16) len += snprintf(excl + len, sizeof(excl) - len, " %dx%d", e.w, e.h);
-    LOGI("settings from %s: %s, mode=%s, factor=%.2f, sharpness=%.2f, tint=%d, area=%.2f (following the gaze %.2f), history=%.2f, "
-         "moving=%.2f, tolerance=%.2f, %s history, %s edges, gaze %s%s (offset %.3f, %.3f), excluded:%s%s",
-         source, nc.enabled ? "on" : "OFF", ModeName(nc.mode), nc.upscaleFactor, nc.sharpness, nc.tint, nc.temporalArea,
-         nc.gazeArea, nc.maxWeight, nc.localTrust, nc.residualTol, nc.sharpHistory ? "sharp" : "fast",
+    LOGI("settings from %s: %s, mode=%s, factor=%.2f, sharpness=%.2f in %.2f (following the gaze %.2f), tint=%d, area=%.2f "
+         "(following the gaze %.2f), history=%.2f, moving=%.2f, tolerance=%.2f, %s history, %s edges, gaze %s%s (offset %.3f, "
+         "%.3f), excluded:%s%s",
+         source, nc.enabled ? "on" : "OFF", ModeName(nc.mode), nc.upscaleFactor, nc.sharpness, std::max(nc.sharpArea, nc.temporalArea),
+         std::max(nc.gazeSharpArea, nc.gazeArea), nc.tint, nc.temporalArea, nc.gazeArea, nc.maxWeight, nc.localTrust, nc.residualTol, nc.sharpHistory ? "sharp" : "fast",
          nc.bilinearEdges ? "bilinear" : "Catmull-Rom", nc.gazeFollow ? "followed" : "not followed",
          nc.gazeShow ? ", ring shown" : "", nc.gazeOffset[0], nc.gazeOffset[1], len ? excl : " none",
          replan ? " (re-planning textures)" : "");

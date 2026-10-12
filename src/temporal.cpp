@@ -95,8 +95,9 @@ struct TParams {   // cbuffer TParams in temporal.hlsl
     uint32_t marks[4];       // gaze ring x, y | calibration cross x, y (content output px; ~0u = none)
     float tune3[4];          // localCheck (bits), localAgree (input px), localAperture, 0
     uint32_t work[4];        // L4 pixels the pyramid is built over (x0, y0, x1, y1): the region and a margin
+    uint32_t sharp[4];       // the sharpening area: w, h (centred on the region, at least its size), 0, 0
 };
-static_assert(sizeof(TParams) == 320, "cbuffer layout must match temporal.hlsl");
+static_assert(sizeof(TParams) == 336, "cbuffer layout must match temporal.hlsl");
 } // namespace
 const UINT kTParamsBytes = sizeof(TParams);
 namespace {
@@ -124,7 +125,8 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 
 enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OUT0, A_COPY, A_GLOBAL, A_REFINE, A_OUTER,
        A_LUMA, A_MARGIN, A_COUNT };
-constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64;
+constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
+               TF_SHARPOUT = 128;
 constexpr UINT kStateBytes = 64;
 
 struct Tex {
@@ -989,7 +991,9 @@ bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialAre
     const LinkGeo g = ContentGeo(ts);
     a.content[0] = g.ox; a.content[1] = g.oy; a.content[2] = g.ox + g.outW; a.content[3] = g.oy + g.outH;
     const UINT rw = AreaSide(g.outW, RegionArea(g_cfg)), rh = AreaSide(g.outH, RegionArea(g_cfg));
+    const UINT sw = std::max(rw, AreaSide(g.outW, SharpArea(g_cfg))), sh = std::max(rh, AreaSide(g.outH, SharpArea(g_cfg)));
     const bool on = (rw < g.outW || rh < g.outH) && count <= 2;
+    a.sharpBeyond = sw > rw || sh > rh;
     a.band = on ? AreaBand(g.outW, g.outH) : 0u;
     for (UINT z = 0; z < std::min(count, 2u); ++z) {
         // the eye: an array of both holds it in its slice, otherwise the viewport said
@@ -1016,6 +1020,10 @@ bool PlaceSpatialArea(TexState *ts, UINT first, UINT count, int side, SpatialAre
             }
         }
         a.region[z][0] = g.ox + st.x; a.region[z][1] = g.oy + st.y; a.region[z][2] = rw; a.region[z][3] = rh;
+        const long sx = (long)(st.x + rw / 2) - (long)(sw / 2), sy = (long)(st.y + rh / 2) - (long)(sh / 2);   // centred on it
+        a.sharp[z][0] = g.ox + (UINT)std::max(0L, std::min(sx, (long)(g.outW - sw)));
+        a.sharp[z][1] = g.oy + (UINT)std::max(0L, std::min(sy, (long)(g.outH - sh)));
+        a.sharp[z][2] = sw; a.sharp[z][3] = sh;
         if (live && GazeShowRing()) {
             a.marks[z][0] = g.ox + (uint32_t)lroundf(u * g.outW);
             a.marks[z][1] = g.oy + (uint32_t)lroundf(v * g.outH);
@@ -1127,6 +1135,12 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     s->side = StreamSide(s, link, ts);
     PlaceRegion(s, s->side, p);
     FillRegionParams(s, g_cfg.localTrust > 0.0f, p);
+    // The sharpening area (Sharpness area), centred on the region: past it, OUTER sharpens its upscale
+    // too and OUT's band blends into that (the GPU places it, as it knows where the region is)
+    p.sharp[0] = std::max(s->rw, AreaSide(s->outW, SharpArea(g_cfg)));
+    p.sharp[1] = std::max(s->rh, AreaSide(s->outH, SharpArea(g_cfg)));
+    const bool sharpOut = sharp > 0.0f && s->foveated && (p.sharp[0] > s->rw || p.sharp[1] > s->rh);
+    if (sharpOut) p.misc[1] |= TF_SHARPOUT;
     const LinkGeo &geo = link->geo;
     const UINT tw = ts->src.Width, th = ts->src.Height;
     p.srcRect[0] = geo.sx; p.srcRect[1] = geo.sy; p.srcRect[2] = tw; p.srcRect[3] = th;
@@ -1226,7 +1240,7 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     Indirect(outShader, A_OUT0);
     if (s->foveated || !geo.full) {   // outside the region (and around the content rectangle): this frame alone
         BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
-        Indirect(SH_T_OUTER_X0 + x, A_OUTER);
+        Indirect((sharpOut ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
     }
     if (!geo.full) {     // outside the content rectangle (the compositor does not sample it): repaints only
         BindCS(ctx, { nullptr, src }, { ts->proxyUAV.Get() });

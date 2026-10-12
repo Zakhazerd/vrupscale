@@ -93,7 +93,9 @@ typedef struct VuSettings {
     float eyeProj[8];             // each eye's projection as SteamVR reports it (tangents left, right, top, bottom;
                                   // left eye, then right); all 0 = not known yet
     float gazeArea;               // the area while Follow gaze is on (since 0.6.1; 0 from an older app = the default)
-    int32_t reserved[15];
+    float sharpArea;              // [upscale] the part RCAS sharpens, at least the area (since 0.6.4; 0 = the default) ...
+    float gazeSharpArea;          // ... and while Follow gaze is on
+    int32_t reserved[13];
 } VuSettings;
 
 typedef struct VuTexInfo {

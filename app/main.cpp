@@ -37,7 +37,7 @@ enum : int {
     IDC_TINT, IDC_HOTKEYS, IDC_AREA, IDC_AREAVAL, IDC_AREAHINT, IDC_HIST, IDC_HISTVAL, IDC_MOVING, IDC_MOVINGVAL, IDC_TOL, IDC_TOLVAL,
     IDC_DEFAULTS, IDC_SAVED, IDC_OPENLOG, IDC_OPENFOLDER, IDC_STATUS, IDC_DETAIL, IDC_TEXLIST, IDC_TEXHINT, IDC_EVENTS,
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
-    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR,
+    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR, IDC_SHARPAREA, IDC_SHARPAREAVAL,
 };
 enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
@@ -129,14 +129,14 @@ DWORD g_lastInstallCheck = 0;
 
 // ---- layout (logical pixels) ------------------------------------------------------------------
 
-constexpr float kW = 1120, kH = 832;   // the page
+constexpr float kW = 1120, kH = 866;   // the page
 constexpr float kColW = 348;
-const RectF kCardUp = { 24, 214, kColW, 376 };
-const RectF kCardEye = { 24, 604, kColW, 210 };
+const RectF kCardUp = { 24, 214, kColW, 410 };
+const RectF kCardEye = { 24, 638, kColW, 210 };
 const RectF kCardTemp = { 386, 214, kColW, 302 };
-const RectF kCardVR = { 386, 530, kColW, 284 };   // SteamVR, and the settings file
+const RectF kCardVR = { 386, 530, kColW, 318 };   // SteamVR, and the settings file
 const RectF kCardTex = { 748, 214, kColW, 262 };
-const RectF kCardEv = { 748, 490, kColW, 324 };
+const RectF kCardEv = { 748, 490, kColW, 358 };
 const RectF kList = { kCardTex.x + 14, kCardTex.y + 52, kColW - 28, 160 };
 const RectF kLog = { kCardEv.x + 14, kCardEv.y + 52, kColW - 28, kCardEv.h - 66 };
 constexpr float kRowH = 40, kLogLineH = 15;
@@ -263,6 +263,10 @@ void UpdateValueLabels()
     SetText(IDC_SHARPVAL, Pos(IDC_SHARP) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_SHARP) / 100.0f));
     SetText(IDC_AREAVAL, Pos(IDC_AREA) >= 100 ? std::wstring(L"all") : Fmt(L"%d%%", Pos(IDC_AREA)));
     Enable(IDC_BILEDGES, g_s.mode != kVuModeBilinear && Pos(IDC_AREA) < 100);   // area "all": there are no edges
+    // the Sharpness area holds the area: shown at least at its size (also while the area slider moves)
+    if (Pos(IDC_SHARPAREA) < Pos(IDC_AREA)) SetPos(IDC_SHARPAREA, Pos(IDC_AREA));
+    SetText(IDC_SHARPAREAVAL, Pos(IDC_SHARPAREA) >= 100 ? std::wstring(L"all") : Fmt(L"%d%%", Pos(IDC_SHARPAREA)));
+    Enable(IDC_SHARPAREA, g_s.mode != kVuModeBilinear && Pos(IDC_SHARP) > 0 && Pos(IDC_AREA) < 100);
     SetText(IDC_HISTVAL, Fmt(L"%.2f", Pos(IDC_HIST) / 100.0f));
     SetText(IDC_MOVINGVAL, Pos(IDC_MOVING) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_MOVING) / 100.0f));
     SetText(IDC_TOLVAL, Fmt(L"%.2f", Pos(IDC_TOL) / 100.0f));
@@ -272,6 +276,7 @@ void SyncListChecks();
 
 // The area the slider shows and edits: its own value while following the gaze.
 float ActiveArea() { return g_s.gazeFollow ? g_s.gazeArea : g_s.temporalArea; }
+float &ActiveSharpArea() { return g_s.gazeFollow ? g_s.gazeSharpArea : g_s.sharpArea; }
 
 // The Eye tracking card: what the tracker is doing, and the calibration.
 void UpdateGazeUi()
@@ -327,6 +332,7 @@ void ModelToUi()
     SetCheck(IDC_TINT, g_s.tint != 0);
     SetCheck(IDC_HOTKEYS, g_s.hotkeys != 0);
     SetPos(IDC_AREA, (int)lroundf(ActiveArea() * 100));
+    SetPos(IDC_SHARPAREA, (int)lroundf(std::max(ActiveSharpArea(), ActiveArea()) * 100));
     SetPos(IDC_HIST, (int)lroundf(g_s.maxWeight * 100));
     SetPos(IDC_MOVING, (int)lroundf(g_s.localTrust * 100));
     SetPos(IDC_TOL, (int)lroundf(g_s.residualTol * 100));
@@ -904,6 +910,10 @@ void RefreshStatus()
         if ((g_sentSeq == 0 || (int32_t)g_st.appliedSeq == g_sentSeq) && GetTickCount() - g_lastEdit > 1500 &&
             !g_pushPending && !g_replanPending && !SameSettings(g_st.current, g_s)) {
             VuSettings m = g_st.current;
+            if (m.sharpArea <= 0.0f) {   // a DLL from before 0.6.4 (an update waiting for SteamVR to close)
+                m.sharpArea = g_s.sharpArea;
+                m.gazeSharpArea = g_s.gazeSharpArea;
+            }
             g_s = m;
             ModelToUi();
             SetTimer(g_wnd, TIMER_SAVE, 600, nullptr);
@@ -1455,10 +1465,11 @@ void CreateControls()
         w.items = { L"1×", L"1.3×", L"1.5×", L"1.72×", L"2×" };
         g_w.push_back(w);
     }
-    AddSlider(IDC_SHARP, { U.x + 20, U.y + 270, U.w - 40, 30 }, L"Sharpness", 0, 100, 116);
-    AddWidget(IDC_TINT, Kind::Toggle, { U.x + 20, U.y + 308, U.w - 40, 26 }, L"Debug tint", ui::BtnOutline,
+    AddSlider(IDC_SHARP, { U.x + 20, U.y + 270, U.w - 40, 30 }, L"Sharpness", 0, 100, 128);
+    AddSlider(IDC_SHARPAREA, { U.x + 20, U.y + 304, U.w - 40, 30 }, L"Sharpness area", 30, 100, 128);
+    AddWidget(IDC_TINT, Kind::Toggle, { U.x + 20, U.y + 342, U.w - 40, 26 }, L"Debug tint", ui::BtnOutline,
               L"magenta = upscaled");
-    AddWidget(IDC_HOTKEYS, Kind::Toggle, { U.x + 20, U.y + 338, U.w - 40, 26 }, L"Shortcuts in VR", ui::BtnOutline,
+    AddWidget(IDC_HOTKEYS, Kind::Toggle, { U.x + 20, U.y + 372, U.w - 40, 26 }, L"Shortcuts in VR", ui::BtnOutline,
               L"Ctrl+F1 to F8");
     AddSlider(IDC_AREA, { T.x + 20, T.y + 50, T.w - 40, 30 }, L"Temporal area", 30, 100, 128);
     AddSlider(IDC_HIST, { T.x + 20, T.y + 122, T.w - 40, 30 }, L"History strength", 10, 200, 128);
@@ -1473,10 +1484,10 @@ void CreateControls()
     AddWidget(IDC_GAZESHOW, Kind::Toggle, { Y.x + 20, Y.y + 92, Y.w - 40, 26 }, L"Show gaze", ui::BtnOutline, L"a green ring in VR");
     AddWidget(IDC_CALIBRATE, Kind::Button, { Y.x + 20, Y.y + 126, 112, 32 }, L"Calibrate", ui::BtnPrimary);
     AddWidget(IDC_CALCLEAR, Kind::Button, { Y.x + 142, Y.y + 126, 150, 32 }, L"Clear calibration");
-    AddWidget(IDC_WITHVR, Kind::Toggle, { V.x + 20, V.y + 204, V.w - 40, 26 }, L"Start with SteamVR", ui::BtnOutline,
+    AddWidget(IDC_WITHVR, Kind::Toggle, { V.x + 20, V.y + 226, V.w - 40, 26 }, L"Start with SteamVR", ui::BtnOutline,
               L"and close with it");
-    AddWidget(IDC_DEFAULTS, Kind::Button, { V.x + 20, V.y + 238, 150, 32 }, L"Restore defaults");
-    AddWidget(IDC_OPENFOLDER, Kind::Button, { V.x + 180, V.y + 238, 120, 32 }, L"Settings file");
+    AddWidget(IDC_DEFAULTS, Kind::Button, { V.x + 20, V.y + 266, 150, 32 }, L"Restore defaults");
+    AddWidget(IDC_OPENFOLDER, Kind::Button, { V.x + 180, V.y + 266, 120, 32 }, L"Settings file");
     AddWidget(IDC_BROWSE, Kind::Button, { V.r() - 140, V.y + 14, 120, 30 }, L"Choose folder…");
     AddWidget(IDC_INSTALL, Kind::Button, { V.x + 20, V.y + 112, 120, 34 }, L"Install", ui::BtnPrimary);
     AddWidget(IDC_UNINSTALL, Kind::Button, { V.x + 150, V.y + 112, 112, 34 }, L"Uninstall");
@@ -1742,8 +1753,16 @@ std::wstring TipText(int id, int part, std::wstring &title)
     }
     case IDC_SHARP:
         title = L"Sharpness";
-        return L"RCAS sharpening (from FSR 1) after upscaling, in every mode. 1.00 is the most RCAS does; 0 turns it off. "
-               L"Default 1.00. Ctrl+F4 in VR steps through 0, 0.25, 0.5, 0.75 and 1.";
+        return L"RCAS sharpening (from FSR 1) after upscaling, over the Sharpness area, in Temporal and FSR 1 mode. 1.00 is the "
+               L"most RCAS does; 0 turns it off. Default 1.00. Ctrl+F4 in VR steps through 0, 0.25, 0.5, 0.75 and 1.";
+    case IDC_SHARPAREA:
+        title = g_s.gazeFollow ? L"Sharpness area, following your gaze" : L"Sharpness area";
+        return L"The width and height of the part of each eye's picture that is sharpened, centred on the Temporal area (and "
+               L"moving with it when it follows your gaze). It is never smaller than the Temporal area: at that size, only the "
+               L"area is sharpened, as before. Larger also sharpens the fast spatial upscale around the area, fading out at the "
+               L"edge, for a little GPU time; all sharpens everything.\n\nLike the area, it has two values: 60% by default, "
+               L"and 40% while Follow gaze is on. Raising the Temporal area past it raises it too. Greyed out in Bilinear "
+               L"mode, with Sharpness off, or when the Temporal area is all.";
     case IDC_TINT:
         title = L"Debug tint";
         return L"Tints everything vrupscale processes: magenta where it upscales, and in Temporal and FSR 1 mode blue on "
@@ -1761,7 +1780,8 @@ std::wstring TipText(int id, int part, std::wstring &title)
                L"blends the two. The main cost control: smaller is cheaper; all turns this off.\n\nIt has two values: "
                L"60% by default, centred (about a third of the pixels, the lens's sharp centre), and 40% while Follow gaze "
                L"is on, since the area then sits wherever you look. The slider shows and sets the one for the Follow gaze "
-               L"switch's state. Changing it rebuilds the histories (a brief hitch).";
+               L"switch's state. Changing it rebuilds the histories (a brief hitch). The Sharpness area is never smaller: "
+               L"raising this past it raises it too.";
     case IDC_HIST:
         title = L"History strength";
         return L"How much the earlier frames may count. Each output pixel mixes this frame with the history, and the "
@@ -1943,7 +1963,7 @@ void DrawPage(ui::Canvas &c)
     c.Text(ui::F_DISPLAY, TextOf(IDC_STATUS), 65, 105, col::ink, 0, 660);
     c.Wrap(ui::F_BODY, TextOf(IDC_DETAIL), { 36, 117, 680, 44 }, 21, col::ink, 2);
 
-    static const int vals[][2] = { { IDC_SHARP, IDC_SHARPVAL }, { IDC_AREA, IDC_AREAVAL },
+    static const int vals[][2] = { { IDC_SHARP, IDC_SHARPVAL }, { IDC_SHARPAREA, IDC_SHARPAREAVAL }, { IDC_AREA, IDC_AREAVAL },
                                    { IDC_HIST, IDC_HISTVAL }, { IDC_MOVING, IDC_MOVINGVAL }, { IDC_TOL, IDC_TOLVAL } };
     for (auto &v : vals)
         if (ui::Widget *w = W(v[0])) w->value = TextOf(v[1]);
@@ -1973,9 +1993,9 @@ void DrawPage(ui::Canvas &c)
     c.PathText(ui::F_SMALL, TextOf(IDC_STEAMPATH), V.x + 20, V.y + 60, V.w - 40, col::inkSoft);
     c.Wrap(ui::F_LABEL, TextOf(IDC_INSTALLSTATE), { V.x + 20, V.y + 68, V.w - 40, 40 }, 19, col::ink, 2);
     const std::wstring saveError = TextOf(IDC_SAVED);   // (settings that couldn't be saved come first)
-    c.Wrap(ui::F_SMALL, saveError.empty() ? TextOf(IDC_INSTALLMSG) : saveError, { V.x + 20, V.y + 154, V.w - 40, 32 }, 16,
-           saveError.empty() ? col::inkSoft : col::red, 2);
-    c.Fill({ V.x + 20, V.y + 194, V.w - 40, 1.5f }, col::inkFaint);
+    c.Wrap(ui::F_SMALL, saveError.empty() ? TextOf(IDC_INSTALLMSG) : saveError, { V.x + 20, V.y + 154, V.w - 40, 50 }, 16,
+           saveError.empty() ? col::inkSoft : col::red, 3);
+    c.Fill({ V.x + 20, V.y + 214, V.w - 40, 1.5f }, col::inkFaint);
 
     // Textures
     const RectF X = kCardTex;
@@ -2095,14 +2115,28 @@ void OnSlider(int id, bool tracking)
     if (id == IDC_SHARP) {
         g_s.sharpness = Pos(IDC_SHARP) / 100.0f;
         Changed(false);
+    } else if (id == IDC_SHARPAREA) {
+        // never below the area (the knob stops there); the value for the current Follow gaze state
+        if (Pos(IDC_SHARPAREA) < Pos(IDC_AREA)) {
+            SetPos(IDC_SHARPAREA, Pos(IDC_AREA));
+            UpdateValueLabels();
+        }
+        ActiveSharpArea() = Pos(IDC_SHARPAREA) / 100.0f;
+        Changed(false);
     } else if (id == IDC_AREA) {
         // A new area re-plans the histories: sent once the slider is let go and has settled
         // (keys move it in steps). It is the value for the current Follow gaze state.
-        if (tracking) return;
+        if (tracking) {
+            const int kept = (int)lroundf(std::max(ActiveSharpArea(), ActiveArea()) * 100);
+            SetPos(IDC_SHARPAREA, std::max(kept, Pos(IDC_AREA)));   // (pushed up meanwhile)
+            UpdateValueLabels();
+            return;
+        }
         float a = Pos(IDC_AREA) / 100.0f;
         float &area = g_s.gazeFollow ? g_s.gazeArea : g_s.temporalArea;
         if (fabsf(a - area) > 0.004f) {
             area = a;
+            ActiveSharpArea() = std::max(ActiveSharpArea(), a);   // the Sharpness area holds the area
             g_lastEdit = GetTickCount();
             g_replanPending = true;
             SetTimer(g_wnd, TIMER_REPLAN, 400, nullptr);
@@ -2610,9 +2644,9 @@ int WriteStatusFile(const std::wstring &path, int waitMs)
         const VuSettings &c = st.current;
         snprintf(line, sizeof(line),
                  "enabled=%d\nmode=%s\nupscaleFactor=%.2f\nsharpHistory=%d\nbilinearEdges=%d\nsharpness=%.2f\ntint=%d\nhotkeys=%d\n"
-                 "maxWeight=%.2f\nlocalTrust=%.2f\nresidualTol=%.2f\ntemporalArea=%.2f\nexcluded=%d\ngpuMsPerSec=%.3f\n",
+                 "maxWeight=%.2f\nlocalTrust=%.2f\nresidualTol=%.2f\ntemporalArea=%.2f\nsharpnessArea=%.2f\nexcluded=%d\ngpuMsPerSec=%.3f\n",
                  c.enabled, Narrow(ModeLabel(c.mode)).c_str(), c.upscaleFactor, c.fastHistory ? 0 : 1, c.bilinearEdges, c.sharpness, c.tint,
-                 c.hotkeys, c.maxWeight, c.localTrust, c.residualTol, c.temporalArea, c.excludeCount, st.gpuMsPerSec);
+                 c.hotkeys, c.maxWeight, c.localTrust, c.residualTol, c.temporalArea, c.sharpArea, c.excludeCount, st.gpuMsPerSec);
         out += line;
         for (uint32_t k = 0; k < st.texCount && k < kVuMaxTex; ++k) {
             const VuTexInfo &t = st.tex[k];

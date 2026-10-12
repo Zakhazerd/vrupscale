@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <math.h>
+#include <algorithm>
 
 namespace app {
 
@@ -86,6 +87,8 @@ VuSettings DefaultSettings()
     s.maxStreams = 4;
     s.temporalArea = 0.6f;
     s.gazeArea = 0.4f;   // following the gaze: it is where you look, so less does
+    s.sharpArea = 0.6f;       // the Sharpness area: as the area's defaults
+    s.gazeSharpArea = 0.4f;
     s.requireShared = 1;
     s.minWidth = 1000;
     s.minHeight = 1000;
@@ -144,6 +147,9 @@ static void Clamp(VuSettings &s)
     s.residualTol = cl(s.residualTol, 0.05f, 10.0f);
     s.temporalArea = roundf(cl(s.temporalArea, 0.3f, 1.0f) * 100.0f) / 100.0f;
     s.gazeArea = roundf(cl(s.gazeArea, 0.3f, 1.0f) * 100.0f) / 100.0f;
+    // the Sharpness area holds the area (its minimum)
+    s.sharpArea = std::max(s.temporalArea, roundf(cl(s.sharpArea, 0.3f, 1.0f) * 100.0f) / 100.0f);
+    s.gazeSharpArea = std::max(s.gazeArea, roundf(cl(s.gazeSharpArea, 0.3f, 1.0f) * 100.0f) / 100.0f);
     s.upscaleFactor = roundf(s.upscaleFactor * 100.0f) / 100.0f;
     if (s.mode < 0 || s.mode > 2) s.mode = kVuModeTemporal;
     if (s.excludeCount < 0) s.excludeCount = 0;
@@ -163,6 +169,8 @@ bool LoadSettings(const std::wstring &p, VuSettings &s, bool *adjusted)
     }
     IniFloat(p, L"upscale", L"upscaleFactor", s.upscaleFactor);
     IniFloat(p, L"upscale", L"sharpness", s.sharpness);
+    IniFloat(p, L"upscale", L"sharpnessArea", s.sharpArea);
+    IniFloat(p, L"upscale", L"gazeSharpnessArea", s.gazeSharpArea);
     IniBool(p, L"upscale", L"debugTint", s.tint);
     IniBool(p, L"general", L"hotkeys", s.hotkeys);
     IniFloat(p, L"temporal", L"maxWeight", s.maxWeight);
@@ -243,6 +251,8 @@ bool SaveSettings(const std::wstring &p, const VuSettings &s)
     put(L"upscale", L"upscaleFactor", Fmt(L"%.2f", s.upscaleFactor));
     WritePrivateProfileStringW(L"upscale", L"targetHeight", nullptr, p.c_str());   // removed in 0.4.4
     put(L"upscale", L"sharpness", Fmt(L"%.2f", s.sharpness));
+    put(L"upscale", L"sharpnessArea", Fmt(L"%.2f", s.sharpArea));
+    put(L"upscale", L"gazeSharpnessArea", Fmt(L"%.2f", s.gazeSharpArea));
     put(L"upscale", L"debugTint", s.tint ? L"1" : L"0");
     put(L"general", L"hotkeys", s.hotkeys ? L"1" : L"0");
     put(L"temporal", L"maxWeight", Fmt(L"%.2f", s.maxWeight));
@@ -282,7 +292,9 @@ bool SameSettings(const VuSettings &a, const VuSettings &b)
         !feq(a.sharpness, b.sharpness) ||
         a.tint != b.tint || a.hotkeys != b.hotkeys ||
         !feq(a.maxWeight, b.maxWeight) || !feq(a.localTrust, b.localTrust) || !feq(a.residualTol, b.residualTol) ||
-        !feq(a.temporalArea, b.temporalArea) || !feq(a.gazeArea, b.gazeArea) || a.excludeCount != b.excludeCount)
+        !feq(a.temporalArea, b.temporalArea) || !feq(a.gazeArea, b.gazeArea) || a.excludeCount != b.excludeCount ||
+        // (0: a DLL from before 0.6.4, which has no Sharpness area)
+        (a.sharpArea > 0 && b.sharpArea > 0 && (!feq(a.sharpArea, b.sharpArea) || !feq(a.gazeSharpArea, b.gazeSharpArea))))
         return false;
     for (int i = 0; i < a.excludeCount; ++i)
         if (a.exclude[i] != b.exclude[i]) return false;
@@ -320,6 +332,8 @@ bool SetSettingByName(VuSettings &s, const std::wstring &key, const std::wstring
     else if (key == L"residualTol") s.residualTol = f;
     else if (key == L"temporalArea") s.temporalArea = f;
     else if (key == L"gazeArea") s.gazeArea = f;
+    else if (key == L"sharpnessArea") s.sharpArea = f;
+    else if (key == L"gazeSharpnessArea") s.gazeSharpArea = f;
     else if (key == L"excludeSizes") {
         s.excludeCount = 0;
         size_t a = 0;

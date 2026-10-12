@@ -281,6 +281,8 @@ struct SpatialArea {
     UINT band = 0;
     UINT content[4] = {};               // the picture in the proxy: x0, y0, x1, y1
     UINT region[2][4] = {};             // per slice: x, y, w, h (proxy px)
+    UINT sharp[2][4] = {};              // per slice: the sharpening area, centred on the region (holds it)
+    bool sharpBeyond = false;           // ... which reaches past the region
     uint32_t marks[2][4] = { { ~0u, ~0u, ~0u, ~0u }, { ~0u, ~0u, ~0u, ~0u } };
 };
 // What the spatial path writes of a texture's proxy (output px: x, y, w, h): the game's picture

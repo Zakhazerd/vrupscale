@@ -18,7 +18,8 @@
 //   REFINE  L2 grid     global model unless a local candidate fits clearly better; confidence
 //   ACCUM   region      Lanczos reconstruction + reprojected Catmull-Rom history, YCoCg clip
 //   OUT     region      RCAS (or copy) -> the compositor-visible proxy, fading to OUTER at the edge
-//   OUTER   output res  outside the region: Catmull-Rom (or bilinear) from this frame alone
+//   OUTER   output res  outside the region: Catmull-Rom (or bilinear) from this frame alone, and
+//                       RCAS over that inside the sharpening area (SHARPEN)
 //   MARGIN  proxy res   outside the content rectangle (repaints only; see below)
 //   COPY    L1..L4      cur pyramid -> prev pyramid
 // Every pass after DECIDE is launched with DispatchIndirect; for a repeated frame (the compositor
@@ -31,6 +32,11 @@
 // of the output (the part of the eye image seen through the sharp centre of the lens). The rest
 // is upscaled spatially, which costs a fraction as much; a band inside the region's edge blends
 // the two so there is no seam. Region = the whole output turns this off.
+//
+// Sharpening area (the Sharpness area setting): RCAS sharpens the region's output; the sharpening
+// area, centred on the region and at least as large, may reach further. Then (TF_SHARPOUT) OUTER
+// sharpens its spatial upscale there too, fading out across a band inside the area's edge, and
+// OUT's band blends into that sharpened upscale instead of the plain one.
 //
 // Content rectangle: after SteamVR's resolution is lowered, the game keeps its larger eye textures
 // and renders into a corner of them (the compositor samples only that part). A stream then works
@@ -69,7 +75,7 @@
 #ifndef LEVEL        // DOWN: destination pyramid level 2..4 (LUMA writes L1)
 #define LEVEL 2
 #endif
-#ifndef SHARPEN      // OUT: 1 = RCAS, 0 = plain copy
+#ifndef SHARPEN      // OUT: 1 = RCAS, 0 = plain copy; OUTER: 1 = RCAS inside the sharpening area
 #define SHARPEN 1
 #endif
 #ifndef LOCAL        // REFINE: 1 = search local motion where the global model fails (localTrust > 0)
@@ -102,6 +108,7 @@ cbuffer TParams : register(b0)
     uint4  Marks;      // gaze ring x, y | calibration cross x, y (content output px; 0xffffffff = none)
     float4 Tune3;      // localCheck (bits: 1 determined, 2 neighbours, 4 last frame), localAgree (L0 px), localAperture, 0
     uint4  Work;       // L4 pixels the pyramid is built over: x0, y0, x1, y1 (the region and Strides.w around it)
+    uint4  Sharp;      // the sharpening area: w, h (output px, centred on the region, at least its size), 0, 0
 };
 
 // The motion passes read the pyramid only in and around the region, so LUMA, DOWN and COPY work
@@ -124,6 +131,7 @@ uint2 UnpackOrg(uint v) { return uint2(v & 0xffffu, v >> 16); }
 #define TF_PRIME 16u   // FP: fill the block memory only
 #define TF_BILINEAR 32u   // OUT / OUTER / MARGIN: the spatial upscale outside the region is bilinear
 #define TF_MARGIN 64u     // DECIDE: MARGIN runs with every new frame, not only on repaints (after a resolution change)
+#define TF_SHARPOUT 128u  // OUT / OUTER: the sharpening area reaches past the region (RcasCon set)
 
 SamplerState LinearClamp : register(s0);
 
@@ -1182,7 +1190,53 @@ float SrcAlpha(uint2 g)
     return Src.SampleLevel(LinearClamp, float3(pos / float2(SrcRect.zw), gZ + Misc.x), 0).a;
 }
 
+// 1 inside the rectangle (org, size) of the content, falling smoothly to 0 across the band at its
+// inner edges (edges that lie on the border of the image need no blending); 0 outside it.
+float RectWeight(int2 g, int2 org, int2 size)
+{
+    float band = float(Misc.w);
+    if (band <= 0.0) return 1.0;
+    int2 lo = org, hi = org + size - 1;
+    float d = 1e6;
+    if (org.x > 0) d = min(d, float(g.x - lo.x));
+    if (org.x + size.x < int(Size4Out.z)) d = min(d, float(hi.x - g.x));
+    if (org.y > 0) d = min(d, float(g.y - lo.y));
+    if (org.y + size.y < int(Size4Out.w)) d = min(d, float(hi.y - g.y));
+    return smoothstep(0.0, 1.0, (d + 0.5) / band);
+}
+
+// The sharpening area: centred on this frame's region, inside the content (origin, size)
+int4 SharpRect()
+{
+    const int2 size = int2(Sharp.xy);
+    const int2 mid = RegionOrg() + int2(Region.zw) / 2;
+    return int4(clamp(mid - size / 2, int2(0, 0), int2(Size4Out.zw) - size), size);
+}
+
+float SharpWeight(int2 g)
+{
+    const int4 r = SharpRect();
+    if (any(g < r.xy) || any(g >= r.xy + r.zw)) return 0.0;
+    return RectWeight(g, r.xy, r.zw);
+}
+
 #if TPASS == TP_OUTER
+
+#if SHARPEN
+// The tile's spatial upscale with a 1-pixel apron (content pixels, clamped to the content), filled
+// once per group when the tile meets the sharpening area, for RCAS
+groupshared float4 gsT[18 * 18];
+static int2 gsOrg;     // the content pixel at gsT[0]
+static bool gsFilled;
+AF4 FsrRcasLoadF(ASU2 p)
+{
+    const int2 q = clamp(int2(p) - gsOrg, 0, 17);
+    return gsT[q.y * 18 + q.x];
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#define FSR_RCAS_F 1
+#include "ffx_fsr1.h"
+#endif
 
 void Emit(uint2 gl)        // gl: the content output rectangle grown by the band (Strides.z) on every side
 {
@@ -1195,6 +1249,18 @@ void Emit(uint2 gl)        // gl: the content output rectangle grown by the band
     if (all(g >= 0) && all(g < int2(Size4Out.zw))) {
         const int2 org = RegionOrg();
         if (all(g >= org) && all(g < org + int2(Region.zw))) return;   // OUT's
+#if SHARPEN
+        if (gsFilled) {   // RCAS over the upscale in the sharpening area
+            const int2 q = g - gsOrg;
+            c = gsT[q.y * 18 + q.x];
+            const float ws = SharpWeight(g);
+            if (ws > 0.0) {
+                AF3 s3;
+                FsrRcasF(s3.r, s3.g, s3.b, uint2(g), RcasCon);
+                c.rgb = lerp(c.rgb, s3, ws);
+            }
+        } else
+#endif
         c = Spatial(uint2(g));
     } else {
         c = SpatialTex(G);
@@ -1219,8 +1285,11 @@ void Emit(uint2 G)                                                 // G: proxy p
 #else
 
 #if SHARPEN
+static bool gRcasSpatial = false;   // RCAS over the spatial upscale (content pixels, computed here) instead of the history
 AF4 FsrRcasLoadF(ASU2 p)
 {
+    if (gRcasSpatial)
+        return Spatial(uint2(clamp(p, ASU2(0, 0), ASU2(Size4Out.zw) - ASU2(1, 1))));
     p = clamp(p, ASU2(0, 0), ASU2(Region.zw) - ASU2(1, 1));
     return Hist.Load(int4(p, gZ, 0));
 }
@@ -1259,6 +1328,17 @@ void Emit(uint2 p)                                                 // p: region 
     float a;
     if (t < 1.0) {
         float4 sp = Spatial(g);
+#if SHARPEN
+        // the sharpening area reaches past the region: blend into the sharpened upscale OUTER writes next to it
+        const float ws = (Misc.y & TF_SHARPOUT) ? SharpWeight(int2(g)) : 0.0;
+        if (ws > 0.0) {
+            AF3 s3;
+            gRcasSpatial = true;
+            FsrRcasF(s3.r, s3.g, s3.b, g, RcasCon);
+            gRcasSpatial = false;
+            sp.rgb = lerp(sp.rgb, s3, ws);
+        }
+#endif
         c = lerp(sp.rgb, c, t);
         a = sp.a;
     } else {
@@ -1278,7 +1358,23 @@ void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
 #if TPASS == TP_OUTER
     OuterTiles ot = GetOuterTiles(uint2(RegionOrg()));
     uint ti = gid.y * ot.tx + gid.x;
+#if SHARPEN
+    // a tile that meets the sharpening area: its upscale (and the apron) to groupshared memory first,
+    // so that RCAS reads each pixel once computed (every thread reaches the barrier)
+    const bool valid = ti < OuterCount(ot);
+    const int2 T = int2(OuterTile(ot, valid ? ti : 0u) << 4u) - int(Strides.z);   // content pixel of the tile's corner
+    const int4 sr = SharpRect();
+    gsOrg = T - 1;
+    gsFilled = valid && (Misc.y & TF_SHARPOUT) != 0 && T.x - 1 < sr.x + sr.z && T.x + 17 > sr.x && T.y - 1 < sr.y + sr.w &&
+               T.y + 17 > sr.y;
+    if (gsFilled)
+        for (uint i = lt.x; i < 18u * 18u; i += 64u)
+            gsT[i] = Spatial(uint2(clamp(gsOrg + int2(i % 18u, i / 18u), int2(0, 0), int2(Size4Out.zw) - 1)));
+    GroupMemoryBarrierWithGroupSync();
+    if (!valid) return;
+#else
     if (ti >= OuterCount(ot)) return;
+#endif
     AU2 gxy = ARmp8x8(lt.x) + (OuterTile(ot, ti) << 4u);
 #else
     AU2 gxy = ARmp8x8(lt.x) + AU2(gid.x << 4u, gid.y << 4u);
