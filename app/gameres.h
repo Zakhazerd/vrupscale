@@ -34,8 +34,8 @@ GameResResult SetGameResolution(const char *appKey, const GameResJob &job);
 
 // SteamVR's global render resolution: this one SteamVR applies to the running game at once (the
 // per-application value only when the game starts, or while SteamVR's settings window is open).
-// vrupscale drives it while VRChat runs: global = what the user had x target / VRChat's own
-// per-application value, so VRChat renders `target` of the resolution it would otherwise.
+// vrupscale drives it while VRChat runs: global = what the user had x target, so VRChat renders
+// `target` of the resolution it would otherwise get (its own per-application value included).
 struct GlobalRes {
     float scale = 1.0f;       // supersampleScale
     bool manual = true;       // supersampleManualOverride ("Custom"; false = "Auto")
@@ -52,7 +52,7 @@ struct GlobalResResult {
     bool viaApi = false;
     GlobalRes base;           // what the user had
     float applied = 0;        // the global scale set
-    int perApp = 100;         // the game's own per-application percentage
+    int perApp = 100;         // the game's own per-application percentage (for the record)
     std::wstring error;
 };
 GlobalResResult SetGlobalResolution(const char *appKey, const GlobalResJob &job);

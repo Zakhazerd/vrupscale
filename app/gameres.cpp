@@ -438,10 +438,12 @@ GlobalResResult SetGlobalResolution(const char *appKey, const GlobalResJob &job)
         int ea = 0;
         const int32_t app = s->GetInt32(appKey, kKey, &ea);
         r.perApp = (ea == 0 && app > 0) ? (int)app : 100;
-        // The game's resolution = global x its own per-application value. Relative to what the
-        // user had (Auto counts as 100%), the game should render `target` of it.
+        // The game's resolution = global x its own per-application value, and what it would get
+        // with the user's global value (Auto counts as 100%) is the target: lowering the global
+        // value by `target` makes the game render that share of it, whatever its own value is
+        // (read for the record only; changing it changes the target).
         const float base = r.base.manual ? r.base.scale : 1.0f;
-        r.applied = std::max(0.2f, std::min(5.0f, base * job.target * 100.0f / (float)r.perApp));
+        r.applied = std::max(0.2f, std::min(5.0f, base * job.target));
         s->SetBool("steamvr", "supersampleManualOverride", true, &e);
         int e2 = 0;
         s->SetFloat("steamvr", "supersampleScale", r.applied, &e2);

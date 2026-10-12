@@ -1,6 +1,6 @@
 // Stand-in for openvr_api.dll (self-test of the app's VRChat-resolution feature): records the
 // calls vrupscale.exe makes. Env: STUB_LOG (file), STUB_INIT_ERR (VR_InitInternal2's error),
-// STUB_VALUE (the value SteamVR "has"; absent = not set).
+// STUB_VALUE (the value SteamVR "has"; absent = not set), STUB_VALUE_FILE (a value changed meanwhile).
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -39,6 +39,17 @@ static void __stdcall SetInt32(const char *sec, const char *key, int32_t v, int 
 static int32_t __stdcall GetInt32(const char *sec, const char *key, int *err)
 {
     if (g_has < 0) { g_has = Env("STUB_VALUE", -1) >= 0; g_value = Env("STUB_VALUE", 0); }
+    {   // STUB_VALUE_FILE: the value the user sets meanwhile (a number in that file), if it exists
+        char path[512];
+        if (GetEnvironmentVariableA("STUB_VALUE_FILE", path, sizeof(path))) {
+            FILE *f = fopen(path, "rb");
+            int v;
+            if (f) {
+                if (fscanf(f, "%d", &v) == 1) { g_has = 1; g_value = v; }
+                fclose(f);
+            }
+        }
+    }
     Log("GetInt32 %s %s -> %s %d", sec, key, g_has ? "value" : "unset", g_value);
     if (err) *err = g_has ? 0 : 5;
     return g_has ? g_value : 0;

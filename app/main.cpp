@@ -55,12 +55,14 @@ DWORD g_lastEdit = 0;
 bool g_pushPending = false;
 bool g_pushOnConnect = false;   // settings were adjusted on loading: send them once SteamVR is there
 
-// "Set VRChat's resolution": while VRChat runs in SteamVR, SteamVR's global resolution is set so
-// that VRChat renders what the scaling preset needs (gameres.h, SetGlobalResolution); SteamVR
-// applies that one live. When VRChat closes, the option is switched off or the app closes, the
-// user's own value is put back. [app] gameResolution=1; globalResBefore = "scale manual" while
-// vrupscale has it changed (what to put back).
-bool g_gameRes = false;
+// VRChat's resolution: the resolution SteamVR gives VRChat (its global value x VRChat's own
+// per-application one) is what the user wants to see. While VRChat runs in SteamVR and this app is
+// open, the global value is lowered to the preset's share (1 / factor^2 of the pixels), so VRChat
+// renders that share and vrupscale upscales it back (gameres.h, SetGlobalResolution; SteamVR applies
+// a global change live). When VRChat or the app closes, the user's global value is put back.
+// [app] manageResolution=0 turns this off; globalResBefore = "scale manual" while vrupscale has
+// the global value changed (what to put back).
+bool g_gameRes = true;
 std::wstring g_gameResStatus;        // for the hint under the presets
 float g_resApplied = 0;              // the factor the global resolution is set for (0: not set by this run)
 bool g_resBusy = false;              // a request is running (one at a time)
@@ -226,16 +228,18 @@ void UpdateValueLabels()
     const int preset = VuScalePreset(f);
     SetText(IDC_FACTORVAL, preset >= 0 ? Widen(kVuScaleName[preset]) : Fmt(L"Custom %.2f×", f));
     const int pct = (int)lroundf(100.0f / (f * f));   // SteamVR's percentages count pixels
-    const std::wstring what = f < 1.005f ? std::wstring(L"Full resolution, no upscaling.")
-                                         : Fmt(L"Upscales %d%% → 100%% per axis.", (int)lroundf(100.0f / f));
-    if (!g_gameRes)
-        SetText(IDC_FACTORHINT, what + Fmt(L" In SteamVR, set VRChat's resolution to %s%d%% to match.", f < 1.005f ? L"" : L"about ", pct));
+    if (f < 1.005f)
+        SetText(IDC_FACTORHINT, L"Full resolution, no upscaling. SteamVR's resolution is left as you set it.");
+    else if (!g_gameRes)
+        SetText(IDC_FACTORHINT, Fmt(L"Upscales %d%% → 100%% per axis. In SteamVR, set VRChat's resolution to about %d%% of what "
+                                    L"you want to see.", (int)lroundf(100.0f / f), pct));
     else if (g_gameResStatus.rfind(L"Couldn't", 0) == 0)
         SetText(IDC_FACTORHINT, g_gameResStatus);
     else if (!g_gameResStatus.empty())
-        SetText(IDC_FACTORHINT, what + L" " + g_gameResStatus);
+        SetText(IDC_FACTORHINT, g_gameResStatus);
     else
-        SetText(IDC_FACTORHINT, what + Fmt(L" VRChat will render at %d%% when it runs (with this app open).", pct));
+        SetText(IDC_FACTORHINT, Fmt(L"While VRChat runs, it renders %d%% of the resolution SteamVR gives it, upscaled back to "
+                                    L"that (keep this app open).", pct));
     SetText(IDC_SHARPVAL, Pos(IDC_SHARP) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_SHARP) / 100.0f));
     SetText(IDC_AREAVAL, Pos(IDC_AREA) >= 100 ? std::wstring(L"all") : Fmt(L"%d%%", Pos(IDC_AREA)));
     Enable(IDC_BILEDGES, g_s.mode != kVuModeBilinear && Pos(IDC_AREA) < 100);   // area "all": there are no edges
@@ -308,7 +312,6 @@ void ModelToUi()
     SetPos(IDC_TOL, (int)lroundf(g_s.residualTol * 100));
     SetCheck(IDC_SHARPHIST, g_s.fastHistory == 0);
     SetCheck(IDC_BILEDGES, g_s.bilinearEdges != 0);
-    SetCheck(IDC_GAMERES, g_gameRes);
     SetCheck(IDC_GAZEFOLLOW, g_s.gazeFollow != 0);
     SetCheck(IDC_GAZESHOW, g_s.gazeShow != 0);
     const bool temporal = g_s.mode == kVuModeTemporal;
@@ -396,8 +399,9 @@ DWORD WINAPI MigrateThread(LPVOID p)
     return 0;
 }
 
-// Once a second (and at once after a change): VRChat's resolution follows the preset while VRChat
-// runs in SteamVR; otherwise what the user had is put back.
+// Once a second (and at once after a change): while VRChat runs in SteamVR, SteamVR's global
+// resolution is the user's one lowered by the preset's share (Native: left alone); otherwise what
+// the user had is put back.
 void GameResTick(bool now)
 {
     if (!now && GetTickCount() - g_resCheck < 1000) return;
@@ -407,14 +411,15 @@ void GameResTick(bool now)
     g_resVrchat = app::VRChatRunning();
     app::GlobalRes base;
     const bool applied = ParseBefore(ReadAppString(L"globalResBefore"), base);
-    if (g_gameRes && steamvr && g_resVrchat) {
+    const bool upscaling = g_s.upscaleFactor >= 1.005f;   // (at Native the user's resolution stays as it is)
+    if (g_gameRes && steamvr && g_resVrchat && upscaling) {
         if (!applied || fabsf(g_resApplied - g_s.upscaleFactor) > 0.004f) {
             if (!now && g_resRetry && GetTickCount() - g_resRetry < 10000) return;   // failed a moment ago
             app::GlobalResJob job;
             job.target = 1.0f / (g_s.upscaleFactor * g_s.upscaleFactor);
             job.haveBase = applied;
             job.base = base;
-            g_gameResStatus = Fmt(L"Setting VRChat to %d%%…", GameResTarget(g_s.upscaleFactor));
+            g_gameResStatus = Fmt(L"Lowering SteamVR's resolution so VRChat renders %d%%…", GameResTarget(g_s.upscaleFactor));
             // the DLL looks for the new picture size quickly for a few seconds (again when SteamVR took it)
             g_ch.SendCommand(kVuCmdResolutionChanging);
             StartRes(job, g_s.upscaleFactor);
@@ -457,10 +462,11 @@ void OnResDone(ResDone *d)
     } else if (r.ok) {
         g_resApplied = d->factor;
         g_resRetry = 0;
-        g_gameResStatus = Fmt(L"VRChat renders at %d%%: SteamVR's resolution is %d%% while it runs.", GameResTarget(d->factor),
-                              (int)lroundf(r.applied * 100.0f));
+        g_gameResStatus = Fmt(L"Upscales %d%% → 100%% per axis. VRChat renders %d%% of its resolution: SteamVR is at %d%% while "
+                              L"it runs (yours: %d%%).", (int)lroundf(100.0f / d->factor), GameResTarget(d->factor),
+                              (int)lroundf(r.applied * 100.0f), (int)lroundf((r.base.manual ? r.base.scale : 1.0f) * 100.0f));
     } else {
-        g_gameResStatus = L"Couldn't set VRChat's resolution: " + r.error + L".";
+        g_gameResStatus = L"Couldn't lower SteamVR's resolution for VRChat: " + r.error + L".";
         g_resRetry = GetTickCount();
     }
     delete d;
@@ -472,16 +478,6 @@ void OnResDone(ResDone *d)
 void SyncGameRes()
 {
     if (g_gameRes && fabsf(g_s.upscaleFactor - g_resApplied) > 0.004f) GameResTick(true);
-}
-
-void OnGameResToggle(bool on)
-{
-    g_gameRes = on;
-    WriteAppString(L"gameResolution", on ? L"1" : L"0");
-    g_gameResStatus.clear();
-    g_resRetry = 0;
-    GameResTick(true);   // on: set it now if VRChat runs; off: put back what was there
-    Invalidate();
 }
 
 // The app closes: SteamVR gets its own resolution back (waits for a request in flight first).
@@ -1216,8 +1212,6 @@ void CreateControls()
         w.items = { L"1×", L"1.3×", L"1.5×", L"1.72×", L"2×" };
         g_w.push_back(w);
     }
-    AddWidget(IDC_GAMERES, Kind::Toggle, { U.x + 20, U.y + 236, U.w - 40, 26 }, L"Set VRChat's resolution", ui::BtnOutline,
-              L"while it runs");
     AddSlider(IDC_SHARP, { U.x + 20, U.y + 270, U.w - 40, 30 }, L"Sharpness", 0, 100, 116);
     AddWidget(IDC_TINT, Kind::Toggle, { U.x + 20, U.y + 308, U.w - 40, 26 }, L"Debug tint", ui::BtnOutline,
               L"magenta = upscaled");
@@ -1495,16 +1489,12 @@ std::wstring TipText(int id, int part, std::wstring &title)
             return std::wstring(kScaleTip[part][1]) + tail;
         }
         title = L"Scaling";
-        return L"How much larger the output is than what the game renders, per axis, after DLSS's presets. The preset only "
-               L"sets the upscale; VRChat has to render at the matching resolution: switch on Set VRChat's resolution, or set "
-               L"it in SteamVR's per-application video settings." + tail;
+        return L"How much larger the output is than what the game renders, per axis, after DLSS's presets.\n\nSet the resolution "
+               L"you want to see in SteamVR as usual (VRChat's per-application video setting, or the global one). While VRChat "
+               L"runs and this app is open, the app lowers SteamVR's global resolution to the preset's share, so VRChat renders "
+               L"that share and vrupscale upscales it back to your resolution. Your global value is put back when VRChat or "
+               L"the app closes." + tail;
     }
-    case IDC_GAMERES:
-        title = L"Set VRChat's resolution";
-        return L"While VRChat runs in SteamVR and this app is open, the app sets SteamVR's resolution so that VRChat renders "
-               L"at the preset's percentage, and follows every preset change (Ctrl+F5 in VR too). It changes SteamVR's global "
-               L"resolution, which SteamVR applies at once, allowing for VRChat's own per-application value. What you had is "
-               L"put back when VRChat or the app closes, or when you switch this off.";
     case IDC_SHARP:
         title = L"Sharpness";
         return L"RCAS sharpening (from FSR 1) after upscaling, in every mode. 1.00 is the most RCAS does; 0 turns it off. "
@@ -1712,7 +1702,7 @@ void DrawPage(ui::Canvas &c)
     c.Wrap(ui::F_SMALL, kModeCaption[std::max(0, std::min(2, (int)g_s.mode))], { U.x + 22, U.y + 90, U.w - 44, 34 }, 17, col::inkSoft, 2);
     c.Text(ui::F_LABEL, L"Scaling", U.x + 20, ui::Mid(ui::F_LABEL, U.y + 143), col::ink);
     c.Text(ui::F_VALUE, TextOf(IDC_FACTORVAL), U.r() - 20, ui::Mid(ui::F_VALUE, U.y + 143), col::ink, 2);
-    c.Wrap(ui::F_SMALL, TextOf(IDC_FACTORHINT), { U.x + 22, U.y + 198, U.w - 44, 34 }, 17, col::inkSoft, 2);
+    c.Wrap(ui::F_SMALL, TextOf(IDC_FACTORHINT), { U.x + 22, U.y + 198, U.w - 44, 51 }, 17, col::inkSoft, 3);
     // Eye tracking
     const RectF Y = kCardEye;
     const ui::Widget *gf = W(IDC_GAZEFOLLOW);
@@ -1935,7 +1925,6 @@ void OnToggle(int id)
     case IDC_HOTKEYS: g_s.hotkeys = w->on; Changed(true); break;
     case IDC_SHARPHIST: g_s.fastHistory = w->on ? 0 : 1; Changed(true); break;
     case IDC_BILEDGES: g_s.bilinearEdges = w->on; ModelToUi(); Changed(true); break;
-    case IDC_GAMERES: OnGameResToggle(w->on); break;
     case IDC_GAZEFOLLOW: g_s.gazeFollow = w->on; ModelToUi(); Changed(true); break;   // (the area shows its value for this state)
     case IDC_GAZESHOW: g_s.gazeShow = w->on; Changed(true); break;
     }
@@ -2058,7 +2047,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE: {
         g_wnd = h;
         g_updStart = GetTickCount();
-        g_gameRes = ReadAppString(L"gameResolution") == L"1";
+        g_gameRes = ReadAppString(L"manageResolution") != L"0";
         CreateControls();
         SetText(IDC_TEXHINT, L"Untick a size to leave it alone, say an overlay that got tinted. Eye textures stay upscaled together.");
         ModelToUi();

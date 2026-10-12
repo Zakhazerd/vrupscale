@@ -2,6 +2,11 @@
 
 What changed in each version of vrupscale, newest first.
 
+## 0.6.3
+
+- The app always sets SteamVR's resolution while VRChat runs; the option is gone. The resolution you set in SteamVR, VRChat's own included, is what you see, and VRChat renders the preset's share of it.
+- Fixed: raising VRChat's own resolution made the app lower SteamVR's further, so you still saw the old resolution.
+
 ## 0.6.2
 
 - A **Change log** button shows this list. After an update, what's new since your last version is marked.

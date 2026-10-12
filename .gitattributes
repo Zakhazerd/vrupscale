@@ -1,0 +1,2 @@
+# the compiled shaders (tools/shaders.sh): binary, no text diffs
+src/gen/shaders.bin binary

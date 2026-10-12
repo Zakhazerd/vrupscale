@@ -15,7 +15,7 @@
 #include <vector>
 #include <utility>
 
-#define VU_VERSION_STR "0.6.2"
+#define VU_VERSION_STR "0.6.3"
 
 namespace vu {
 
@@ -153,7 +153,7 @@ void FormatHookVariantHits(char *out, size_t n);   // empty unless several bodie
 extern volatile LONGLONG g_lastTickQpc;  // last render-thread housekeeping tick (QPC), 0 = never
 void StartWorker();
 
-// Precompiled compute-shader bytecode (src/gen/shader_blobs.h, indexed by ShaderId in permutations.h)
+// Precompiled compute-shader bytecode (src/gen/shaders.bin, indexed by ShaderId in permutations.h)
 struct BlobRef { const void *data; size_t size; };
 BlobRef GetShaderBlob(int id);
 

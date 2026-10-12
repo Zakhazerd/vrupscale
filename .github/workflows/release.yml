@@ -1,6 +1,7 @@
 # Publishes a GitHub release for each new version: when main gets a VU_VERSION_STR (src/common.h)
 # that has no release yet, this builds vrupscale and creates release v<version> at that commit,
-# with the zip the app's updater downloads (stored uncompressed), its SHA-256, and the source.
+# with the zip the app's updater downloads (stored uncompressed). GitHub publishes each asset's
+# SHA-256, which the updater checks; GitHub's own source archives come with the release.
 # The notes are the version's section of CHANGELOG.md. (Pushing a tag v<version>
 # works too; a version that already has a release is skipped.)
 name: Release
@@ -55,7 +56,6 @@ jobs:
           VER: ${{ steps.ver.outputs.ver }}
         run: |
           python3 tools/release_notes.py "$VER" > notes.md
-          cat build/vrupscale-$VER.zip.sha256
-          sha256sum build/pkg/vrupscale-$VER/vrupscale.exe build/pkg/vrupscale-$VER/payload/dxgi.dll
+          sha256sum "build/vrupscale-$VER.zip" build/pkg/vrupscale-$VER/vrupscale.exe build/pkg/vrupscale-$VER/payload/dxgi.dll
           gh release create "v$VER" --target "$GITHUB_SHA" --title "vrupscale $VER" --notes-file notes.md \
-            "build/vrupscale-$VER.zip" "build/vrupscale-$VER.zip.sha256" "build/vrupscale-$VER-src.zip"
+            "build/vrupscale-$VER.zip"

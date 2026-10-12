@@ -1411,7 +1411,10 @@ static void RunResolutionSwitchTest(Gfx &g, const World &world, const char *iniB
         for (int e = 0; e < 2; ++e)
             for (int k = 0; k < 3; ++k) {
                 uint32_t c[8] = {};
-                if (!debugContent(tex[e][k], c) || !c[7] || c[0] != 0 || c[1] != 0 || c[2] != (uint32_t)pw[pic] || c[3] != (uint32_t)ph[pic])
+                // (to within 2 px, as the DLL itself takes a measured picture: a row that didn't change
+                // in the last windows, say an edge of plain sky, can't be told from the unused part)
+                if (!debugContent(tex[e][k], c) || !c[7] || c[0] != 0 || c[1] != 0 || abs((int)c[2] - pw[pic]) > 2 ||
+                    abs((int)c[3] - ph[pic]) > 2)
                     return false;
             }
         StreamSummary s = Summarize(firstId);

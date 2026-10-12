@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds everything and produces the binary and source zips in build/.
+# Builds everything and produces the release zip in build/ (what the app's updater downloads).
 set -eu
 cd "$(dirname "$0")/.."
 VER=$(sed -n 's/^#define VU_VERSION_STR "\(.*\)"/\1/p' src/common.h)
@@ -31,11 +31,4 @@ with zipfile.ZipFile('../vrupscale-$VER.zip', 'w', zipfile.ZIP_STORED) as z:
         for f in sorted(files):
             z.write(os.path.join(root, f))
 ")
-(cd build && sha256sum vrupscale-$VER.zip > vrupscale-$VER.zip.sha256)
-
-S=build/src/vrupscale-$VER-src
-rm -rf build/src && mkdir -p $S
-cp -r src shaders test tools app third_party build.sh README.md CHANGELOG.md LICENSE .gitignore .github $S/
-(cd build/src && python3 -I -c "
-import shutil; shutil.make_archive('../vrupscale-$VER-src', 'zip', '.', 'vrupscale-$VER-src')")
-ls -la build/vrupscale-$VER*
+ls -la build/vrupscale-$VER.zip

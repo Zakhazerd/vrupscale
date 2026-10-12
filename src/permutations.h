@@ -1,5 +1,5 @@
 // Every compute-shader permutation the DLL uses. Compiled offline by tools/compile_shaders.cpp
-// (Microsoft d3dcompiler_47, cs_5_0) into src/gen/shader_blobs.h, which is embedded in the DLL.
+// (Microsoft d3dcompiler_47, cs_5_0) into src/gen/shaders.bin, which is embedded in the DLL.
 // X(enum name, source file, "DEFINE=VALUE;...")
 #pragma once
 

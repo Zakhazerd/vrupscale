@@ -7,7 +7,7 @@ CXX=${CXX:-x86_64-w64-mingw32-g++-win32}
 WINDRES=${WINDRES:-x86_64-w64-mingw32-windres}
 OUT=build
 mkdir -p $OUT/obj $OUT/gen
-[ -f src/gen/shader_blobs.h ] || { echo "src/gen/shader_blobs.h missing: run tools/shaders.sh"; exit 1; }
+[ -f src/gen/shaders.bin ] || { echo "src/gen/shaders.bin missing: run tools/shaders.sh"; exit 1; }
 
 CFLAGS="-O2 -Wall -D__USE_MINGW_ANSI_STDIO=1 -Wno-unknown-pragmas -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0A00 -DUNICODE -D_UNICODE"
 INC="-Isrc -I$OUT/gen -Ithird_party/ffx -Ithird_party/minhook/include"
@@ -17,6 +17,7 @@ for f in third_party/minhook/src/buffer.c third_party/minhook/src/hook.c third_p
 done
 $CC $CFLAGS $INC -c src/vtables.c -o $OUT/obj/vtables.o
 $CC -c src/exports.S -o $OUT/obj/exports.o
+$CC -c src/shader_pack.S -o $OUT/obj/shader_pack.o   # the compiled shaders (src/gen/shaders.bin)
 for f in dllmain log config proxy hooks shaders upscaler temporal control gaze; do
   $CXX $CFLAGS -std=c++17 -fno-exceptions -fno-rtti -Wno-unused-function $INC -c src/$f.cpp -o $OUT/obj/$f.o
 done
