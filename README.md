@@ -19,9 +19,11 @@ vrupscale itself runs inside SteamVR, so it upscales even with the app closed, b
 
 ## The app
 
-The headline says what vrupscale is doing. The line below it shows what is being upscaled (the game's render resolution and the output), the mode, how many new frames arrive per second, and the GPU time per frame for both eyes. The characters on the right show the state too: asleep while SteamVR isn't running, sparkling while upscaling, with an orange **!** when something needs you. **Temporal paused** means an eye has been on FSR 1 for more than a second because its textures can't share one history (see If something goes wrong).
+vrupscale has two parts: the upscaler, which **Install** puts into SteamVR (as `dxgi.dll` in `SteamVR\bin\win64`) and which runs inside SteamVR's compositor, and this app, which installs it, shows what it is doing and changes its settings.
 
-**Updates:** when a new version is out, an **Update to …** button appears at the top; point at it to see what's new. One click downloads it, checks it against GitHub's checksum, replaces the app's files and restarts the app. Your settings stay. SteamVR's copy of vrupscale is updated straight away if SteamVR is closed, otherwise as soon as it closes (or the next time you open the app). The app checks GitHub when it starts and every 6 hours, sending nothing but the request.
+The headline says what vrupscale is doing. The line below it shows what is being upscaled (the game's render resolution and the output), the mode, how many new frames arrive per second, and the GPU time per frame for both eyes. The little illustrated characters on the right show the state too: asleep while SteamVR isn't running, sparkling while upscaling, with an orange **!** when something needs you. **Temporal paused** means vrupscale has had to use FSR 1 for one eye for more than a second (see If something goes wrong).
+
+**Updates:** when a new version is out, an **Update to …** button appears at the top; point at it to see what's new. One click downloads it, checks it against GitHub's checksum, replaces the app's files and restarts the app. Your settings stay. The upscaler inside SteamVR is updated straight away if SteamVR is closed; otherwise the app updates it as soon as SteamVR closes (or the next time you open the app). The app checks GitHub when it starts and every 6 hours, sending nothing but the request.
 
 **Change log**, next to the version number, shows what changed in each version (the same as [CHANGELOG.md](CHANGELOG.md)). After an update, the versions you didn't have yet are marked **new**; while an update is available, its notes come first.
 
@@ -42,18 +44,18 @@ Under the headline, the window has six panels, each described below: Upscaling, 
 
   **Native** doesn't upscale. In Temporal mode it is anti-aliasing from your head's micro-motion, like DLAA (on the test scene about 3.5 dB better than FSR 1 at 1×, and steadier); FSR 1 at 1× only sharpens.
 
-  **The resolution you set in SteamVR is the one you see.** SteamVR gives VRChat its global resolution × VRChat's own per-application resolution. While VRChat runs, the app lowers the global resolution to the preset's share, so VRChat renders the table's percentage of what you set and vrupscale upscales it back. For example, with the global resolution at 100%, VRChat's own at 150% and Ultra Quality, the app sets the global to 59%: VRChat renders 89% (59% of 150%) and you see 150%.
+  **The resolution you set in SteamVR is the one you see.** SteamVR gives VRChat its global resolution × VRChat's own per-application resolution. While VRChat runs, the app lowers the global resolution to the table's pixel percentage (59% at Ultra Quality), so VRChat renders that share of what you set and vrupscale upscales it back. For example, with the global resolution at 100%, VRChat's own at 150% and Ultra Quality, the app sets the global to 59%: VRChat renders 89% (59% of 150%) and you see 150%.
   - Preset changes (in the app, or Ctrl+F5 in VR) apply at once. At Native the resolution is left alone. Your global resolution is put back when VRChat or the app closes, or, if the app closed unexpectedly, the next time it starts.
   - To change what you see while VRChat runs, change VRChat's per-application resolution; SteamVR applies it when VRChat starts, or straight away while SteamVR's settings window is open. Leave the global resolution alone meanwhile: SteamVR shows the lowered value then. "Auto" counts as 100% and is set back to Auto afterwards.
-  - Each time the app changes the resolution, it tells vrupscale, which then finds VRChat's new render size in a fraction of a second instead of about five.
+  - Each time the app changes the resolution, it tells the upscaler, which then finds VRChat's new render size in a fraction of a second instead of about five.
   - To manage the resolution yourself, set `[app] manageResolution=0` in the settings file and set VRChat to the table's percentage.
-- **Sharpness** (default 1.00, the most RCAS does) – sharpening after upscaling.
+- **Sharpness** (default 1.00, the maximum) – how much the upscaled picture is sharpened (with FSR's RCAS), in every mode; 0 turns it off.
 - **Debug tint** – magenta on everything vrupscale upscales; in Temporal and FSR 1 mode, blue outside the area, where the fast spatial upscale is used.
-- **Shortcuts in VR** – hold Ctrl and press a function key: F1 upscaling on/off, F2 mode (Temporal → FSR 1 → Bilinear), F3 debug tint, F4 sharpness steps, F5 next scaling preset (Native → … → Performance → Native, changing VRChat's resolution too), F6 Sharp history, F7 Bilinear edges, F8 calibrate the eye tracking. The app follows along and saves the change.
+- **Shortcuts in VR** – hold Ctrl and press a function key: F1 upscaling on/off, F2 mode (Temporal → FSR 1 → Bilinear), F3 debug tint, F4 steps through sharpness values, F5 next scaling preset (Native → … → Performance → Native, changing VRChat's resolution too), F6 Sharp history, F7 Bilinear edges, F8 calibrate the eye tracking. The app follows along and saves the change.
 
-**Temporal**
-- **Temporal area** (default 60%; 40% while **Follow gaze** is on) – the width and height of the part of each eye's picture that gets the full treatment: temporal detail in Temporal mode, FSR 1 in FSR 1 mode. 60% covers about a third of the pixels. The rest gets a fast spatial upscale, and a soft band blends the two. This is the main cost control: smaller is cheaper, and **all** treats the whole picture.
-  - It has two values: one for the centred area, and one for when it follows your gaze. That one can be smaller, since the area then sits where you look instead of covering everywhere you might look; 40% covers 16% of the pixels. The slider shows and sets the value for the current state of **Follow gaze**.
+**Temporal** – Temporal mode keeps a *history* for each eye: the picture it has built up from earlier frames.
+- **Temporal area** (default 60%; 40% while **Follow gaze** is on) – the width and height, as a share of each eye's picture, of the area that gets temporal detail (FSR 1 in FSR 1 mode). 60% covers about a third of the pixels. The rest gets a fast spatial upscale, and a soft band blends the two. This is the main cost control: smaller is cheaper, and **all** treats the whole picture.
+  - It has two values: one for the centred area, and one for when it follows your gaze. That one can be smaller, since the area then sits where you look instead of covering everywhere you might look; 40% covers 16% of the pixels. The slider shows whichever value is in use, so switching **Follow gaze** on or off moves it between the two.
   - Changing it rebuilds the histories (a brief hitch).
 - **History strength** (default 1.00, up to 2.00) – how much the earlier frames count. Higher is steadier but softer. On the test scene steadiness peaks around 1 and higher values only soften the image, so they are for experimenting.
 - **Moving objects** (0 to 1, default 1.00) – how far history is trusted on things that move differently from your head, such as avatars. At 1 they get temporal smoothing too, with a little smearing on fast movement; at 0 they get the spatial upscale and never smear.
@@ -63,13 +65,16 @@ Under the headline, the window has six panels, each described below: Upscaling, 
 
 **Eye tracking** (Bigscreen Beyond 2e) – the area follows your gaze, so the sharp, steady part of the picture is wherever you look.
 - Setup: install Bigscreen's eye tracking (the **Eyetracking Add-On** in the Bigscreen Beyond Utility), start its Eyetracking client with your trained model, and switch on **VRCFT** there. vrupscale reads that output, the same data Bigscreen's VRCFaceTracking module reads; VRCFaceTracking itself doesn't need to run, and if it does, both read side by side.
-- **Follow gaze** (the switch next to the title, default off) – the area moves to where you look, once your gaze leaves a small zone around its centre (2% of the width), so tiny eye movements leave it alone. In Temporal mode, the strip the area uncovers when it moves starts without history and catches up within a few frames. If tracking drops out (a blink, the headset off), the area stays where it was.
+- **Follow gaze** (the switch next to the title, default off) – the area moves to where you look, once your gaze leaves a small zone around its centre (2% of the width), so tiny eye movements leave it alone. In Temporal mode, the strip the area newly covers when it moves starts without history and catches up within a few frames. If tracking drops out (a blink, the headset off), the area stays where it was.
 - **Show gaze** – a green ring in the headset where vrupscale thinks you look. The ring should sit on whatever you look at; if it doesn't, calibrate.
 - **Calibrate** (or Ctrl+F8 in VR) – a cross appears straight ahead in both eyes; look at its centre until it disappears (about 3 seconds). The tracker's reading during that time becomes an offset taken off every later reading, so that straight ahead lines up. Afterwards the ring shows for a few seconds so you can check. If your gaze wandered, the calibration fails and the old one stays. Needs Temporal or FSR 1 mode and live eye tracking.
 - **Clear calibration** removes the offset.
 - The app reads each eye's field of view from SteamVR once per session (to place the gaze in each eye's picture), so have it open the first time you use eye tracking.
 
-**SteamVR** – where SteamVR is, which vrupscale version is installed in it, and **Install / Update** and **Uninstall** (both need SteamVR closed). Uninstall puts back another tool's `dxgi.dll` if the installer had to set one aside. Settings are saved automatically and applied live; **Restore defaults** resets them all except your texture choices, the eye tracking calibration and SteamVR's field of view, and **Settings file** shows the file in Explorer.
+**SteamVR** – installing, and the settings:
+- Where SteamVR is, and which version of the upscaler is installed in it.
+- **Install / Update** puts the upscaler into SteamVR and **Uninstall** removes it; both need SteamVR closed. If another tool's `dxgi.dll` was there, Install sets it aside (after asking) and Uninstall puts it back.
+- Settings are saved automatically to `%LOCALAPPDATA%\vrupscale\vrupscale.ini` and apply at once. **Restore defaults** resets them all except your texture choices, the eye tracking calibration and SteamVR's field of view; **Settings file** shows the file in Explorer.
 
 **Textures** – every large texture the compositor sampled in the last minute, what vrupscale did with it, and why. Point at a row for details.
 - The game's eye textures are marked **eye**. When the game renders into only part of a larger texture (after SteamVR's resolution was lowered), the row shows that part: `uses 2516×2516 → 3573×3573`.
@@ -77,9 +82,7 @@ Under the headline, the window has six panels, each described below: Upscaling, 
 - Unticked sizes stay listed even when not in use, so you can tick them again; **Tick all** ticks them all.
 - Sizes skipped by rule (too small, too wide, SteamVR's own) can't be ticked.
 
-**Recent events** – the last lines vrupscale logged inside SteamVR (scroll with the mouse wheel). **Open log** opens the whole log.
-
-Settings are saved to `%LOCALAPPDATA%\vrupscale\vrupscale.ini` and apply when SteamVR starts.
+**Recent events** – the last lines the upscaler logged inside SteamVR (scroll with the mouse wheel). **Open log** opens the whole log.
 
 ## How the temporal mode works
 
@@ -106,8 +109,8 @@ Decisions are made on the GPU, so the CPU never waits for it:
 
 ## Status and testing
 
-- **In SteamVR:** used with VRChat on an RTX 3090. The app's status line shows the GPU time vrupscale takes on your system. That cost follows the output resolution (the one you set in SteamVR) more than the preset: a higher preset makes the game cheaper and vrupscale's motion estimation a little cheaper, while the output stays the same.
-- **Test harness:** vrupscale is cross-compiled and run against a real D3D11 implementation (DXVK on a software Vulkan GPU, under Wine), with a harness that behaves like SteamVR's compositor. It runs once drawing directly (171 checks) and once recording into command lists like SteamVR (173 checks); all pass. The checks cover quality against ground truth, the area in both modes (inside it, identical to the whole-image result; no seam), SteamVR drawing every swapchain texture each frame, games rendering into part of larger textures, resolution changes while running, eye tracking, and the app's live connection.
+- **In SteamVR:** used with VRChat on an RTX 3090. The app's status line shows the GPU time vrupscale takes on your system. It depends mostly on the resolution you see (set in SteamVR), not on the preset: a higher preset makes the game cheaper, while vrupscale's output stays the same size.
+- **Test harness:** vrupscale is cross-compiled and run against a real D3D11 implementation (DXVK on a software Vulkan GPU, under Wine), with a harness that behaves like SteamVR's compositor. It runs once drawing directly (171 checks) and once recording into command lists like SteamVR (173 checks); all pass. The checks cover quality against ground truth, the area in both modes (the same result inside it as processing the whole picture, and no visible seam), SteamVR drawing every swapchain texture each frame, games rendering into part of larger textures, resolution changes while running, eye tracking, and the app's live connection.
 - **SteamVR's resolution** is tested against a stand-in for `openvr_api.dll` that records the calls: VRChat starting, preset changes, Native, a change of VRChat's own resolution, VRChat closing and the app closing each set or put back SteamVR's global `supersampleScale` as they should.
 - **Eye tracking** works with a real Bigscreen Beyond 2e. The tests also run it against a stand-in for Bigscreen's eye tracking client (the same shared memory and data layout that Bigscreen's own VRCFaceTracking module reads): the area follows the gaze in both eyes and both modes, the history moves with it (no smearing or shifted picture), the dead zone, calibration and its failure on a restless gaze, the markers, and running without a tracker.
 - **Risk:** at worst, SteamVR fails to start or the image looks wrong. Click **Uninstall** in the app (with SteamVR closed), or delete `dxgi.dll` from `SteamVR\bin\win64`.
@@ -126,7 +129,7 @@ The test scene is a procedural VR-like scene with thin lines, tiny text, a zone 
 | Moving object | 20.16 dB | 19.60 dB (smears a little) | **20.84 dB** | |
 | Still scene (no motion, nothing to gain) | 23.17 dB | 23.42 dB | | |
 
-The defaults gain most in steadiness (less shimmer). Sharp history shows up in the fine-detail numbers, but the difference is hard to see in the headset. With **Moving objects** on, the moving object comes within 0.6 dB of FSR 1 and the area behind it beats FSR 1; turning it off gains 1.2 dB on the object.
+The defaults gain most in steadiness (less shimmer). Sharp history shows up in the fine-detail numbers, but the difference is hard to see in the headset. With **Moving objects** at 1, the moving object comes within 0.6 dB of FSR 1 and the background it uncovers beats FSR 1; at 0 the object gains 1.2 dB.
 
 At each scaling preset (defaults, the same sequence rendered at the matching output size):
 
@@ -148,9 +151,9 @@ History strength, on the same sequence over 40 frames (Lanczos-3 history; measur
 | Pattern above the input's Nyquist limit | 21.21 dB | 21.23 dB | 20.56 dB | 19.45 dB |
 | Steadiness | 26.92 dB | **27.28 dB** | 27.22 dB | 26.91 dB |
 
-Above 1 the history gets softer faster than it gets steadier, also with exact motion (so the history's resampling limits it, not motion estimation) and with calmer head motion. Motion tolerance above 1.5 and a wider colour clamp (`clipGamma`) changed nothing measurable.
+Above 1 the picture gets softer faster than it gets steadier. That holds with perfectly known motion and with calmer head motion too, so the limit is the repeated resampling of the history, not motion estimation. Motion tolerance above 1.5 and a wider colour clamp (`clipGamma`) changed nothing measurable.
 
-With the default area (60%):
+By part of the picture, with the area at 60% (the default):
 
 | Part of the image | FSR 1, whole image | FSR 1, area 60% | Bilinear | Temporal, area 100% | Temporal, area 60% | Area 60%, Bilinear edges |
 |---|---|---|---|---|---|---|
@@ -176,7 +179,7 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 
 **Nothing is upscaled:** the texture list says why for each texture. If VRChat's eye textures are unticked, tick them (or **Tick all**). If they aren't listed at all, send the log.
 
-**"Temporal paused":** an eye's textures have been on different histories for more than a second, so that eye gets FSR 1 (every frame, never alternating). A change of SteamVR's resolution shouldn't cause it. If it stays, restart the game, which then makes new textures of one size, and send the log.
+**"Temporal paused":** for more than a second, the game's textures for one eye have held pictures of different sizes, which can't share a history. That eye gets FSR 1 meanwhile, for every frame (switching back and forth would flicker). A change of SteamVR's resolution shouldn't cause it. If it stays, restart the game, which then makes new textures of one size, and send the log.
 
 **An overlay or menu gets upscaled (tinted magenta):** untick its size in the texture list.
 
@@ -192,13 +195,13 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 
 ## Settings file reference
 
-`%LOCALAPPDATA%\vrupscale\vrupscale.ini`. The app writes the keys it shows; SteamVR re-reads the file within a second of a change, so editing it by hand works too. Keys the app doesn't show:
-- `[general] active=0` – the DLL does nothing except forward `dxgi.dll` (read when SteamVR starts).
+`%LOCALAPPDATA%\vrupscale\vrupscale.ini`. The app writes the keys it shows; the upscaler re-reads the file within a second of a change, so editing it by hand works too. Keys the app doesn't show:
+- `[general] active=0` – the upscaler does nothing but pass calls on to Windows' own `dxgi.dll` (read when SteamVR starts).
 - `[general] logLevel` (0 errors, 1 info, 2 verbose); `statsIntervalSec` (a stats line every N seconds, 0 off); `passTiming=1` (temporal mode's GPU time per pass in the stats line, per new frame and eye, with the quick checks of frames already processed listed apart; the app's GPU figure isn't measured meanwhile).
 - `[match]` – rules for what counts as an eye texture: `minWidth`, `minHeight`, `minAspect`, `maxAspect`, `requireShared`, `onlySizes` / `excludeSizes` (comma-separated `WxH`), `maxArraySize`.
 - `[upscale] upscaleFactor` – the **Scaling** preset's factor. Any value from 1.00 to 3.00 works; one that isn't a preset shows as Custom in the app, and one within 0.02 of a preset is moved onto it when the app starts.
 - `[eyes]` – `followGaze`, `showGaze` (the app's switches); `offsetX` / `offsetY` (the calibration: tangents of the angle taken off the tracker's reading, x right, y up); `projection` (each eye's field of view as SteamVR reports it: tangents left, right, top, bottom, left eye then right; written by the app); `deadzone` (default 0.02: how far the gaze must move from the area's centre, as a fraction of the width, before the area follows).
-- `[app] checkUpdates=0` stops the app from asking GitHub for updates. `updateDll=1` is set by an update while SteamVR's copy still waits to be updated.
+- `[app] checkUpdates=0` stops the app from asking GitHub for updates. `updateDll=1` is set by an update while the upscaler inside SteamVR still waits to be updated.
 - `[app] manageResolution=0` – the app leaves SteamVR's resolution alone (see Scaling). `globalResBefore` holds your global resolution while the app has it lowered (the scale, and 1 for Custom or 0 for Auto); it is put back from there.
 - `[temporal]` – `temporalArea` and `gazeArea` are the **Temporal area** as fractions (0.3–1.0): centred (default 0.6) and while following the gaze (default 0.4), in both Temporal and FSR 1 mode. `sharpHistory` and `bilinearEdges` are those switches; `maxWeight`, `localTrust` and `residualTol` are **History strength**, **Moving objects** and **Motion tolerance** (by hand, `maxWeight` goes up to 64).
 - `[temporal] maxStreams` (default 4) – the most histories at once. Each takes about 38 MB for Index-sized eye textures at the default area (82 MB with the area at all).
