@@ -6,6 +6,7 @@
 #include "gameres.h"
 #include "ui.h"
 #include "update.h"
+#include "vrlink.h"
 
 #include <commctrl.h>
 #include <shellapi.h>
@@ -36,11 +37,11 @@ enum : int {
     IDC_TINT, IDC_HOTKEYS, IDC_AREA, IDC_AREAVAL, IDC_AREAHINT, IDC_HIST, IDC_HISTVAL, IDC_MOVING, IDC_MOVINGVAL, IDC_TOL, IDC_TOLVAL,
     IDC_DEFAULTS, IDC_SAVED, IDC_OPENLOG, IDC_OPENFOLDER, IDC_STATUS, IDC_DETAIL, IDC_TEXLIST, IDC_TEXHINT, IDC_EVENTS,
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
-    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG,
+    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR,
 };
 enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
-           WM_APP_UPDPROGRESS = WM_APP + 5, WM_APP_UPDDONE = WM_APP + 6;
+           WM_APP_UPDPROGRESS = WM_APP + 5, WM_APP_UPDDONE = WM_APP + 6, WM_APP_VRQUIT = WM_APP + 7, WM_APP_AUTOLAUNCH = WM_APP + 8;
 
 HWND g_wnd = nullptr;
 UINT g_dpi = 96;
@@ -70,6 +71,25 @@ volatile LONG g_resWorkers = 0;
 DWORD g_resCheck = 0, g_resRetry = 0;
 bool g_resVrchat = false;            // VRChat is running
 bool g_resMigrated = false;          // 0.4.7/0.4.8's per-application value put back
+bool g_dllOurs = true;               // vrupscale is installed in SteamVR (else nothing would upscale VRChat)
+
+// Start with SteamVR (vrlink.h): SteamVR starts the app (minimized) when it starts, and the app closes
+// when SteamVR does. While on, a thread keeps a connection to SteamVR for as long as it runs, so that
+// SteamVR's request to quit arrives: the resolution is put back while SteamVR still answers, then the
+// app closes (or, if SteamVR went without asking, once its processes are gone). The thread also keeps
+// the app's entry among SteamVR's startup apps in line with the switch. [app] withSteamVR=0 turns it
+// off; withSteamVRApplied = what SteamVR was last told (1 or 0).
+bool g_withVR = true;
+bool g_fromVR = false;               // this run was started by SteamVR
+HANDLE g_linkThread = nullptr, g_linkWake = nullptr;
+volatile LONG g_linkStop = 0;
+volatile LONG g_linkWant = 1;        // the thread keeps the lasting connection
+volatile LONG g_linkApplied = 0;     // SteamVR was last told "on"
+volatile LONG g_linkSync = 1;        // the thread brings SteamVR's startup entry in line (again)
+bool g_vrSeen = false;               // SteamVR ran during this run
+bool g_vrQuitting = false;           // SteamVR asked the app to quit; its processes are still closing
+bool g_closingWithVR = false;
+DWORD g_vrGoneAt = 0, g_vrCheck = 0;
 
 // Eye tracking: each eye's projection is asked from SteamVR once per SteamVR session (so a gaze
 // direction can be placed in each eye's picture); calibration messages from the DLL are shown
@@ -239,7 +259,7 @@ void UpdateValueLabels()
         SetText(IDC_FACTORHINT, g_gameResStatus);
     else
         SetText(IDC_FACTORHINT, Fmt(L"While VRChat runs, it renders %d%% of the resolution SteamVR gives it, upscaled back to "
-                                    L"that (keep this app open).", pct));
+                                    L"that%s.", pct, g_withVR ? L"" : L" (keep this app open)"));
     SetText(IDC_SHARPVAL, Pos(IDC_SHARP) == 0 ? std::wstring(L"off") : Fmt(L"%.2f", Pos(IDC_SHARP) / 100.0f));
     SetText(IDC_AREAVAL, Pos(IDC_AREA) >= 100 ? std::wstring(L"all") : Fmt(L"%d%%", Pos(IDC_AREA)));
     Enable(IDC_BILEDGES, g_s.mode != kVuModeBilinear && Pos(IDC_AREA) < 100);   // area "all": there are no edges
@@ -314,6 +334,7 @@ void ModelToUi()
     SetCheck(IDC_BILEDGES, g_s.bilinearEdges != 0);
     SetCheck(IDC_GAZEFOLLOW, g_s.gazeFollow != 0);
     SetCheck(IDC_GAZESHOW, g_s.gazeShow != 0);
+    SetCheck(IDC_WITHVR, g_withVR);
     const bool temporal = g_s.mode == kVuModeTemporal;
     for (int id : { IDC_HIST, IDC_MOVING, IDC_TOL, IDC_SHARPHIST }) Enable(id, temporal);
     Enable(IDC_AREA, g_s.mode != kVuModeBilinear);
@@ -332,7 +353,7 @@ void ModelToUi()
 void Save()
 {
     if (SaveSettings(g_settingsPath, g_s))
-        SetText(IDC_SAVED, L"Saved automatically and applied live. Restore defaults keeps your texture choices.");
+        SetText(IDC_SAVED, L"");   // (only a failure is shown)
     else
         SetText(IDC_SAVED, Fmt(L"Could not save the settings to %s", g_settingsPath.c_str()));
 }
@@ -407,12 +428,14 @@ void GameResTick(bool now)
     if (!now && GetTickCount() - g_resCheck < 1000) return;
     g_resCheck = GetTickCount();
     if (g_resBusy) return;   // the running request ends with another tick
-    const bool steamvr = IsSteamVRRunning() || _wgetenv(L"VRUPSCALE_TEST_STEAMVR_RUNNING") != nullptr;
+    // (SteamVR asked the app to quit: its resolution was put back, and stays so while it closes)
+    const bool steamvr = (IsSteamVRRunning() || _wgetenv(L"VRUPSCALE_TEST_STEAMVR_RUNNING") != nullptr) && !g_vrQuitting;
     g_resVrchat = app::VRChatRunning();
     app::GlobalRes base;
     const bool applied = ParseBefore(ReadAppString(L"globalResBefore"), base);
     const bool upscaling = g_s.upscaleFactor >= 1.005f;   // (at Native the user's resolution stays as it is)
-    if (g_gameRes && steamvr && g_resVrchat && upscaling) {
+    const bool dll = g_live || g_dllOurs;
+    if (g_gameRes && steamvr && g_resVrchat && upscaling && dll) {
         if (!applied || fabsf(g_resApplied - g_s.upscaleFactor) > 0.004f) {
             if (!now && g_resRetry && GetTickCount() - g_resRetry < 10000) return;   // failed a moment ago
             app::GlobalResJob job;
@@ -671,6 +694,49 @@ void SetStatusColor(COLORREF c)
     }
 }
 
+// After an update by the Update button, SteamVR's copy (its dxgi.dll) is updated once SteamVR is
+// closed. [app] updateDll=1 while that is pending.
+enum class DllUpd { None, Waiting, Done, Failed };
+DllUpd FinishDllUpdate(const std::wstring &root, std::wstring &msg)
+{
+    if (ReadAppString(L"updateDll") != L"1") return DllUpd::None;
+    const bool found = IsSteamVRRoot(root);
+    const DllInfo payload = GetDllInfo(PayloadPath());
+    const DllInfo cur = found ? GetDllInfo(InstalledDllPath(root)) : DllInfo();
+    if (!found || !cur.present || !cur.ours || !payload.present || cur.version == payload.version) {
+        WriteAppString(L"updateDll", L"");
+        return DllUpd::None;
+    }
+    const std::wstring waiting = Fmt(L"SteamVR's copy is updated to %s as soon as SteamVR closes.", payload.version.c_str());
+    if (IsSteamVRRunning()) {
+        msg = waiting;
+        return DllUpd::Waiting;
+    }
+    const InstallResult r = Install(root, false, msg);
+    if (r == InstallResult::Ok) {
+        WriteAppString(L"updateDll", L"");
+        msg = Fmt(L"Updated SteamVR's copy to %s.", payload.version.c_str());
+        return DllUpd::Done;
+    }
+    if (r == InstallResult::SteamVRRunning) {   // (closing just now: next time)
+        msg = waiting;
+        return DllUpd::Waiting;
+    }
+    WriteAppString(L"updateDll", L"");
+    msg = r == InstallResult::AccessDenied ? std::wstring(L"Click Update to finish: Windows needs administrator rights for the SteamVR folder.")
+                                           : L"Click Update to finish: " + msg;
+    return DllUpd::Failed;
+}
+
+const wchar_t *kDllHelperMutex = L"Local\\vrupscale.dllupdate";
+
+bool DllUpdateHelperRunning()
+{
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, kDllHelperMutex);
+    if (m) CloseHandle(m);
+    return m != nullptr;
+}
+
 void RefreshInstall(bool force)
 {
     DWORD now = GetTickCount();
@@ -683,27 +749,15 @@ void RefreshInstall(bool force)
     DllInfo cur = found ? GetDllInfo(InstalledDllPath(g_root)) : DllInfo();
     const bool hasBackup = found && GetFileAttributesW((InstalledDllPath(g_root) + L".vrupscale-backup").c_str()) !=
                                         INVALID_FILE_ATTRIBUTES;
-    // After an update by the Update button, SteamVR's copy follows as soon as SteamVR is closed.
-    if (ReadAppString(L"updateDll") == L"1") {
-        if (!found || !cur.present || !cur.ours || !payload.present || cur.version == payload.version) {
-            WriteAppString(L"updateDll", L"");
-        } else if (IsSteamVRRunning()) {
-            SetText(IDC_INSTALLMSG, Fmt(L"SteamVR's copy is updated to %s as soon as SteamVR closes.", payload.version.c_str()));
-        } else {
-            std::wstring msg;
-            const InstallResult r = Install(g_root, false, msg);
-            if (r == InstallResult::Ok) {
-                WriteAppString(L"updateDll", L"");
-                SetText(IDC_INSTALLMSG, Fmt(L"Updated SteamVR's copy to %s.", payload.version.c_str()));
-                cur = GetDllInfo(InstalledDllPath(g_root));
-            } else if (r != InstallResult::SteamVRRunning) {   // (closing just now: next time)
-                WriteAppString(L"updateDll", L"");
-                SetText(IDC_INSTALLMSG, r == InstallResult::AccessDenied
-                                            ? std::wstring(L"Click Update to finish: Windows needs administrator rights for the SteamVR folder.")
-                                            : L"Click Update to finish: " + msg);
-            }
-        }
+    // After an update by the Update button, SteamVR's copy follows as soon as SteamVR is closed
+    // (unless a helper this app started on closing with SteamVR is doing that right now).
+    if (!DllUpdateHelperRunning()) {
+        std::wstring m;
+        const DllUpd u = FinishDllUpdate(g_root, m);
+        if (u != DllUpd::None) SetText(IDC_INSTALLMSG, m);
+        if (u == DllUpd::Done) cur = GetDllInfo(InstalledDllPath(g_root));
     }
+    g_dllOurs = found && cur.present && cur.ours;
     std::wstring state, button = L"Install";
     if (!found) state = L"";
     else if (!cur.present) state = L"vrupscale is not installed in SteamVR.";
@@ -900,6 +954,8 @@ int RunElevated(const std::wstring &args)
     return (int)code;
 }
 
+void OnWithVrToggle(bool on);
+
 void DoInstall(bool uninstall)
 {
     if (!IsSteamVRRoot(g_root)) return;
@@ -932,11 +988,198 @@ void DoInstall(bool uninstall)
                         : Fmt(L"That did not work (code %d).", code);
         r = code == 0 ? InstallResult::Ok : InstallResult::Failed;
     }
+    if (uninstall && r == InstallResult::Ok && g_withVR) {   // gone from SteamVR: the app leaves its startup apps too
+        SetCheck(IDC_WITHVR, false);
+        OnWithVrToggle(false);
+        msg += L" Start with SteamVR is off now.";
+    }
     SetText(IDC_INSTALLMSG, msg);
     if (r != InstallResult::Ok && r != InstallResult::ForeignDll)
         MessageBoxW(g_wnd, msg.c_str(), L"vrupscale", MB_OK | MB_ICONWARNING);
     RefreshInstall(true);
     RefreshStatus();
+}
+
+// ---- starting and closing with SteamVR (vrlink.h) -------------------------------------------------
+
+struct AutoLaunchDone {
+    app::AutoLaunchJob job;
+    app::AutoLaunchResult r;
+};
+
+// The link thread: while SteamVR runs, the lasting connection (if wanted) and SteamVR's quit request;
+// once per SteamVR session, and after the switch moved, SteamVR's startup entry.
+DWORD WINAPI LinkThread(LPVOID)
+{
+    DWORD lastOpen = 0, lastSync = 0;
+    bool synced = false, quitSeen = false;
+    while (!g_linkStop) {
+        WaitForSingleObject(g_linkWake, 500);
+        if (g_linkStop) break;
+        if (!IsSteamVRRunning()) {
+            if (app::VrLinkIsOpen()) app::VrLinkClose();
+            synced = quitSeen = false;
+            continue;
+        }
+        if (quitSeen) continue;   // SteamVR is closing: nothing more until it has
+        const bool want = g_linkWant != 0;
+        if (want && !app::VrLinkIsOpen() && GetTickCount() - lastOpen > 3000) {
+            lastOpen = GetTickCount();
+            std::wstring err;
+            app::VrLinkOpen(err);   // (fails while SteamVR is starting: tried again)
+        }
+        if (app::VrLinkIsOpen() && app::VrLinkPollQuit()) {
+            quitSeen = true;   // the window puts the resolution back through the link, then closes it
+            if (!PostMessageW(g_wnd, WM_APP_VRQUIT, 0, 0)) app::VrLinkClose();
+            continue;
+        }
+        if (!want && app::VrLinkIsOpen()) app::VrLinkClose();
+        if (InterlockedExchange(&g_linkSync, 0)) synced = false;
+        if (!synced && !want && !g_linkApplied) synced = true;   // off, and SteamVR was told so (or switched it off itself)
+        if (!synced && GetTickCount() - lastSync > 3000) {
+            lastSync = GetTickCount();
+            AutoLaunchDone *d = new AutoLaunchDone();
+            d->job.want = want;
+            d->job.applied = g_linkApplied != 0;
+            d->r = app::SyncAutoLaunch(d->job);
+            if (d->r.notReady) {   // SteamVR is starting: again in a moment
+                delete d;
+                continue;
+            }
+            synced = true;
+            if (!PostMessageW(g_wnd, WM_APP_AUTOLAUNCH, 0, (LPARAM)d)) delete d;
+        }
+    }
+    app::VrLinkClose();
+    return 0;
+}
+
+void StartLink()
+{
+    const std::wstring applied = ReadAppString(L"withSteamVRApplied");
+    if (g_fromVR && !g_withVR && applied == L"0") {   // switched back on in SteamVR's own list since
+        g_withVR = true;
+        WriteAppString(L"withSteamVR", L"1");
+        SetCheck(IDC_WITHVR, true);
+        UpdateValueLabels();
+    }
+    g_linkWant = g_withVR ? 1 : 0;
+    g_linkApplied = applied == L"1" ? 1 : 0;
+    g_linkWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_linkThread = CreateThread(nullptr, 0, LinkThread, nullptr, 0, nullptr);
+}
+
+void StopLink()
+{
+    if (!g_linkThread) return;
+    g_linkStop = 1;
+    SetEvent(g_linkWake);
+    WaitForSingleObject(g_linkThread, 5000);
+    CloseHandle(g_linkThread);
+    g_linkThread = nullptr;
+}
+
+void OnAutoLaunch(AutoLaunchDone *d)
+{
+    const app::AutoLaunchResult &r = d->r;
+    const bool current = d->job.want == (g_linkWant != 0);   // (the switch didn't move meanwhile)
+    if (r.ok) {
+        g_linkApplied = r.want ? 1 : 0;
+        WriteAppString(L"withSteamVRApplied", r.want ? L"1" : L"0");
+    }
+    if (current) {
+        std::wstring msg;
+        if (r.ok && r.userOff) {   // switched off in SteamVR's own list since: the app follows
+            g_withVR = false;
+            g_linkWant = 0;
+            WriteAppString(L"withSteamVR", L"0");
+            SetCheck(IDC_WITHVR, false);
+            UpdateValueLabels();
+            msg = L"Start with SteamVR is off: it was switched off in SteamVR's startup overlay apps.";
+        } else if (r.ok && r.registered) {
+            msg = L"SteamVR starts this app from now on, and the app closes with SteamVR.";
+        } else if (!r.ok) {
+            msg = (d->job.want ? L"Couldn't add vrupscale to SteamVR's startup apps: " : L"Couldn't take vrupscale off SteamVR's startup apps: ") +
+                  r.error + L".";
+        }
+        if (!msg.empty()) SetText(IDC_INSTALLMSG, msg);
+    }
+    delete d;
+    Invalidate();
+}
+
+// Started by the app as it closes with SteamVR: SteamVR's copy (pending after an update) is replaced
+// once SteamVR is gone, from a process of its own (SteamVR may end what it started when it closes).
+void StartDllUpdateHelper()
+{
+    std::wstring cmd = L"\"" + SelfPath() + L"\" --finish-dll-update --settings \"" + g_settingsPath + L"\"";
+    if (IsSteamVRRoot(g_root)) cmd += L" --steamvr \"" + g_root + L"\"";
+    for (DWORD flags : { (DWORD)CREATE_BREAKAWAY_FROM_JOB, (DWORD)0 }) {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        std::wstring line = cmd;
+        if (CreateProcessW(nullptr, &line[0], nullptr, nullptr, FALSE, flags, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return;
+        }
+    }
+}
+
+// SteamVR is closing (it asked) or has closed: so does the app.
+void CloseWithSteamVR()
+{
+    if (g_closingWithVR) return;
+    g_closingWithVR = true;
+    if (ReadAppString(L"updateDll") == L"1" && !DllUpdateHelperRunning()) {
+        if (IsSteamVRRunning()) StartDllUpdateHelper();
+        else RefreshInstall(true);   // SteamVR is gone already: now
+    }
+    PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+}
+
+// SteamVR asked the app to quit (it is closing): its resolution goes back while SteamVR still answers.
+void OnSteamVrQuit()
+{
+    g_vrQuitting = true;
+    RestoreGameResOnExit();
+    g_resApplied = 0;
+    app::VrLinkClose();
+    if (g_withVR) CloseWithSteamVR();
+    else UpdateValueLabels();
+}
+
+// Twice a second: SteamVR gone (without asking, or not connected) closes the app too, once it ran
+// during this run.
+void WithVrTick()
+{
+    const DWORD now = GetTickCount();
+    if (now - g_vrCheck < 500) return;
+    g_vrCheck = now;
+    if (IsSteamVRRunning()) {
+        if (!g_vrQuitting) g_vrSeen = true;
+        g_vrGoneAt = 0;
+        return;
+    }
+    g_vrQuitting = false;
+    if (!g_vrGoneAt) g_vrGoneAt = now | 1;
+    if (g_withVR && g_vrSeen && now - g_vrGoneAt >= 1500) CloseWithSteamVR();
+}
+
+void OnWithVrToggle(bool on)
+{
+    g_withVR = on;
+    g_linkWant = on ? 1 : 0;
+    g_linkSync = 1;
+    SetEvent(g_linkWake);
+    WriteAppString(L"withSteamVR", on ? L"1" : L"0");
+    UpdateValueLabels();
+    if (!IsSteamVRRunning())
+        SetText(IDC_INSTALLMSG, on ? L"SteamVR starts this app once it has run while the app is open."
+                                   : L"Takes effect the next time SteamVR runs while this app is open.");
+    else
+        SetText(IDC_INSTALLMSG, on ? L"SteamVR starts this app from now on, and the app closes with SteamVR."
+                                   : L"SteamVR no longer starts this app, and it stays open when SteamVR closes.");
 }
 
 // ---- updates ------------------------------------------------------------------------------------
@@ -1230,6 +1473,8 @@ void CreateControls()
     AddWidget(IDC_GAZESHOW, Kind::Toggle, { Y.x + 20, Y.y + 92, Y.w - 40, 26 }, L"Show gaze", ui::BtnOutline, L"a green ring in VR");
     AddWidget(IDC_CALIBRATE, Kind::Button, { Y.x + 20, Y.y + 126, 112, 32 }, L"Calibrate", ui::BtnPrimary);
     AddWidget(IDC_CALCLEAR, Kind::Button, { Y.x + 142, Y.y + 126, 150, 32 }, L"Clear calibration");
+    AddWidget(IDC_WITHVR, Kind::Toggle, { V.x + 20, V.y + 204, V.w - 40, 26 }, L"Start with SteamVR", ui::BtnOutline,
+              L"and close with it");
     AddWidget(IDC_DEFAULTS, Kind::Button, { V.x + 20, V.y + 238, 150, 32 }, L"Restore defaults");
     AddWidget(IDC_OPENFOLDER, Kind::Button, { V.x + 180, V.y + 238, 120, 32 }, L"Settings file");
     AddWidget(IDC_BROWSE, Kind::Button, { V.r() - 140, V.y + 14, 120, 30 }, L"Choose folder…");
@@ -1568,10 +1813,19 @@ std::wstring TipText(int id, int part, std::wstring &title)
     case IDC_CALCLEAR:
         title = L"Clear calibration";
         return L"Removes the calibration offset: the tracker's own reading is used as it is.";
+    case IDC_WITHVR:
+        title = L"Start with SteamVR";
+        return L"SteamVR starts this app when it starts (minimized), and the app closes when SteamVR does, putting SteamVR's "
+               L"resolution back first. So VRChat's resolution is handled every time you play without opening the app.\n\n"
+               L"The app adds itself to SteamVR's startup overlay apps (SteamVR settings, Startup / Shutdown) the next time "
+               L"SteamVR runs while it is open. Switching it off there switches it off here too. Default on.";
     case IDC_DEFAULTS:
         title = L"Restore defaults";
         return L"Puts every setting back to its default. Your texture choices, the eye tracking calibration and SteamVR's "
                L"field of view are kept.";
+    case IDC_OPENFOLDER:
+        title = L"Settings file";
+        return L"Opens the folder with vrupscale.ini. Settings are saved there as you change them, and apply live.";
     case IDC_INSTALL:
         title = L"Install / Update";
         return L"Puts vrupscale (its dxgi.dll) into SteamVR's bin\\win64 folder, or updates it there. SteamVR must be "
@@ -1718,9 +1972,10 @@ void DrawPage(ui::Canvas &c)
     const RectF V = kCardVR;
     c.PathText(ui::F_SMALL, TextOf(IDC_STEAMPATH), V.x + 20, V.y + 60, V.w - 40, col::inkSoft);
     c.Wrap(ui::F_LABEL, TextOf(IDC_INSTALLSTATE), { V.x + 20, V.y + 68, V.w - 40, 40 }, 19, col::ink, 2);
-    c.Wrap(ui::F_SMALL, TextOf(IDC_INSTALLMSG), { V.x + 20, V.y + 154, V.w - 40, 32 }, 16, col::inkSoft, 2);
+    const std::wstring saveError = TextOf(IDC_SAVED);   // (settings that couldn't be saved come first)
+    c.Wrap(ui::F_SMALL, saveError.empty() ? TextOf(IDC_INSTALLMSG) : saveError, { V.x + 20, V.y + 154, V.w - 40, 32 }, 16,
+           saveError.empty() ? col::inkSoft : col::red, 2);
     c.Fill({ V.x + 20, V.y + 194, V.w - 40, 1.5f }, col::inkFaint);
-    c.Wrap(ui::F_SMALL, TextOf(IDC_SAVED), { V.x + 20, V.y + 202, V.w - 40, 34 }, 17, col::inkSoft, 2);
 
     // Textures
     const RectF X = kCardTex;
@@ -1927,6 +2182,7 @@ void OnToggle(int id)
     case IDC_BILEDGES: g_s.bilinearEdges = w->on; ModelToUi(); Changed(true); break;
     case IDC_GAZEFOLLOW: g_s.gazeFollow = w->on; ModelToUi(); Changed(true); break;   // (the area shows its value for this state)
     case IDC_GAZESHOW: g_s.gazeShow = w->on; Changed(true); break;
+    case IDC_WITHVR: OnWithVrToggle(w->on); break;
     }
 }
 
@@ -2048,6 +2304,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         g_wnd = h;
         g_updStart = GetTickCount();
         g_gameRes = ReadAppString(L"manageResolution") != L"0";
+        g_withVR = ReadAppString(L"withSteamVR") != L"0";
         CreateControls();
         SetText(IDC_TEXHINT, L"Untick a size to leave it alone, say an overlay that got tinted. Eye textures stay upscaled together.");
         ModelToUi();
@@ -2058,6 +2315,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetTimer(h, TIMER_REFRESH, 250, nullptr);
         SetTimer(h, TIMER_PUSH, 100, nullptr);
         RefreshUpdateUi();
+        StartLink();
         return 0;
     }
     case WM_TIMER:
@@ -2065,6 +2323,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             RefreshStatus();
             RefreshInstall(false);
             UpdateTick();
+            WithVrTick();
         } else if (wp == TIMER_PUSH) {
             if (g_pushPending) Push();
         } else if (wp == TIMER_SAVE) {
@@ -2253,6 +2512,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_UPDDONE:
         OnUpdateDone((app::StagedUpdate *)lp);
         return 0;
+    case WM_APP_VRQUIT:
+        OnSteamVrQuit();
+        return 0;
+    case WM_APP_AUTOLAUNCH:
+        OnAutoLaunch((AutoLaunchDone *)lp);
+        return 0;
     case WM_DPICHANGED: {
         g_dpi = HIWORD(wp);
         ui::MakeFonts(g_dpi);
@@ -2272,6 +2537,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             for (int i = 0; i < 100 && g_resWorkers > 0; ++i) Sleep(50);
         else
             RestoreGameResOnExit();
+        StopLink();   // (after the restore, which may use its connection)
         KillTimer(h, TIMER_SAVE);
         KillTimer(h, TIMER_REPLAN);
         if (g_replanPending) {
@@ -2384,6 +2650,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     bool doInstall = false, doUninstall = false, force = false, headless = false;
     std::wstring statusFile, steamvr, gameRes, report;
     bool gameResTest = false, updateTest = false, checkUpdate = false, changeLogTest = false, showChangeLog = false;
+    bool launchArg = false, finishDll = false, linkTest = false;
     std::vector<std::wstring> sets;
     int waitMs = 3000;
     for (int i = 1; i < argc; ++i) {
@@ -2407,6 +2674,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         else if (a == L"--test-changelog") changeLogTest = headless = true;   // self-test of the change log's reading and layout
         else if (a == L"--changelog") showChangeLog = true;   // open the change log at start
         else if (a == L"--check-update") checkUpdate = headless = true; // ask GitHub (or VRUPSCALE_UPDATE_URL) and report
+        else if (a == app::kLaunchArg) launchArg = true;               // started by SteamVR (its manifest's argument)
+        else if (a == L"--finish-dll-update") finishDll = headless = true;   // update SteamVR's copy once SteamVR is gone
+        else if (a == L"--test-steamvr-link") linkTest = headless = true;   // self-test of the startup manifest
     }
     LocalFree(argv);
 
@@ -2414,6 +2684,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         int code = 0;
         std::wstring out;
         if (gameResTest) code = app::GameResSelfTest(out) ? 5 : 0;
+        if (linkTest) code = app::VrLinkSelfTest(out) ? 11 : code;
         if (updateTest) code = app::UpdateSelfTest(out) ? 7 : code;
         if (changeLogTest) {
             ui::Startup(inst);
@@ -2479,6 +2750,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
             }
         }
         if (!statusFile.empty()) code = WriteStatusFile(statusFile, waitMs) || code;
+        if (finishDll) {   // started by CloseWithSteamVR: waits up to two minutes for SteamVR to be gone
+            HANDLE busy = CreateMutexW(nullptr, FALSE, kDllHelperMutex);
+            for (int i = 0; i < 240 && IsSteamVRRunning(); ++i) Sleep(500);
+            std::wstring msg;
+            const DllUpd u = FinishDllUpdate(IsSteamVRRoot(steamvr) ? steamvr : FindSteamVR(), msg);
+            code = u == DllUpd::Failed ? 12 : u == DllUpd::Waiting ? 13 : code;
+            if (busy) CloseHandle(busy);
+        }
         return code;
     }
 
@@ -2488,6 +2767,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         const DWORD w = WaitForSingleObject(single, 30000);
         another = !(w == WAIT_OBJECT_0 || w == WAIT_ABANDONED);
     }
+    g_fromVR = app::StartedBySteamVR(launchArg);
+    if (another && g_fromVR) return 0;   // SteamVR starting it while it is open already: nothing to show
     if (another) {
         HWND other = FindWindowW(L"vrupscale.app", nullptr);
         if (other) {
@@ -2547,7 +2828,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
             set(w, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof(text));
         }
     }
-    ShowWindow(w, show);
+    ShowWindow(w, g_fromVR ? SW_SHOWMINNOACTIVE : show);   // started by SteamVR: out of the way
     UpdateWindow(w);
     if (showChangeLog) OpenChangeLog();
     MSG m;

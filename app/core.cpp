@@ -449,6 +449,9 @@ std::wstring FindSteamVR()
 
 bool IsSteamVRRunning()
 {
+    wchar_t flag[MAX_PATH];   // self-test: a file that stands for SteamVR's processes
+    DWORD fn = GetEnvironmentVariableW(L"VRUPSCALE_TEST_STEAMVR_FLAG", flag, MAX_PATH);
+    if (fn > 0 && fn < MAX_PATH) return GetFileAttributesW(flag) != INVALID_FILE_ATTRIBUTES;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
     PROCESSENTRY32W pe = { sizeof(pe) };

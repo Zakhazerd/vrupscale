@@ -2,6 +2,11 @@
 
 What changed in each version of vrupscale, newest first.
 
+## 0.6.4
+
+- The app starts with SteamVR, minimized, and closes when SteamVR does. It adds itself to SteamVR's startup apps the first time SteamVR runs while it is open. **Start with SteamVR** switches this off.
+- SteamVR's resolution is no longer lowered while vrupscale isn't installed in SteamVR.
+
 ## 0.6.3
 
 - The app always sets SteamVR's resolution while VRChat runs; the option is gone. The resolution you set in SteamVR, VRChat's own included, is what you see, and VRChat renders the preset's share of it.

@@ -35,10 +35,10 @@ VER=$(sed -n 's/^#define VU_VERSION_STR "\(.*\)"/\1/p' src/common.h)
 RCVER=$(echo "$VER" | tr '.' ',' | sed 's/$/,0/')
 mkdir -p $OUT/app
 $WINDRES -DVU_RC_VERSION="$RCVER" -DVU_RC_VERSION_STR="\\\"$VER\\\"" -I app app/app.rc -O coff -o $OUT/app/app_res.o
-for f in core ui main gameres update changelog; do
+for f in core ui main gameres update changelog vrlink; do
   $CXX -O2 -Wall -std=c++17 -municode -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -DVU_APP_VERSION="\"$VER\"" \
     -c app/$f.cpp -o $OUT/app/$f.o
 done
-$CXX -municode -mwindows -o $OUT/vrupscale.exe $OUT/app/core.o $OUT/app/ui.o $OUT/app/main.o $OUT/app/gameres.o $OUT/app/update.o $OUT/app/changelog.o $OUT/app/app_res.o \
+$CXX -municode -mwindows -o $OUT/vrupscale.exe $OUT/app/core.o $OUT/app/ui.o $OUT/app/main.o $OUT/app/gameres.o $OUT/app/update.o $OUT/app/changelog.o $OUT/app/vrlink.o $OUT/app/app_res.o \
   -static -static-libgcc -static-libstdc++ -lgdiplus -lcomctl32 -lversion -lshell32 -lole32 -luuid -ladvapi32 -lwinhttp -lbcrypt -s -Wl,--no-insert-timestamp
 echo "built $OUT/vrupscale.exe ($VER)"

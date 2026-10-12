@@ -2,6 +2,7 @@
 #include "gameres.h"
 #include "core.h"
 #include "json.h"
+#include "vrlink.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -198,12 +199,7 @@ bool SetViaFile(const std::wstring &file, const char *appKey, const GameResJob &
     return true;
 }
 
-// ---- OpenVR (openvr_api.dll's C interface: VR_InitInternal2 + the IVRSettings function table) ----
-
-typedef uint32_t(__cdecl *PFN_InitInternal2)(int *err, int appType, const char *startupInfo);
-typedef void(__cdecl *PFN_ShutdownInternal)();
-typedef void *(__cdecl *PFN_GetGenericInterface)(const char *version, int *err);
-typedef const char *(__cdecl *PFN_InitErrorText)(int err);
+// ---- OpenVR (through vrlink.h's sessions: the IVRSettings function table) ----
 
 struct SettingsFnTable {   // VR_IVRSettings_FnTable, IVRSettings_003 (openvr_capi.h)
     const char *(__stdcall *GetSettingsErrorNameFromEnum)(int err);
@@ -219,49 +215,17 @@ struct SettingsFnTable {   // VR_IVRSettings_FnTable, IVRSettings_003 (openvr_ca
     void(__stdcall *RemoveKeyInSection)(const char *section, const char *key, int *err);
 };
 
-enum { kAppBackground = 3, kInitNoServerForBackgroundApp = 121, kSettingsIpcFailed = 1 };
+enum { kSettingsIpcFailed = 1 };
 
-// OpenVR is initialised and shut down around each use; two threads (the resolution setter and the
-// projection lookup) must not overlap, or one's shutdown pulls the interfaces from under the other.
-SRWLOCK g_ovrLock = SRWLOCK_INIT;
-struct OvrGuard {
-    OvrGuard() { AcquireSRWLockExclusive(&g_ovrLock); }
-    ~OvrGuard() { ReleaseSRWLockExclusive(&g_ovrLock); }
-};
-
-HMODULE OpenVrDll()
-{
-    static HMODULE dll = nullptr;   // loaded once, kept (OpenVR may leave threads behind)
-    if (!dll) {
-        std::wstring path = EnvW(L"VRUPSCALE_TEST_OPENVR");   // self-test: a stand-in
-        if (path.empty()) path = ExeDir() + L"\\openvr_api.dll";
-        dll = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    }
-    return dll;
-}
+const wchar_t *kNoSettings = L"this SteamVR doesn't offer its settings to other programs";
 
 bool SetViaApi(const char *appKey, const GameResJob &job, GameResResult &r)
 {
-    OvrGuard guard;
-    HMODULE dll = OpenVrDll();
-    PFN_InitInternal2 init = dll ? (PFN_InitInternal2)GetProcAddress(dll, "VR_InitInternal2") : nullptr;
-    PFN_ShutdownInternal shutdown = dll ? (PFN_ShutdownInternal)GetProcAddress(dll, "VR_ShutdownInternal") : nullptr;
-    PFN_GetGenericInterface get = dll ? (PFN_GetGenericInterface)GetProcAddress(dll, "VR_GetGenericInterface") : nullptr;
-    if (!init || !shutdown || !get) {
-        r.error = L"openvr_api.dll is missing next to vrupscale.exe";
-        return false;
-    }
-    int err = 0;
-    init(&err, kAppBackground, nullptr);   // never starts SteamVR
-    if (err != 0) {
-        r.error = err == kInitNoServerForBackgroundApp ? L"SteamVR is starting or closing, try again in a moment"
-                                                         : Fmt(L"SteamVR didn't answer (error %d)", err);
-        return false;
-    }
-    SettingsFnTable *s = (SettingsFnTable *)get("FnTable:IVRSettings_003", &err);
-    if (!s || err != 0) {
-        shutdown();
-        r.error = L"this SteamVR doesn't offer its settings to other programs";
+    VrSession vr;   // never starts SteamVR
+    if (!vr.Open(r.error)) return false;
+    SettingsFnTable *s = (SettingsFnTable *)vr.Interface("FnTable:IVRSettings_003");
+    if (!s) {
+        r.error = kNoSettings;
         return false;
     }
     if (job.readBefore) {
@@ -277,7 +241,6 @@ bool SetViaApi(const char *appKey, const GameResJob &job, GameResResult &r)
         const char *name = s->GetSettingsErrorNameFromEnum ? s->GetSettingsErrorNameFromEnum(e) : nullptr;
         r.error = Fmt(L"SteamVR refused the change (%s)", name ? Widen(name).c_str() : Fmt(L"error %d", e).c_str());
     }
-    shutdown();
     return ok;
 }
 
@@ -285,32 +248,18 @@ bool SetViaApi(const char *appKey, const GameResJob &job, GameResResult &r)
 
 bool GetEyeProjection(float out[8], std::wstring &error)
 {
-    OvrGuard guard;
-    HMODULE dll = OpenVrDll();
-    PFN_InitInternal2 init = dll ? (PFN_InitInternal2)GetProcAddress(dll, "VR_InitInternal2") : nullptr;
-    PFN_ShutdownInternal shutdown = dll ? (PFN_ShutdownInternal)GetProcAddress(dll, "VR_ShutdownInternal") : nullptr;
-    PFN_GetGenericInterface get = dll ? (PFN_GetGenericInterface)GetProcAddress(dll, "VR_GetGenericInterface") : nullptr;
-    if (!init || !shutdown || !get) {
-        error = L"openvr_api.dll is missing next to vrupscale.exe";
-        return false;
-    }
-    int err = 0;
-    init(&err, kAppBackground, nullptr);
-    if (err != 0) {
-        error = Fmt(L"SteamVR didn't answer (error %d)", err);
-        return false;
-    }
+    VrSession vr;
+    if (!vr.Open(error)) return false;
     // VR_IVRSystem_FnTable (openvr_capi.h): GetRecommendedRenderTargetSize, GetProjectionMatrix,
     // GetProjectionRaw, ... (the first entries have kept their place in every version)
     typedef void(__stdcall * PFN_ProjectionRaw)(int eye, float *l, float *r, float *t, float *b);
     void **sys = nullptr;
     for (const char *v : { "FnTable:IVRSystem_026", "FnTable:IVRSystem_023", "FnTable:IVRSystem_022", "FnTable:IVRSystem_021",
                            "FnTable:IVRSystem_020", "FnTable:IVRSystem_019" }) {
-        err = 0;
-        sys = (void **)get(v, &err);
-        if (sys && err == 0) break;
+        sys = (void **)vr.Interface(v);
+        if (sys) break;
     }
-    bool ok = sys && err == 0;
+    bool ok = sys != nullptr;
     if (ok) {
         PFN_ProjectionRaw raw = (PFN_ProjectionRaw)sys[2];
         for (int eye = 0; eye < 2; ++eye) raw(eye, &out[eye * 4], &out[eye * 4 + 1], &out[eye * 4 + 2], &out[eye * 4 + 3]);
@@ -320,7 +269,6 @@ bool GetEyeProjection(float out[8], std::wstring &error)
     } else {
         error = L"this SteamVR doesn't offer IVRSystem to other programs";
     }
-    shutdown();
     return ok;
 }
 
@@ -399,26 +347,11 @@ GlobalResResult SetGlobalResolution(const char *appKey, const GlobalResJob &job)
         r.ok = WriteSettingsText(file, text, exists, r.error);
         return r;
     }
-    OvrGuard guard;
-    HMODULE dll = OpenVrDll();
-    PFN_InitInternal2 init = dll ? (PFN_InitInternal2)GetProcAddress(dll, "VR_InitInternal2") : nullptr;
-    PFN_ShutdownInternal shutdown = dll ? (PFN_ShutdownInternal)GetProcAddress(dll, "VR_ShutdownInternal") : nullptr;
-    PFN_GetGenericInterface get = dll ? (PFN_GetGenericInterface)GetProcAddress(dll, "VR_GetGenericInterface") : nullptr;
-    if (!init || !shutdown || !get) {
-        r.error = L"openvr_api.dll is missing next to vrupscale.exe";
-        return r;
-    }
-    int err = 0;
-    init(&err, kAppBackground, nullptr);
-    if (err != 0) {
-        r.error = err == kInitNoServerForBackgroundApp ? L"SteamVR is starting or closing, try again in a moment"
-                                                         : Fmt(L"SteamVR didn't answer (error %d)", err);
-        return r;
-    }
-    SettingsFnTable *s = (SettingsFnTable *)get("FnTable:IVRSettings_003", &err);
-    if (!s || err != 0) {
-        shutdown();
-        r.error = L"this SteamVR doesn't offer its settings to other programs";
+    VrSession vr;
+    if (!vr.Open(r.error)) return r;
+    SettingsFnTable *s = (SettingsFnTable *)vr.Interface("FnTable:IVRSettings_003");
+    if (!s) {
+        r.error = kNoSettings;
         return r;
     }
     int e = 0;
@@ -453,7 +386,6 @@ GlobalResResult SetGlobalResolution(const char *appKey, const GlobalResJob &job)
         const char *name = s->GetSettingsErrorNameFromEnum ? s->GetSettingsErrorNameFromEnum(e) : nullptr;
         r.error = Fmt(L"SteamVR refused the change (%s)", name ? Widen(name).c_str() : Fmt(L"error %d", e).c_str());
     }
-    shutdown();
     return r;
 }
 

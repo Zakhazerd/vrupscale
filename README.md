@@ -10,12 +10,12 @@ The default mode is temporal: it builds up detail across frames, using motion it
 
 1. Download `vrupscale-<version>.zip` from the [releases page](https://github.com/Zakhazerd/vrupscale/releases/latest), extract it somewhere permanent that you can write to (for example `Documents\vrupscale`, not Program Files) and run **`vrupscale.exe`**. It isn't code-signed, so Windows SmartScreen may warn the first time: **More info → Run anyway**. After that, updates come through the app.
 2. Close SteamVR completely and click **Install** in the app. It finds SteamVR on its own; if it can't, use **Choose folder…**. If Windows asks for administrator rights, your SteamVR folder needs them.
-3. Start SteamVR. The headline changes to **Connected to SteamVR.**
-4. Set the resolution you want to see in SteamVR as usual, pick a scaling preset in the app (Ultra Quality by default) and leave the app open. While VRChat runs, the app lowers SteamVR's resolution so that VRChat renders the preset's share of it, and vrupscale upscales it back.
+3. Start SteamVR with the app open. The headline changes to **Connected to SteamVR.** The app also adds itself to SteamVR's startup apps: from now on SteamVR starts it (minimized), and it closes when SteamVR does.
+4. Set the resolution you want to see in SteamVR as usual and pick a scaling preset in the app (Ultra Quality by default). While VRChat runs, the app lowers SteamVR's resolution so that VRChat renders the preset's share of it, and vrupscale upscales it back.
 5. Start VRChat. The line under the headline shows what is being upscaled, for example `Upscaling 2756×2756 → 3555×3555, temporal`, and the GPU time it takes, for example `GPU 1.10 ms per displayed frame (9.9%)`.
 6. To check what is being upscaled, switch on **Debug tint** for a moment: the area turns magenta and the rest blue. Only the world should be tinted, not SteamVR's menus or overlays.
 
-vrupscale itself runs inside SteamVR, so it upscales even with the app closed, but then VRChat renders at the full resolution you set: keep the app open while you play.
+vrupscale itself runs inside SteamVR, so it upscales even with the app closed, but then VRChat renders at the full resolution you set: the app has to run while you play, which is why it starts with SteamVR. To start it yourself instead, switch off **Start with SteamVR** in the SteamVR panel.
 
 ## The app
 
@@ -45,7 +45,7 @@ Under the headline, the window has six panels, each described below: Upscaling, 
   **Native** doesn't upscale. In Temporal mode it is anti-aliasing from your head's micro-motion, like DLAA (on the test scene about 3.5 dB better than FSR 1 at 1×, and steadier); FSR 1 at 1× only sharpens.
 
   **The resolution you set in SteamVR is the one you see.** SteamVR gives VRChat its global resolution × VRChat's own per-application resolution. While VRChat runs, the app lowers the global resolution to the table's pixel percentage (59% at Ultra Quality), so VRChat renders that share of what you set and vrupscale upscales it back. For example, with the global resolution at 100%, VRChat's own at 150% and Ultra Quality, the app sets the global to 59%: VRChat renders 89% (59% of 150%) and you see 150%.
-  - Preset changes (in the app, or Ctrl+F5 in VR) apply at once. At Native the resolution is left alone. Your global resolution is put back when VRChat or the app closes, or, if the app closed unexpectedly, the next time it starts.
+  - Preset changes (in the app, or Ctrl+F5 in VR) apply at once. At Native, or while vrupscale isn't installed in SteamVR, the resolution is left alone. Your global resolution is put back when VRChat or the app closes, or, if the app closed unexpectedly, the next time it starts.
   - To change what you see while VRChat runs, change VRChat's per-application resolution; SteamVR applies it when VRChat starts, or straight away while SteamVR's settings window is open. Leave the global resolution alone meanwhile: SteamVR shows the lowered value then. "Auto" counts as 100% and is set back to Auto afterwards.
   - Each time the app changes the resolution, it tells the upscaler, which then finds VRChat's new render size in a fraction of a second instead of about five.
   - To manage the resolution yourself, set `[app] manageResolution=0` in the settings file and set VRChat to the table's percentage.
@@ -73,7 +73,8 @@ Under the headline, the window has six panels, each described below: Upscaling, 
 
 **SteamVR** – installing, and the settings:
 - Where SteamVR is, and which version of the upscaler is installed in it.
-- **Install / Update** puts the upscaler into SteamVR and **Uninstall** removes it; both need SteamVR closed. If another tool's `dxgi.dll` was there, Install sets it aside (after asking) and Uninstall puts it back.
+- **Install / Update** puts the upscaler into SteamVR and **Uninstall** removes it; both need SteamVR closed. If another tool's `dxgi.dll` was there, Install sets it aside (after asking) and Uninstall puts it back. Uninstall also switches off Start with SteamVR.
+- **Start with SteamVR** (default on) – SteamVR starts the app when it starts, minimized, and the app closes when SteamVR does, putting SteamVR's resolution back first. The app adds itself to SteamVR's startup overlay apps (SteamVR settings, **Startup / Shutdown**) the first time SteamVR runs while it is open; switching vrupscale off in that list switches this off too. If the app was moved to another folder, it moves its entry there the next time SteamVR runs with it open.
 - Settings are saved automatically to `%LOCALAPPDATA%\vrupscale\vrupscale.ini` and apply at once. **Restore defaults** resets them all except your texture choices, the eye tracking calibration and SteamVR's field of view; **Settings file** shows the file in Explorer.
 
 **Textures** – every large texture the compositor sampled in the last minute, what vrupscale did with it, and why. Point at a row for details.
@@ -183,6 +184,8 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 
 **An overlay or menu gets upscaled (tinted magenta):** untick its size in the texture list.
 
+**The app doesn't start with SteamVR:** open it once while SteamVR runs, with **Start with SteamVR** on; the SteamVR panel says if SteamVR refused. In SteamVR's settings, **Startup / Shutdown → Choose startup overlay apps** should list vrupscale, switched on.
+
 **The update failed:** the app says why, and nothing was changed (a half-finished update is rolled back). Try again later, or download the zip from the [releases page](https://github.com/Zakhazerd/vrupscale/releases/latest) and extract it over the old folder. If the app is in a folder Windows protects (such as Program Files), it can't replace its own files: move it to a folder of your own.
 
 **Ghosting or smearing:** on moving avatars, lower **Moving objects** (0 turns history off on them). Elsewhere, lower **History strength** (say 0.50) or **Motion tolerance** (say 0.90). Note when it happens (turning, walking, avatars moving) and send the log.
@@ -202,6 +205,7 @@ The performance section measures the GPU cost at two sizes (Index-like, 1561×17
 - `[upscale] upscaleFactor` – the **Scaling** preset's factor. Any value from 1.00 to 3.00 works; one that isn't a preset shows as Custom in the app, and one within 0.02 of a preset is moved onto it when the app starts.
 - `[eyes]` – `followGaze`, `showGaze` (the app's switches); `offsetX` / `offsetY` (the calibration: tangents of the angle taken off the tracker's reading, x right, y up); `projection` (each eye's field of view as SteamVR reports it: tangents left, right, top, bottom, left eye then right; written by the app); `deadzone` (default 0.02: how far the gaze must move from the area's centre, as a fraction of the width, before the area follows).
 - `[app] checkUpdates=0` stops the app from asking GitHub for updates. `updateDll=1` is set by an update while the upscaler inside SteamVR still waits to be updated.
+- `[app] withSteamVR=0` – **Start with SteamVR** off. `withSteamVRApplied` is what SteamVR was last told (1 on, 0 off), so that the app can tell when you switched it off in SteamVR's own list. The app's entry there comes from `vrupscale.vrmanifest`, which the app writes next to itself (or, if that folder can't be written, next to the settings file).
 - `[app] manageResolution=0` – the app leaves SteamVR's resolution alone (see Scaling). `globalResBefore` holds your global resolution while the app has it lowered (the scale, and 1 for Custom or 0 for Auto); it is put back from there.
 - `[temporal]` – `temporalArea` and `gazeArea` are the **Temporal area** as fractions (0.3–1.0): centred (default 0.6) and while following the gaze (default 0.4), in both Temporal and FSR 1 mode. `sharpHistory` and `bilinearEdges` are those switches; `maxWeight`, `localTrust` and `residualTol` are **History strength**, **Moving objects** and **Motion tolerance** (by hand, `maxWeight` goes up to 64).
 - `[temporal] maxStreams` (default 4) – the most histories at once. Each takes about 38 MB for Index-sized eye textures at the default area (82 MB with the area at all).
@@ -236,9 +240,9 @@ Tests: `test/fake_compositor.cpp` (with `test/temporal_tests.inc`) is the functi
 - `VRUPSCALE_TEST_PROBE=1` exercises the probe-device fallback.
 - `VRUPSCALE_TEST_QUALITY_ONLY=1` / `VRUPSCALE_TEST_PERF_ONLY=1` run one section (`VRUPSCALE_PERF_FRAMES=N` timed frames per mode); `VRUPSCALE_TEST_ONLY=switch`, `=gaze` or `=corner` runs one test.
 - `VRUPSCALE_TEST_SERVE=<seconds>` keeps drawing like a running compositor, for trying the app against it (set `VRUPSCALE_CONTROL=Local\vrupscale.control.v1` so the app finds it).
-- `test/stub/openvr_stub.c` stands in for `openvr_api.dll` and records what the app asks SteamVR; `test/stub/fakegaze.c` stands in for Bigscreen's eye tracking client.
+- `test/stub/openvr_stub.c` stands in for `openvr_api.dll` and records what the app asks SteamVR (settings, its startup entry, and a quit request on demand); `test/stub/fakegaze.c` stands in for Bigscreen's eye tracking client.
 
-The app also has command-line modes for scripting: `--install [--force]`, `--uninstall`, `--steamvr <folder>`, `--set key=value`, `--status-file <file>`, `--settings <ini>`, `--channel <name>` and `--changelog` (opens the change log at start); and self-tests, each with `--report <file>`: `--test-update` (the updater's zip reader, hash and version comparison), `--test-changelog` (reading CHANGELOG.md and laying it out), `--check-update` (asks GitHub, or `VRUPSCALE_UPDATE_URL`, and reports) and `--test-game-resolution`.
+The app also has command-line modes for scripting: `--install [--force]`, `--uninstall`, `--steamvr <folder>`, `--set key=value`, `--status-file <file>`, `--settings <ini>`, `--channel <name>`, `--changelog` (opens the change log at start) and `--from-steamvr` (what SteamVR passes: starts minimized, and quietly does nothing if the app is open already); and self-tests, each with `--report <file>`: `--test-update` (the updater's zip reader, hash and version comparison), `--test-changelog` (reading CHANGELOG.md and laying it out), `--check-update` (asks GitHub, or `VRUPSCALE_UPDATE_URL`, and reports), `--test-game-resolution` and `--test-steamvr-link` (the startup manifest).
 
 Releases: set `VU_VERSION_STR` in `src/common.h`, add a `## <version>` section to `CHANGELOG.md` (it becomes the release's notes, which the app's Update button shows), and push to `main`. When `main` has a version without a release, GitHub Actions (`.github/workflows/release.yml`) builds everything with MinGW-w64 on Ubuntu and publishes release `v<version>` at that commit with `vrupscale-<version>.zip`, the name the app's updater looks for. The updater checks the download against the SHA-256 that GitHub publishes for it. Pushing a tag `v<version>` works too.
 
@@ -249,8 +253,8 @@ Layout:
 - `src/temporal.cpp`: per-eye histories and the temporal pass sequence
 - `src/control.cpp`, `src/control_shared.h`: the live channel to the app
 - `shaders/upscale.hlsl`: FSR 1 and bilinear; `shaders/temporal.hlsl`: the temporal passes; `src/permutations.h`: every compiled variant
-- `app/`: the Windows app (`ui.cpp` draws it, shapes with GDI+ and text with GDI; `update.cpp` updates it from GitHub; `gameres.cpp` sets SteamVR's resolution for VRChat; `changelog.cpp` shows the change log)
+- `app/`: the Windows app (`ui.cpp` draws it, shapes with GDI+ and text with GDI; `update.cpp` updates it from GitHub; `gameres.cpp` sets SteamVR's resolution for VRChat; `vrlink.cpp` holds the connection to SteamVR and the app's startup entry; `changelog.cpp` shows the change log)
 
 ## Licenses
 
-vrupscale: MIT. Bundled: MinHook (BSD-2-Clause, Tsuda Kageyu), AMD FidelityFX Super Resolution 1 (MIT, Advanced Micro Devices; the temporal path uses FSR 1's RCAS), the Rubik typeface in the app (SIL Open Font License 1.1, The Rubik Project Authors; subset, hinted, with an added arrow), and Valve's `openvr_api.dll` (OpenVR SDK, BSD-3-Clause), which the app uses to change SteamVR's settings. See `LICENSES/`. The app's look is inspired by Valve's Steam hardware pages; its illustrations are original, and vrupscale is not affiliated with Valve.
+vrupscale: MIT. Bundled: MinHook (BSD-2-Clause, Tsuda Kageyu), AMD FidelityFX Super Resolution 1 (MIT, Advanced Micro Devices; the temporal path uses FSR 1's RCAS), the Rubik typeface in the app (SIL Open Font License 1.1, The Rubik Project Authors; subset, hinted, with an added arrow), and Valve's `openvr_api.dll` (OpenVR SDK, BSD-3-Clause), which the app uses to change SteamVR's settings and to start and close with it. See `LICENSES/`. The app's look is inspired by Valve's Steam hardware pages; its illustrations are original, and vrupscale is not affiliated with Valve.
