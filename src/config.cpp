@@ -10,16 +10,25 @@ namespace vu {
 Config g_cfg;
 volatile LONG g_cfgGen = 1;
 std::wstring g_dllDir;
-std::wstring g_iniPath;
+std::wstring g_iniPath;          // switched (ConfigFileChanged) under g_iniLock once other threads run
 std::wstring g_iniPreferred;
 std::wstring g_logPath;
 
-static FILETIME g_iniTime = {};
+static SRWLOCK g_iniLock = SRWLOCK_INIT;
+static volatile LONG64 g_iniTime = 0;   // last-write time of the file as last read (FILETIME as 64 bits)
 
-static std::wstring ReadStr(const wchar_t *sec, const wchar_t *key, const wchar_t *def)
+std::wstring IniPath()
+{
+    AcquireSRWLockShared(&g_iniLock);
+    std::wstring p = g_iniPath;
+    ReleaseSRWLockShared(&g_iniLock);
+    return p;
+}
+
+static std::wstring ReadStr(const wchar_t *ini, const wchar_t *sec, const wchar_t *key, const wchar_t *def)
 {
     wchar_t buf[1024];
-    GetPrivateProfileStringW(sec, key, def, buf, 1024, g_iniPath.c_str());
+    GetPrivateProfileStringW(sec, key, def, buf, 1024, ini);
     // strip trailing comments ("; ...") and whitespace
     std::wstring s(buf);
     size_t sc = s.find_first_of(L";#");
@@ -30,32 +39,32 @@ static std::wstring ReadStr(const wchar_t *sec, const wchar_t *key, const wchar_
     return s.substr(b);
 }
 
-static bool ReadBool(const wchar_t *sec, const wchar_t *key, bool def)
+static bool ReadBool(const wchar_t *ini, const wchar_t *sec, const wchar_t *key, bool def)
 {
-    std::wstring s = ReadStr(sec, key, def ? L"1" : L"0");
+    std::wstring s = ReadStr(ini, sec, key, def ? L"1" : L"0");
     if (s.empty()) return def;
     wchar_t c = towlower(s[0]);
     return c == L'1' || c == L't' || c == L'y' || (c == L'o' && s.size() > 1 && towlower(s[1]) == L'n');
 }
 
-static int ReadInt(const wchar_t *sec, const wchar_t *key, int def)
+static int ReadInt(const wchar_t *ini, const wchar_t *sec, const wchar_t *key, int def)
 {
-    std::wstring s = ReadStr(sec, key, L"");
+    std::wstring s = ReadStr(ini, sec, key, L"");
     if (s.empty()) return def;
     return (int)wcstol(s.c_str(), nullptr, 10);
 }
 
-static float ReadFloat(const wchar_t *sec, const wchar_t *key, float def)
+static float ReadFloat(const wchar_t *ini, const wchar_t *sec, const wchar_t *key, float def)
 {
-    std::wstring s = ReadStr(sec, key, L"");
+    std::wstring s = ReadStr(ini, sec, key, L"");
     if (s.empty()) return def;
     return (float)wcstod(s.c_str(), nullptr);
 }
 
-static std::vector<Size2> ReadSizes(const wchar_t *sec, const wchar_t *key)
+static std::vector<Size2> ReadSizes(const wchar_t *ini, const wchar_t *sec, const wchar_t *key)
 {
     std::vector<Size2> out;
-    std::wstring s = ReadStr(sec, key, L"");
+    std::wstring s = ReadStr(ini, sec, key, L"");
     size_t i = 0;
     while (i < s.size()) {
         size_t j = s.find(L',', i);
@@ -70,89 +79,92 @@ static std::vector<Size2> ReadSizes(const wchar_t *sec, const wchar_t *key)
     return out;
 }
 
-static bool GetIniTime(FILETIME &t)
+static bool GetIniTime(const wchar_t *ini, LONG64 &t)
 {
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(g_iniPath.c_str(), GetFileExInfoStandard, &fad)) return false;
-    t = fad.ftLastWriteTime;
+    if (!GetFileAttributesExW(ini, GetFileExInfoStandard, &fad)) return false;
+    t = (LONG64)(((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime);
     return true;
 }
 
-bool LoadConfig(Config &c)
+bool LoadConfig(Config &c, std::wstring *pathOut)
 {
     Config d; // defaults
-    FILETIME t;
-    bool exists = GetIniTime(t);
-    if (exists) g_iniTime = t;
+    const std::wstring path = IniPath();
+    const wchar_t *ini = path.c_str();
+    if (pathOut) *pathOut = path;
+    LONG64 t = 0;
+    bool exists = GetIniTime(ini, t);
+    if (exists) InterlockedExchange64(&g_iniTime, t);
     if (!exists) {
         c = d;
         return false;
     }
 
-    c.active = ReadBool(L"general", L"active", d.active);
-    c.logLevel = ReadInt(L"general", L"logLevel", d.logLevel);
-    c.statsIntervalSec = ReadInt(L"general", L"statsIntervalSec", d.statsIntervalSec);
-    c.hotkeys = ReadBool(L"general", L"hotkeys", d.hotkeys);
-    c.gpuTiming = ReadBool(L"general", L"gpuTiming", d.gpuTiming);
+    c.active = ReadBool(ini, L"general", L"active", d.active);
+    c.logLevel = ReadInt(ini, L"general", L"logLevel", d.logLevel);
+    c.statsIntervalSec = ReadInt(ini, L"general", L"statsIntervalSec", d.statsIntervalSec);
+    c.hotkeys = ReadBool(ini, L"general", L"hotkeys", d.hotkeys);
+    c.gpuTiming = ReadBool(ini, L"general", L"gpuTiming", d.gpuTiming);
 
-    c.enabled = ReadBool(L"upscale", L"enabled", d.enabled);
-    std::wstring mode = ReadStr(L"upscale", L"mode", L"temporal");
+    c.enabled = ReadBool(ini, L"upscale", L"enabled", d.enabled);
+    std::wstring mode = ReadStr(ini, L"upscale", L"mode", L"temporal");
     wchar_t m0 = mode.empty() ? L't' : towlower(mode[0]);
     c.mode = m0 == L'b' ? Mode::Bilinear : (m0 == L'f' ? Mode::Fsr : Mode::Temporal);
-    c.upscaleFactor = ReadFloat(L"upscale", L"upscaleFactor", d.upscaleFactor);
-    c.sharpness = ReadFloat(L"upscale", L"sharpness", d.sharpness);
-    c.dedupeMs = ReadFloat(L"upscale", L"dedupeMs", d.dedupeMs);
-    c.tint = ReadBool(L"upscale", L"debugTint", d.tint);
+    c.upscaleFactor = ReadFloat(ini, L"upscale", L"upscaleFactor", d.upscaleFactor);
+    c.sharpness = ReadFloat(ini, L"upscale", L"sharpness", d.sharpness);
+    c.dedupeMs = ReadFloat(ini, L"upscale", L"dedupeMs", d.dedupeMs);
+    c.tint = ReadBool(ini, L"upscale", L"debugTint", d.tint);
 
-    c.maxWeight = ReadFloat(L"temporal", L"maxWeight", d.maxWeight);
-    c.clipGamma = ReadFloat(L"temporal", L"clipGamma", d.clipGamma);
-    c.residualTol = ReadFloat(L"temporal", L"residualTol", d.residualTol);
-    c.sampleSigma = ReadFloat(L"temporal", L"sampleSigma", d.sampleSigma);
-    c.minNewWeight = ReadFloat(L"temporal", L"minNewWeight", d.minNewWeight);
-    c.lkEps = ReadFloat(L"temporal", L"lkEps", d.lkEps);
-    c.searchLambda = ReadFloat(L"temporal", L"searchLambda", d.searchLambda);
-    c.clipReject = ReadFloat(L"temporal", L"clipReject", d.clipReject);
-    c.localTrust = ReadFloat(L"temporal", L"localTrust", d.localTrust);
-    c.localGate = ReadFloat(L"temporal", L"localGate", d.localGate);
-    c.localRatio = ReadFloat(L"temporal", L"localRatio", d.localRatio);
-    c.sharpHistory = ReadBool(L"temporal", L"sharpHistory", d.sharpHistory);
-    c.localCheck = ReadInt(L"temporal", L"localCheck", d.localCheck);
-    c.localAgree = ReadFloat(L"temporal", L"localAgree", d.localAgree);
-    c.localAperture = ReadFloat(L"temporal", L"localAperture", d.localAperture);
-    c.workMargin = ReadInt(L"temporal", L"workMargin", d.workMargin);
-    c.commandLists = ReadBool(L"temporal", L"commandLists", d.commandLists);
-    c.bilinearEdges = ReadBool(L"temporal", L"bilinearEdges", d.bilinearEdges);
+    c.maxWeight = ReadFloat(ini, L"temporal", L"maxWeight", d.maxWeight);
+    c.clipGamma = ReadFloat(ini, L"temporal", L"clipGamma", d.clipGamma);
+    c.residualTol = ReadFloat(ini, L"temporal", L"residualTol", d.residualTol);
+    c.sampleSigma = ReadFloat(ini, L"temporal", L"sampleSigma", d.sampleSigma);
+    c.minNewWeight = ReadFloat(ini, L"temporal", L"minNewWeight", d.minNewWeight);
+    c.lkEps = ReadFloat(ini, L"temporal", L"lkEps", d.lkEps);
+    c.searchLambda = ReadFloat(ini, L"temporal", L"searchLambda", d.searchLambda);
+    c.clipReject = ReadFloat(ini, L"temporal", L"clipReject", d.clipReject);
+    c.localTrust = ReadFloat(ini, L"temporal", L"localTrust", d.localTrust);
+    c.localGate = ReadFloat(ini, L"temporal", L"localGate", d.localGate);
+    c.localRatio = ReadFloat(ini, L"temporal", L"localRatio", d.localRatio);
+    c.sharpHistory = ReadBool(ini, L"temporal", L"sharpHistory", d.sharpHistory);
+    c.localCheck = ReadInt(ini, L"temporal", L"localCheck", d.localCheck);
+    c.localAgree = ReadFloat(ini, L"temporal", L"localAgree", d.localAgree);
+    c.localAperture = ReadFloat(ini, L"temporal", L"localAperture", d.localAperture);
+    c.workMargin = ReadInt(ini, L"temporal", L"workMargin", d.workMargin);
+    c.commandLists = ReadBool(ini, L"temporal", L"commandLists", d.commandLists);
+    c.bilinearEdges = ReadBool(ini, L"temporal", L"bilinearEdges", d.bilinearEdges);
 
-    c.gazeFollow = ReadBool(L"eyes", L"followGaze", d.gazeFollow);
-    c.gazeShow = ReadBool(L"eyes", L"showGaze", d.gazeShow);
-    c.gazeOffset[0] = ReadFloat(L"eyes", L"offsetX", d.gazeOffset[0]);
-    c.gazeOffset[1] = ReadFloat(L"eyes", L"offsetY", d.gazeOffset[1]);
-    c.gazeDeadzone = ReadFloat(L"eyes", L"deadzone", d.gazeDeadzone);
+    c.gazeFollow = ReadBool(ini, L"eyes", L"followGaze", d.gazeFollow);
+    c.gazeShow = ReadBool(ini, L"eyes", L"showGaze", d.gazeShow);
+    c.gazeOffset[0] = ReadFloat(ini, L"eyes", L"offsetX", d.gazeOffset[0]);
+    c.gazeOffset[1] = ReadFloat(ini, L"eyes", L"offsetY", d.gazeOffset[1]);
+    c.gazeDeadzone = ReadFloat(ini, L"eyes", L"deadzone", d.gazeDeadzone);
     {   // "l r t b l r t b": what SteamVR reports for each eye (the app writes it)
-        std::wstring pr = ReadStr(L"eyes", L"projection", L"");
+        std::wstring pr = ReadStr(ini, L"eyes", L"projection", L"");
         float v[8] = {};
         if (swscanf(pr.c_str(), L"%f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8)
             memcpy(c.eyeProj, v, sizeof(v));
     }
-    c.temporalArea = ReadFloat(L"temporal", L"temporalArea", d.temporalArea);
-    c.gazeArea = ReadFloat(L"temporal", L"gazeArea", d.gazeArea);
-    c.sharpArea = ReadFloat(L"upscale", L"sharpnessArea", d.sharpArea);
-    c.gazeSharpArea = ReadFloat(L"upscale", L"gazeSharpnessArea", d.gazeSharpArea);
-    c.maxStreams = ReadInt(L"temporal", L"maxStreams", d.maxStreams);
-    c.linkPools = ReadBool(L"temporal", L"linkPools", d.linkPools);
-    c.linkGapMs = ReadFloat(L"temporal", L"linkGapMs", d.linkGapMs);
-    c.detectContent = ReadBool(L"temporal", L"detectContent", d.detectContent);
-    c.probeWindowMs = ReadInt(L"temporal", L"probeWindowMs", d.probeWindowMs);
+    c.temporalArea = ReadFloat(ini, L"temporal", L"temporalArea", d.temporalArea);
+    c.gazeArea = ReadFloat(ini, L"temporal", L"gazeArea", d.gazeArea);
+    c.sharpArea = ReadFloat(ini, L"upscale", L"sharpnessArea", d.sharpArea);
+    c.gazeSharpArea = ReadFloat(ini, L"upscale", L"gazeSharpnessArea", d.gazeSharpArea);
+    c.maxStreams = ReadInt(ini, L"temporal", L"maxStreams", d.maxStreams);
+    c.linkPools = ReadBool(ini, L"temporal", L"linkPools", d.linkPools);
+    c.linkGapMs = ReadFloat(ini, L"temporal", L"linkGapMs", d.linkGapMs);
+    c.detectContent = ReadBool(ini, L"temporal", L"detectContent", d.detectContent);
+    c.probeWindowMs = ReadInt(ini, L"temporal", L"probeWindowMs", d.probeWindowMs);
 
-    c.minWidth = ReadInt(L"match", L"minWidth", d.minWidth);
-    c.minHeight = ReadInt(L"match", L"minHeight", d.minHeight);
-    c.minAspect = ReadFloat(L"match", L"minAspect", d.minAspect);
-    c.maxAspect = ReadFloat(L"match", L"maxAspect", d.maxAspect);
-    c.onlySizes = ReadSizes(L"match", L"onlySizes");
-    c.excludeSizes = ReadSizes(L"match", L"excludeSizes");
-    c.requireShared = ReadBool(L"match", L"requireShared", d.requireShared);
-    c.followCopies = ReadBool(L"match", L"followCopies", d.followCopies);
-    c.maxArraySize = ReadInt(L"match", L"maxArraySize", d.maxArraySize);
+    c.minWidth = ReadInt(ini, L"match", L"minWidth", d.minWidth);
+    c.minHeight = ReadInt(ini, L"match", L"minHeight", d.minHeight);
+    c.minAspect = ReadFloat(ini, L"match", L"minAspect", d.minAspect);
+    c.maxAspect = ReadFloat(ini, L"match", L"maxAspect", d.maxAspect);
+    c.onlySizes = ReadSizes(ini, L"match", L"onlySizes");
+    c.excludeSizes = ReadSizes(ini, L"match", L"excludeSizes");
+    c.requireShared = ReadBool(ini, L"match", L"requireShared", d.requireShared);
+    c.followCopies = ReadBool(ini, L"match", L"followCopies", d.followCopies);
+    c.maxArraySize = ReadInt(ini, L"match", L"maxArraySize", d.maxArraySize);
 
     SanitizeConfig(c);
     return true;
@@ -241,20 +253,25 @@ const char *ModeName(Mode m)
     return m == Mode::Temporal ? "temporal" : (m == Mode::Fsr ? "fsr" : "bilinear");
 }
 
+void ConfigRecheck() { InterlockedExchange64(&g_iniTime, 0); }
+
 bool ConfigFileChanged(bool *switched)
 {
     if (switched) *switched = false;
+    const std::wstring path = IniPath();
     // The app's settings file appeared after we started on a fallback: switch to it.
-    if (!g_iniPreferred.empty() && g_iniPath != g_iniPreferred &&
+    if (!g_iniPreferred.empty() && path != g_iniPreferred &&
         GetFileAttributesW(g_iniPreferred.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        AcquireSRWLockExclusive(&g_iniLock);
         g_iniPath = g_iniPreferred;
-        g_iniTime = {};
+        ReleaseSRWLockExclusive(&g_iniLock);
+        InterlockedExchange64(&g_iniTime, 0);
         if (switched) *switched = true;
         return true;
     }
-    FILETIME t;
-    if (!GetIniTime(t)) return false;
-    return CompareFileTime(&t, &g_iniTime) != 0;
+    LONG64 t;
+    if (!GetIniTime(path.c_str(), t)) return false;
+    return t != InterlockedCompareExchange64(&g_iniTime, 0, 0);
 }
 
 } // namespace vu

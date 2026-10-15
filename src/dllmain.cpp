@@ -139,6 +139,7 @@ DWORD WINAPI Worker(LPVOID)
     for (int i = 0; i < 240; ++i) {
         Sleep(500);
         LogModules(false);
+        vu::ConfigWatchTick();   // (the settings file is read here, never on SteamVR's thread)
         fallbackTick();
         if (i == 59 && vu::HooksInstalled() && vu::g_stats.psHookCalls == 0)
             LOGI("diag: no PSSetShaderResources calls through the hooked runtime after 30 s "
@@ -152,6 +153,7 @@ DWORD WINAPI Worker(LPVOID)
         // hooks (status, settings); the render-thread tick takes over as soon as it runs
         Sleep(500);
         if (vu::g_shuttingDown) break;
+        vu::ConfigWatchTick();
         fallbackTick();
         if (slice % 20 != 19) continue;
         if (!vu::HooksInstalled() || budget <= 0) continue;

@@ -1279,7 +1279,7 @@ PFN_GetAsyncKeyState g_getKey = nullptr;
 bool g_keyWasDown[8] = {};
 volatile LONG g_testHotkey = -1;   // a shortcut the self-test asks for (VrUpscaleDebugHotkey)
 SRWLOCK g_tickLock = SRWLOCK_INIT;
-LONGLONG g_lastHotkey = 0, g_lastCfgPoll = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0;
+LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0;
 
 // Ctrl+F1..F8. Goes through ApplyConfig like any other change, so a new factor re-plans the
 // textures; the app mirrors the result and saves it.
@@ -1345,13 +1345,12 @@ void PollHotkeys()
     }
 }
 
-// merge: the file changed on its own (the app saved it, or an edit by hand), so it is taken field by
-// field against what is running (ControlMergeFile); otherwise (asked to, or another file) as it is.
-void ReloadConfig(bool merge)
+// The settings file as read (path), applied. merge: the file changed on its own (the app saved it, or
+// an edit by hand), so it is taken field by field against what is running (ControlMergeFile);
+// otherwise (asked to, or another file) as it is.
+void ApplyFileConfig(Config &nc, bool found, bool merge, const std::wstring &path)
 {
-    Config nc;
-    bool found = LoadConfig(nc);
-    LOGI("config: settings file %ls%s", g_iniPath.c_str(), found ? "" : " (missing: defaults)");
+    LOGI("config: settings file %ls%s", path.c_str(), found ? "" : " (missing: defaults)");
     const Config fromFile = nc;
     if (merge && found) {
         Config cur;
@@ -1365,6 +1364,51 @@ void ReloadConfig(bool merge)
     ControlFileRead(fromFile);
     ApplyConfig(nc, "the settings file");
     PrintConfig(nc);
+}
+
+// A changed settings file is noticed and read by the worker thread (ConfigWatchTick): reading it
+// takes milliseconds, a hitch in SteamVR's frame when done on its thread. The render thread (or the
+// worker, while SteamVR's thread is not passing through the hooks) applies what was read.
+struct PendingFile {
+    Config cfg;
+    std::wstring path;
+    bool found = false, merge = true;
+    LONG seq = 0;
+};
+SRWLOCK g_pendingLock = SRWLOCK_INIT;
+PendingFile *g_pending = nullptr;   // guarded by g_pendingLock
+volatile LONG g_pendingReady = 0;
+volatile LONG g_fileSeq = 0;        // bumped by every reading of the file on the applying side: a read
+                                    // the worker started before that is stale
+
+// Asked for (the test harness after writing the file, or the app): read and applied at once.
+void ReloadConfig()
+{
+    InterlockedIncrement(&g_fileSeq);
+    Config nc;
+    std::wstring path;
+    const bool found = LoadConfig(nc, &path);
+    ApplyFileConfig(nc, found, false, path);
+}
+
+void ApplyPendingFile()
+{
+    if (!g_pendingReady) return;
+    AcquireSRWLockExclusive(&g_pendingLock);
+    PendingFile *p = g_pending;
+    g_pending = nullptr;
+    InterlockedExchange(&g_pendingReady, 0);
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    if (!p) return;
+    if (p->seq == g_fileSeq) ApplyFileConfig(p->cfg, p->found, p->merge, p->path);
+    else ConfigRecheck();   // read before a reload asked for here: if the file changed after that, read it again
+    delete p;
+}
+
+void ConfigTick()   // caller holds g_workLock
+{
+    if (InterlockedExchange(&g_reloadRequested, 0)) ReloadConfig();
+    ApplyPendingFile();
 }
 
 void LogStats(ID3D11DeviceContext *ctx, double seconds)
@@ -1467,12 +1511,7 @@ void RenderTick(ID3D11DeviceContext *ctx)
     const LONG testKey = InterlockedExchange(&g_testHotkey, -1);
     if (testKey >= 0) ApplyHotkey((int)testKey);
     GazeTick();
-    if (g_reloadRequested || now.QuadPart - g_lastCfgPoll > f) {
-        g_lastCfgPoll = now.QuadPart;
-        const bool requested = InterlockedExchange(&g_reloadRequested, 0) != 0;
-        bool switched = false;
-        if (requested || ConfigFileChanged(&switched)) ReloadConfig(!requested && !switched);
-    }
+    ConfigTick();
     if (now.QuadPart - g_lastProbePoll > f / 20) {   // content rectangles (render size)
         g_lastProbePoll = now.QuadPart;
         Ref<ID3D11Device> dev;
@@ -1591,7 +1630,27 @@ void NoteHookCpu(LONGLONG d)
 void ControlTickFromWorker()
 {
     WorkLock lock(false);
-    if (lock.held) ControlTick();
+    if (!lock.held) return;
+    ConfigTick();
+    ControlTick();
+}
+
+void ConfigWatchTick()
+{
+    bool switched = false;
+    if (!ConfigFileChanged(&switched)) return;
+    PendingFile *p = new PendingFile();
+    p->seq = g_fileSeq;
+    p->found = LoadConfig(p->cfg, &p->path);
+    p->merge = !switched;
+    AcquireSRWLockExclusive(&g_pendingLock);
+    if (g_pending) {   // not applied yet: this newer read replaces it (as a switch, if that one was)
+        p->merge = p->merge && g_pending->merge;
+        delete g_pending;
+    }
+    g_pending = p;
+    InterlockedExchange(&g_pendingReady, 1);
+    ReleaseSRWLockExclusive(&g_pendingLock);
 }
 
 // ---------------------------------------------------------------------------------------------

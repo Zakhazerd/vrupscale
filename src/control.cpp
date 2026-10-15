@@ -195,7 +195,7 @@ void Publish()
     st.eventCount = g_eventN;
     memcpy(st.events, g_events, sizeof(st.events));
     ReleaseSRWLockShared(&g_ctlLock);
-    CopyW(st.iniPath, 260, g_iniPath);
+    CopyW(st.iniPath, 260, IniPath());
     CopyW(st.logPath, 260, g_logPath);
     GazeFillStatus(st.gaze);
     SeqWrite(&g_sh->statusSeq, &g_sh->status, &st, sizeof(st));

@@ -149,12 +149,18 @@ extern std::wstring g_dllDir;
 extern std::wstring g_iniPreferred;   // where the app keeps the settings; switched to once it exists
 extern std::wstring g_logPath;
 extern volatile LONG g_reloadRequested;
-extern std::wstring g_iniPath;
+extern std::wstring g_iniPath;       // set at startup; once threads run, read it through IniPath()
+std::wstring IniPath();
 
-bool LoadConfig(Config &out);        // returns false if the file is missing (defaults kept)
+// Reads the settings file (path: the one read). Returns false if it is missing (defaults kept). The
+// profile API re-reads the file for every key, so this takes milliseconds: not on SteamVR's thread.
+bool LoadConfig(Config &out, std::wstring *path = nullptr);
 void SanitizeConfig(Config &c);
 void PrintConfig(const Config &c);
 bool ConfigFileChanged(bool *switched = nullptr);   // cheap mtime poll (switched: now another file)
+void ConfigRecheck();                // the next ConfigFileChanged reports a change (read the file again)
+// Worker thread, twice a second: reads a changed settings file for the render thread to apply.
+void ConfigWatchTick();
 
 // ---------------------------------------------------------------------------------------------
 // Hooks / runtime
