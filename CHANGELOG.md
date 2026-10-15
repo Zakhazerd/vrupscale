@@ -5,6 +5,8 @@ What changed in each version of vrupscale, newest first.
 ## 0.6.6
 
 - Fixed: with the app open, pressing a shortcut twice in quick succession (Ctrl+F1 off and straight back on, say) could undo the second press a moment later.
+- Less work inside SteamVR's frame: the log is written in the background, and GPU timing is taken on a sample of frames instead of every one.
+- The log's stats lines show the CPU time vrupscale takes on SteamVR's compositor threads.
 
 ## 0.6.4
 

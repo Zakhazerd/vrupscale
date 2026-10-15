@@ -75,6 +75,9 @@ volatile LONG g_texSerial = 0;
 
 // Interval counters for the periodic stats line
 struct Interval { volatile LONG ps, subs, upscales, draws; } g_iv;
+// CPU time in the hook handlers during the interval: total and longest call (QPC ticks), calls
+volatile LONG64 g_hookTicks = 0, g_hookMax = 0;
+volatile LONG g_hookCalls = 0;
 
 // What was upscaled during the current stats interval (render thread only)
 struct SizeTally { UINT w, h, slices, ow, oh; DXGI_FORMAT fmt; LONG count; };
@@ -1230,6 +1233,9 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
     LONG ps = InterlockedExchange(&g_iv.ps, 0);
     LONG subs = InterlockedExchange(&g_iv.subs, 0);
     LONG ups = InterlockedExchange(&g_iv.upscales, 0);
+    const double hookMs = double(InterlockedExchange64(&g_hookTicks, 0)) * 1000.0 / double(g_qpf.QuadPart);
+    const double hookMax = double(InterlockedExchange64(&g_hookMax, 0)) * 1000.0 / double(g_qpf.QuadPart);
+    const LONG hookCalls = InterlockedExchange(&g_hookCalls, 0);
     double gpuSum = 0, gpuMax = 0;
     int gpuN = 0;
     AcquireSRWLockShared(&g_devLock);
@@ -1245,9 +1251,10 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
     char gpu[64];
     if (gpuN) snprintf(gpu, sizeof(gpu), "%.3f ms avg, %.3f ms max", gpuSum / gpuN, gpuMax);
     else snprintf(gpu, sizeof(gpu), "%s", ups ? "not timed yet" : "-");
-    LOGI("stats %.0fs: binds=%ld substituted=%ld upscales=%ld (%.1f/s) gpu=%s | live textures=%ld views=%ld | "
-         "totals: opened=%ld copied=%ld skipped=%ld | %s",
+    LOGI("stats %.0fs: binds=%ld substituted=%ld upscales=%ld (%.1f/s) gpu=%s cpu=%.3f ms/s in hooks (%ld calls, longest "
+         "%.3f ms) | live textures=%ld views=%ld | totals: opened=%ld copied=%ld skipped=%ld | %s",
          seconds, (long)ps, (long)subs, (long)ups, seconds > 0 ? ups / seconds : 0.0, gpu,
+         seconds > 0 ? hookMs / seconds : 0.0, (long)hookCalls, hookMax,
          (long)g_stats.liveTexStates, (long)g_stats.liveViewEntries, (long)g_stats.sharedOpened,
          (long)g_stats.copiesMarked, (long)g_stats.rejects, g_cfg.enabled ? "ON" : "OFF");
     {
@@ -1417,6 +1424,18 @@ float GpuMsRecent()
     }
     ReleaseSRWLockShared(&g_devLock);
     return best;
+}
+
+void NoteHookCpu(LONGLONG d)
+{
+    InterlockedExchangeAdd64(&g_hookTicks, d);
+    InterlockedIncrement(&g_hookCalls);
+    LONG64 m = g_hookMax;
+    while (d > m) {
+        const LONG64 seen = InterlockedCompareExchange64(&g_hookMax, d, m);
+        if (seen == m) break;
+        m = seen;
+    }
 }
 
 void ControlTickFromWorker()

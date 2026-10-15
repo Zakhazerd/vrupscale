@@ -37,6 +37,18 @@ inline bool InVu()
     return in;
 }
 
+// CPU time the compositor's threads spend in vrupscale's handlers (not in the calls passed on)
+struct HookCpu {
+    LARGE_INTEGER t0;
+    HookCpu() { QueryPerformanceCounter(&t0); }
+    ~HookCpu()
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        NoteHookCpu(t.QuadPart - t0.QuadPart);
+    }
+};
+
 struct VuScope {
     bool outer;
     VuScope() : outer(g_tls != TLS_OUT_OF_INDEXES && !InVu())
@@ -115,8 +127,10 @@ void STDMETHODCALLTYPE Hook_PSSetShaderResources(ID3D11DeviceContext *ctx, UINT 
     ID3D11ShaderResourceView *local[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
     bool replaced = false;
     if (views && num > 0 && start < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT &&
-        num <= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - start)
+        num <= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - start) {
+        HookCpu cpu;
         OnPSSetShaderResources(ctx, start, num, views, local, &replaced);
+    }
     g_oPS[V](ctx, start, num, replaced ? local : views);
 }
 
@@ -138,7 +152,7 @@ void STDMETHODCALLTYPE Hook_CSSetShaderResources(ID3D11DeviceContext *ctx, UINT 
         VuScope scope;                                              \
         InterlockedIncrement(&g_stats.drawHookCalls);               \
         InterlockedIncrement(&g_drawHits[V]);                       \
-        OnBeforeDraw(ctx);                                          \
+        { HookCpu cpu; OnBeforeDraw(ctx); }                         \
         ARR[V] ARGS;                                                \
     }
 
@@ -205,7 +219,7 @@ HRESULT STDMETHODCALLTYPE Hook_FinishCommandList(ID3D11DeviceContext *ctx, BOOL 
     if (g_shuttingDown || InVu()) return g_oFinishCommandList[V](ctx, restore, pp);
     VuScope scope;
     HRESULT hr = g_oFinishCommandList[V](ctx, restore, pp);
-    OnFinishCommandList(ctx, restore != FALSE, (SUCCEEDED(hr) && pp) ? *pp : nullptr);
+    { HookCpu cpu; OnFinishCommandList(ctx, restore != FALSE, (SUCCEEDED(hr) && pp) ? *pp : nullptr); }
     return hr;
 }
 
@@ -214,9 +228,9 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandList(ID3D11DeviceContext *ctx, ID3D11C
 {
     if (g_shuttingDown || InVu()) return g_oExecuteCommandList[V](ctx, cl, restore);
     VuScope scope;
-    OnBeforeExecuteCommandList(ctx, cl);
+    { HookCpu cpu; OnBeforeExecuteCommandList(ctx, cl); }
     g_oExecuteCommandList[V](ctx, cl, restore);
-    OnAfterExecuteCommandList(ctx, restore != FALSE);
+    { HookCpu cpu; OnAfterExecuteCommandList(ctx, restore != FALSE); }
 }
 
 // ---- method table -------------------------------------------------------------------------------

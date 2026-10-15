@@ -1161,9 +1161,14 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     ID3D11Buffer *cb = ds->tcb.Get();
     ctx->CSSetConstantBuffers(0, 1, &cb);
 
-    // per-pass timestamps, inside the timed batch this run is part of (none: not timed)
-    PassQueries *pq = (ds->activeBatch >= 0 && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? AcquirePassQueries(ds, ctx)
-                                                                                                : nullptr;
+    // per-pass timestamps, inside the timed batch this run is part of (none: not timed). A sample
+    // of runs, at most 20 a second: each timed run adds a timestamp per pass group and a readback
+    // to SteamVR's frame, and the averages need no more.
+    PassQueries *pq = nullptr;
+    if (ds->activeBatch >= 0 && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && now - ds->passTimedQpc >= g_qpf.QuadPart / 20) {
+        pq = AcquirePassQueries(ds, ctx);
+        if (pq) ds->passTimedQpc = now;
+    }
     if (pq) {
         pq->batch = ds->activeBatch;
         pq->batchSerial = ds->q[ds->activeBatch].serial;

@@ -226,7 +226,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_isTarget) {
             InterlockedExchange(&vu::g_shuttingDown, 1);
-            vu::LogFlush();
+            vu::LogFlushAtExit();
         }
     }
     return TRUE;

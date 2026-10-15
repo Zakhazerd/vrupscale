@@ -207,6 +207,7 @@ struct DevState {
     double gpuEma = -1;            // for the app's status (not reset by the stats line)
     DWORD gpuEmaTick = 0;
     PassQueries pq[8];
+    LONGLONG passTimedQpc = 0;     // when a run's passes were last timed (at most 20 runs a second are)
     int activeBatch = -1;          // the QuerySet timing the batch being recorded now (-1: none)
     // content check of the spatial path: fingerprint and the indirect args it leaves (used at once)
     Ref<ID3D11Buffer> gateFp, gateArgs;

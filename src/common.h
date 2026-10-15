@@ -48,8 +48,10 @@ private:
 extern volatile LONG g_logLevel;   // 0 = errors, 1 = info, 2 = verbose
 void LogOpen(const std::wstring &path);
 void ControlNoteEvent(int level, const char *line);   // control.cpp: recent events for the app
+void NoteHookCpu(LONGLONG qpcTicks);   // upscaler.cpp: time spent in a hook handler (stats)
 void LogWrite(int level, const char *fmt, ...) __attribute__((format(gnu_printf, 2, 3)));
 void LogFlush();
+void LogFlushAtExit();
 
 #define LOGE(...) ::vu::LogWrite(0, __VA_ARGS__)
 #define LOGI(...) do { if (::vu::g_logLevel >= 1) ::vu::LogWrite(1, __VA_ARGS__); } while (0)
