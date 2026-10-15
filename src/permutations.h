@@ -24,7 +24,6 @@
     X(T_LUMA_X0,       "temporal.hlsl", "TPASS=0;XFORM=0")                    \
     X(T_LUMA_X1,       "temporal.hlsl", "TPASS=0;XFORM=1")                    \
     X(T_LUMA_X2,       "temporal.hlsl", "TPASS=0;XFORM=2")                    \
-    X(T_DECIDE,        "temporal.hlsl", "TPASS=1")                            \
     X(T_DOWN_L2,       "temporal.hlsl", "TPASS=2;LEVEL=2")                    \
     X(T_DOWN_L3,       "temporal.hlsl", "TPASS=2;LEVEL=3")                    \
     X(T_DOWN_L4,       "temporal.hlsl", "TPASS=2;LEVEL=4")                    \
@@ -49,10 +48,13 @@
     X(T_OUTERSH_X0,    "temporal.hlsl", "TPASS=10;XFORM=0;SHARPEN=1")         \
     X(T_OUTERSH_X1,    "temporal.hlsl", "TPASS=10;XFORM=1;SHARPEN=1")         \
     X(T_OUTERSH_X2,    "temporal.hlsl", "TPASS=10;XFORM=2;SHARPEN=1")         \
-    X(T_FP_X0,         "temporal.hlsl", "TPASS=11;XFORM=0")                   \
-    X(T_FP_X1,         "temporal.hlsl", "TPASS=11;XFORM=1")                   \
-    X(T_FP_X2,         "temporal.hlsl", "TPASS=11;XFORM=2")                   \
-    X(T_SDECIDE,       "temporal.hlsl", "TPASS=12")                           \
+    /* fingerprint, then its last group decides: temporal (FPD) or spatial (FPS) */ \
+    X(T_FPD_X0,        "temporal.hlsl", "TPASS=11;FPMODE=1;XFORM=0")          \
+    X(T_FPD_X1,        "temporal.hlsl", "TPASS=11;FPMODE=1;XFORM=1")          \
+    X(T_FPD_X2,        "temporal.hlsl", "TPASS=11;FPMODE=1;XFORM=2")          \
+    X(T_FPS_X0,        "temporal.hlsl", "TPASS=11;FPMODE=2;XFORM=0")          \
+    X(T_FPS_X1,        "temporal.hlsl", "TPASS=11;FPMODE=2;XFORM=1")          \
+    X(T_FPS_X2,        "temporal.hlsl", "TPASS=11;FPMODE=2;XFORM=2")          \
     X(T_MARGIN_X0,     "temporal.hlsl", "TPASS=13;XFORM=0")                   \
     X(T_MARGIN_X1,     "temporal.hlsl", "TPASS=13;XFORM=1")                   \
     X(T_MARGIN_X2,     "temporal.hlsl", "TPASS=13;XFORM=2")

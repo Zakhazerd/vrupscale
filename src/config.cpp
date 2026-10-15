@@ -120,6 +120,7 @@ bool LoadConfig(Config &c)
     c.localAgree = ReadFloat(L"temporal", L"localAgree", d.localAgree);
     c.localAperture = ReadFloat(L"temporal", L"localAperture", d.localAperture);
     c.workMargin = ReadInt(L"temporal", L"workMargin", d.workMargin);
+    c.commandLists = ReadBool(L"temporal", L"commandLists", d.commandLists);
     c.bilinearEdges = ReadBool(L"temporal", L"bilinearEdges", d.bilinearEdges);
 
     c.gazeFollow = ReadBool(L"eyes", L"followGaze", d.gazeFollow);
@@ -223,10 +224,10 @@ void PrintConfig(const Config &c)
          c.sharpHistory, c.bilinearEdges, c.gazeFollow, c.gazeShow, c.gazeOffset[0], c.gazeOffset[1]);
     LOGI("config: temporal maxWeight=%.1f clipGamma=%.2f residualTol=%.3f sampleSigma=%.2f minNewWeight=%.3f lkEps=%.4f "
          "searchLambda=%.4f clipReject=%.2f localTrust=%.2f localGate=%.2f localRatio=%.2f temporalArea=%.2f gazeArea=%.2f maxStreams=%d "
-         "linkPools=%d linkGapMs=%.1f detectContent=%d probeWindowMs=%d",
+         "linkPools=%d linkGapMs=%.1f detectContent=%d probeWindowMs=%d commandLists=%d",
          c.maxWeight, c.clipGamma, c.residualTol, c.sampleSigma, c.minNewWeight, c.lkEps, c.searchLambda, c.clipReject,
          c.localTrust, c.localGate, c.localRatio, c.temporalArea, c.gazeArea, c.maxStreams, c.linkPools, c.linkGapMs, c.detectContent,
-         c.probeWindowMs);
+         c.probeWindowMs, c.commandLists);
     LOGI("config: match min=%dx%d aspect=[%.2f, %.2f] requireShared=%d followCopies=%d maxArraySize=%d onlySizes=%zu excludeSizes=%zu",
          c.minWidth, c.minHeight, c.minAspect, c.maxAspect, c.requireShared, c.followCopies, c.maxArraySize,
          c.onlySizes.size(), c.excludeSizes.size());

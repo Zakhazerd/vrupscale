@@ -72,34 +72,8 @@ void PollPassQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
     }
 }
 
-namespace {
-
-struct TParams {   // cbuffer TParams in temporal.hlsl
-    uint32_t size01[4];
-    uint32_t size23[4];
-    uint32_t size4out[4];
-    float scaleInfo[4];
-    uint32_t rcasCon[4];
-    float tune0[4];
-    float tune1[4];
-    uint32_t misc[4];
-    float debugFlow[4];
-    float tune2[4];
-    uint32_t region[4];      // output region with history: x0, y0, w, h
-    uint32_t lkCells[4];     // L3 cells: first x, y, count x, y (strided)
-    uint32_t refCells[4];    // L2 cells: first x, y, count x, y
-    uint32_t searchBox[4];   // L4 pixels: x0, y0, w, h
-    uint32_t strides[4];     // LK cell step, global-fit step (in LK cells), 0, 0
-    uint32_t srcRect[4];     // content origin in the source x, y | source texture w, h
-    uint32_t dstRect[4];     // content origin in the proxy x, y | proxy w, h
-    uint32_t marks[4];       // gaze ring x, y | calibration cross x, y (content output px; ~0u = none)
-    float tune3[4];          // localCheck (bits), localAgree (input px), localAperture, 0
-    uint32_t work[4];        // L4 pixels the pyramid is built over (x0, y0, x1, y1): the region and a margin
-    uint32_t sharp[4];       // the sharpening area: w, h (centred on the region, at least its size), 0, 0
-};
-static_assert(sizeof(TParams) == 336, "cbuffer layout must match temporal.hlsl");
-} // namespace
 const UINT kTParamsBytes = sizeof(TParams);
+volatile LONG g_listsOff = 0;
 namespace {
 
 float g_debugFlow[3] = {};   // test hook (VrUpscaleDebugForceFlow)
@@ -125,6 +99,8 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 
 enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OUT0, A_COPY, A_GLOBAL, A_REFINE, A_OUTER,
        A_LUMA, A_MARGIN, A_COUNT };
+// StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
+constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64;
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
                TF_SHARPOUT = 128;
 constexpr UINT kStateBytes = 64;
@@ -187,6 +163,7 @@ public:
     Buf fp, state, ctrl, args, model;
     Ref<ID3D11Buffer> staging, debugStaging;
     bool stagingPending = false;
+    uint64_t runsCopied = 0;                         // runs issued before the counters in staging were copied
     bool haveCounters = false;                       // gpuNew.. valid (TemporalPollCounters)
     uint32_t gpuNew = 0, gpuCalls = 0, gpuForced = 0;   // GPU totals: new app frames, checks, forced repaints
     bool haveBaseline = false;
@@ -409,7 +386,7 @@ Stream *CreateStream(DevState *ds, const TexState *ts, UINT count, const OutSig 
          CreateRaw(dev, s->model, 64 * count, true, false) &&
          CreateTex(dev, s->hist[0], s->rw, s->rh, count, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, b) &&
          CreateTex(dev, s->hist[1], s->rw, s->rh, count, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, b) &&
-         CreateRaw(dev, s->fp, 16, true, false) && CreateRaw(dev, s->state, kStateBytes, false, false) &&
+         CreateRaw(dev, s->fp, 16, false, false) && CreateRaw(dev, s->state, kStateBytes, false, false) &&
          CreateRaw(dev, s->ctrl, 16, true, false) && CreateRaw(dev, s->args, A_COUNT * 12, false, true) &&
          CreateStaging(dev, s->staging) && CreateStaging(dev, s->debugStaging);
     if (!ok) {
@@ -1090,7 +1067,7 @@ void FillRegionParams(const Stream *s, bool localSearch, TParams &p)
 
 } // namespace
 
-void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now)
+void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, StreamRun &r)
 {
     Stream *s = link->stream;
     TexState *ts = ve->tex.Get();
@@ -1098,7 +1075,8 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     const UINT n = link->count;
     const bool reset = s->needReset || s->resetGen != g_resetGen;
 
-    TParams p = {};
+    TParams &p = r.p;
+    p = {};
     p.size01[0] = s->lw[0]; p.size01[1] = s->lh[0]; p.size01[2] = s->lw[1]; p.size01[3] = s->lh[1];
     p.size23[0] = s->lw[2]; p.size23[1] = s->lh[2]; p.size23[2] = s->lw[3]; p.size23[3] = s->lh[3];
     p.size4out[0] = s->lw[4]; p.size4out[1] = s->lh[4]; p.size4out[2] = s->outW; p.size4out[3] = s->outH;
@@ -1154,27 +1132,30 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     ContentProbe *probe = EnsureProbe(ds, ts);
     const uint32_t sliceMask = ((1u << n) - 1u) << link->first;
     if (probe) p.misc[1] |= (probe->primed & sliceMask) == sliceMask ? TF_PROBE : TF_PRIME;
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ctx->Map(ds->tcb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-    memcpy(m.pData, &p, sizeof(p));
-    ctx->Unmap(ds->tcb.Get(), 0);
-    ID3D11Buffer *cb = ds->tcb.Get();
-    ctx->CSSetConstantBuffers(0, 1, &cb);
 
-    // per-pass timestamps, inside the timed batch this run is part of (none: not timed). A sample
-    // of runs, at most 20 a second: each timed run adds a timestamp per pass group and a readback
-    // to SteamVR's frame, and the averages need no more.
-    PassQueries *pq = nullptr;
-    if (ds->activeBatch >= 0 && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && now - ds->passTimedQpc >= g_qpf.QuadPart / 20) {
-        pq = AcquirePassQueries(ds, ctx);
-        if (pq) ds->passTimedQpc = now;
-    }
-    if (pq) {
-        pq->batch = ds->activeBatch;
-        pq->batchSerial = ds->q[ds->activeBatch].serial;
-        pq->batchRead = false;
-        pq->freq = 0;
-    }
+    r.link = link;
+    r.ve = ve;
+    r.probe = probe;
+    r.sliceMask = sliceMask;
+    r.tw = tw;
+    r.th = th;
+    r.n = n;
+    r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
+              ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
+              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u);
+}
+
+namespace {
+
+// The passes of one run, on ctx (the compositor's context, or the deferred context a command list is
+// recorded on). pq: per-pass timestamps (never in a command list).
+void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, PassQueries *pq)
+{
+    const StreamLink *link = r.link;
+    Stream *s = link->stream;
+    TexState *ts = r.ve->tex.Get();
+    ContentProbe *probe = r.probe;
+    const int x = (int)(r.shape & SHAPE_XFORM);
     int mark = 0;
     auto Mark = [&]() {
         if (pq && mark <= kTPasses) ctx->End(pq->t[mark++].Get());
@@ -1183,22 +1164,19 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
 
     ID3D11Buffer *args = s->args.buf.Get();
     auto Indirect = [&](int shader, int entry) {
-        ctx->CSSetShader(ds->cs[shader].Get(), nullptr, 0);
+        SetCS(ctx, ds->cs[shader].Get());
         ctx->DispatchIndirect(args, entry * 12);
     };
-    ID3D11ShaderResourceView *src = ve->srcRead.Get();
+    ID3D11ShaderResourceView *src = r.ve->srcRead.Get();
 
-    // 1. sparse fingerprint of the whole texture and decide (always: the only work for a frame
-    //    already processed), then luma straight to L1 (new frames only)
+    // 1. sparse fingerprint of the whole texture, whose last group decides (always: the only work
+    //    for a frame already processed), then luma straight to L1 (new frames only)
     const UINT zero[4] = { 0, 0, 0, 0 };
     ctx->ClearUnorderedAccessViewUint(s->fp.uav.Get(), zero);
-    ctx->CSSetShader(ds->cs[SH_T_FP_X0 + x].Get(), nullptr, 0);
-    BindCS(ctx, { src }, { s->fp.uav.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr });
-    ctx->Dispatch((tw + 63) / 64, (th + 63) / 64, n);   // one sample per 8x8 block
-    if (probe) probe->primed |= sliceMask;
-    ctx->CSSetShader(ds->cs[SH_T_DECIDE].Get(), nullptr, 0);
-    BindCS(ctx, { s->fp.srv.Get() }, { s->state.uav.Get(), s->args.uav.Get(), s->ctrl.uav.Get(), link->linkUAV });
-    ctx->Dispatch(1, 1, 1);
+    SetCS(ctx, ds->cs[SH_T_FPD_X0 + x].Get());
+    BindCS(ctx, { src }, { s->fp.uav.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
+                           s->state.uav.Get(), s->args.uav.Get(), s->ctrl.uav.Get(), link->linkUAV });
+    ctx->Dispatch((r.tw + 63) / 64, (r.th + 63) / 64, r.n);   // one sample per 8x8 block (the shader counts these groups)
     BindCS(ctx, { src }, { s->cur[1].uav.Get() });   // (the args buffer must not stay bound as a UAV)
     Indirect(SH_T_LUMA_X0 + x, A_LUMA);
     Mark();
@@ -1227,7 +1205,7 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     BindCS(ctx, { s->flowLoc.srv.Get(), s->model.srv.Get(), s->flowPrev.srv.Get(), s->pack[1].srv.Get(), s->prev[1].srv.Get(),
                   s->ctrl.srv.Get() },
            { s->flow2.uav.Get() });
-    Indirect(g_cfg.localTrust > 0.0f ? SH_T_REFINE : SH_T_REFINE_G, A_REFINE);
+    Indirect((r.shape & SHAPE_LOCAL) ? SH_T_REFINE : SH_T_REFINE_G, A_REFINE);
     Mark();
 
     // 5. accumulate into whichever history is not current (the GPU knows which)
@@ -1238,16 +1216,16 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
     Mark();
 
     // 6. output into this texture's proxy (RCAS or copy)
-    const int outShader = (sharp > 0.0f ? SH_T_OUTRCAS_X0 : SH_T_OUTCOPY_X0) + x;
+    const int outShader = ((r.shape & SHAPE_RCAS) ? SH_T_OUTRCAS_X0 : SH_T_OUTCOPY_X0) + x;
     BindCS(ctx, { s->hist[1].srv.Get(), src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
     Indirect(outShader, A_OUT1);
     BindCS(ctx, { s->hist[0].srv.Get(), src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
     Indirect(outShader, A_OUT0);
-    if (s->foveated || !geo.full) {   // outside the region (and around the content rectangle): this frame alone
+    if (r.shape & SHAPE_OUTER) {   // outside the region (and around the content rectangle): this frame alone
         BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
-        Indirect((sharpOut ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
+        Indirect(((r.shape & SHAPE_SHARPOUT) ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
     }
-    if (!geo.full) {     // outside the content rectangle (the compositor does not sample it): repaints only
+    if (r.shape & SHAPE_MARGIN) {   // outside the content rectangle (the compositor does not sample it): repaints only
         BindCS(ctx, { nullptr, src }, { ts->proxyUAV.Get() });
         Indirect(SH_T_MARGIN_X0 + x, A_MARGIN);
     }
@@ -1262,10 +1240,120 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
         ctx->CopyResource(pq->ctrl.Get(), s->ctrl.buf.Get());   // this run's decision (new frame or not)
         pq->busy = mark == kTPasses + 1;
     }
+}
+
+bool EnsureRecorder(DevState *ds)
+{
+    if (ds->rec) return true;
+    if (ds->recFailed) return false;
+    ds->recFailed = true;   // (until it works)
+    D3D11_FEATURE_DATA_THREADING th = {};
+    ds->dev->CheckFeatureSupport(D3D11_FEATURE_THREADING, &th, sizeof(th));
+    Ref<ID3D11DeviceContext> dc;
+    HRESULT hr = ds->dev->CreateDeferredContext(0, dc.Put());
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = kTParamsBytes;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    Ref<ID3D11Buffer> cb;
+    if (SUCCEEDED(hr)) hr = ds->dev->CreateBuffer(&bd, nullptr, cb.Put());
+    if (FAILED(hr)) {
+        LOGI("temporal: command lists not available on this device (0x%08lx): the passes are issued one by one",
+             (unsigned long)hr);
+        return false;
+    }
+    ds->rec = dc;
+    ds->tcbRec = cb;
+    ds->recFailed = false;
+    LOGI("temporal: each texture's passes are recorded once into a command list and replayed (%s)",
+         th.DriverCommandLists ? "the driver runs command lists itself" : "command lists emulated by the D3D11 runtime");
+    return true;
+}
+
+} // namespace
+
+bool StreamListReady(DevState *ds, StreamRun &r)
+{
+    ViewEntry *ve = r.ve;
+    TexState *ts = ve->tex.Get();
+    Stream *s = r.link->stream;
+    RecordedRun &rec = ve->rec;
+    ID3D11UnorderedAccessView *mem = r.probe ? r.probe->memUAV.Get() : nullptr;
+    ID3D11UnorderedAccessView *box = r.probe ? r.probe->boxUAV.Get() : nullptr;
+    if (rec.list && rec.streamId == s->id && rec.src.Get() == ve->srcRead.Get() && rec.proxy.Get() == ts->proxyUAV.Get() &&
+        rec.probeMem.Get() == mem && rec.probeBox.Get() == box && rec.link.Get() == r.link->linkUAV && rec.tw == r.tw &&
+        rec.th == r.th && rec.n == r.n && rec.shape == r.shape)
+        return true;
+    rec = RecordedRun();
+    if (!EnsureRecorder(ds)) return false;
+    ID3D11DeviceContext *dc = ds->rec.Get();
+    {
+        CsCacheScope cache(dc, true);   // (a deferred context starts empty, and FinishCommandList(FALSE) empties it)
+        SetCSConstants(dc, ds->tcbRec.Get());
+        ID3D11SamplerState *samp = ds->samp.Get();
+        dc->CSSetSamplers(0, 1, &samp);
+        IssueStream(dc, ds, r, nullptr);
+    }
+    HRESULT hr = dc->FinishCommandList(FALSE, rec.list.Put());
+    if (FAILED(hr)) {   // (out of memory, or the device is gone): no more recording on this device
+        rec = RecordedRun();
+        dc->ClearState();
+        ds->rec.Reset();
+        ds->recFailed = true;
+        LOGE("temporal: recording stream #%d's passes failed (0x%08lx); issuing them one by one", s->id, (unsigned long)hr);
+        return false;
+    }
+    rec.streamId = s->id;
+    rec.src = ve->srcRead;
+    rec.proxy = ts->proxyUAV;
+    rec.probeMem = Ref<ID3D11UnorderedAccessView>(mem, true);
+    rec.probeBox = Ref<ID3D11UnorderedAccessView>(box, true);
+    rec.link = Ref<ID3D11UnorderedAccessView>(r.link->linkUAV, true);
+    rec.tw = r.tw;
+    rec.th = r.th;
+    rec.n = r.n;
+    rec.shape = r.shape;
+    InterlockedIncrement(&g_stats.listsRecorded);
+    return true;
+}
+
+void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamRun &r, bool replay, LONGLONG now)
+{
+    StreamLink *link = r.link;
+    Stream *s = link->stream;
+    TexState *ts = r.ve->tex.Get();
+    if (replay) {
+        ctx->UpdateSubresource(ds->tcbRec.Get(), 0, nullptr, &r.p, 0, 0);
+        ctx->ExecuteCommandList(r.ve->rec.list.Get(), TRUE);   // (restores the context's state after)
+        InterlockedIncrement(&g_stats.listsReplayed);
+    } else {
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ctx->Map(ds->tcb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+        memcpy(m.pData, &r.p, sizeof(r.p));
+        ctx->Unmap(ds->tcb.Get(), 0);
+        SetCSConstants(ctx, ds->tcb.Get());
+        // per-pass timestamps, inside the timed batch this run is part of (none: not timed). A sample
+        // of runs, at most 20 a second: each timed run adds a timestamp per pass group and a readback
+        // to SteamVR's frame, and the averages need no more.
+        PassQueries *pq = nullptr;
+        if (ds->activeBatch >= 0 && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE &&
+            now - ds->passTimedQpc >= g_qpf.QuadPart / 20) {
+            pq = AcquirePassQueries(ds, ctx);
+            if (pq) ds->passTimedQpc = now;
+        }
+        if (pq) {
+            pq->batch = ds->activeBatch;
+            pq->batchSerial = ds->q[ds->activeBatch].serial;
+            pq->batchRead = false;
+            pq->freq = 0;
+        }
+        IssueStream(ctx, ds, r, pq);
+    }
+    if (r.probe) r.probe->primed |= r.sliceMask;
 
     if (s->runs == 0)
         LOGI("temporal: stream #%d first run (texture #%llu, slices %u..%u)", s->id, (unsigned long long)ts->serial,
-             link->first, link->first + n - 1);
+             link->first, link->first + r.n - 1);
     s->needReset = false;
     s->resetGen = g_resetGen;
     link->written = true;
@@ -1283,9 +1371,8 @@ void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEnt
 bool CreateGateResources(DevState *ds)
 {
     Buf fp, args;
-    if (!CreateRaw(ds->dev.Get(), fp, 16, true, false) || !CreateRaw(ds->dev.Get(), args, 48, false, true)) return false;
+    if (!CreateRaw(ds->dev.Get(), fp, 16, false, false) || !CreateRaw(ds->dev.Get(), args, 48, false, true)) return false;
     ds->gateFp = fp.buf;
-    ds->gateFpSRV = fp.srv;
     ds->gateFpUAV = fp.uav;
     ds->gateArgs = args.buf;
     ds->gateArgsUAV = args.uav;
@@ -1330,17 +1417,14 @@ bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11
     if (FAILED(ctx->Map(ds->tcb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
     memcpy(m.pData, &p, sizeof(p));
     ctx->Unmap(ds->tcb.Get(), 0);
-    ID3D11Buffer *cb = ds->tcb.Get();
-    ctx->CSSetConstantBuffers(0, 1, &cb);
+    SetCSConstants(ctx, ds->tcb.Get());
     const UINT zero[4] = { 0, 0, 0, 0 };
     ctx->ClearUnorderedAccessViewUint(ds->gateFpUAV.Get(), zero);
-    ctx->CSSetShader(ds->cs[SH_T_FP_X0 + xform].Get(), nullptr, 0);
-    BindCS(ctx, { src }, { ds->gateFpUAV.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr });
-    ctx->Dispatch((w + 63) / 64, (h + 63) / 64, count);
+    SetCS(ctx, ds->cs[SH_T_FPS_X0 + xform].Get());
+    BindCS(ctx, { src }, { ds->gateFpUAV.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
+                           g.uav, ds->gateArgsUAV.Get() });
+    ctx->Dispatch((w + 63) / 64, (h + 63) / 64, count);   // (the shader counts these groups)
     if (probe) probe->primed |= sliceMask;
-    ctx->CSSetShader(ds->cs[SH_T_SDECIDE].Get(), nullptr, 0);
-    BindCS(ctx, { ds->gateFpSRV.Get() }, { g.uav, ds->gateArgsUAV.Get() });
-    ctx->Dispatch(1, 1, 1);
     BindCS(ctx, {}, {});   // the args buffer must not stay bound as a UAV
     g.outGen = g_outGen;
     return true;
@@ -1619,11 +1703,19 @@ void TemporalPollCounters(ID3D11DeviceContext *ctx, ID3D11Device *dev)
                 ctx->Unmap(s->staging.Get(), 0);
                 s->stagingPending = false;
                 s->haveCounters = true;
+                // Every run counts itself on the GPU (DECIDE), and the copy holds all runs issued
+                // before it. Runs missing there were replayed from command lists the driver did not
+                // execute again (DXVK does that unless d3d11.dcSingleUseMode = False).
+                const uint32_t lost = (uint32_t)s->runsCopied - s->gpuCalls;
+                if (lost >= 4 && lost < 0x80000000u && g_cfg.commandLists && !InterlockedExchange(&g_listsOff, 1))
+                    LOGE("temporal: %u of %llu runs of stream #%d replayed from command lists did not run: replaying them is off "
+                         "(the passes are issued one by one)", lost, (unsigned long long)s->runsCopied, s->id);
             }
         }
         if (!s->stagingPending) {
             ctx->CopyResource(s->staging.Get(), s->state.buf.Get());
             s->stagingPending = true;
+            s->runsCopied = s->runs;
         }
     }
     ReleaseSRWLockShared(&g_streamLock);

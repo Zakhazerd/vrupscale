@@ -109,6 +109,8 @@ struct Config {
     float localAgree = 1.0f;         // input px within which neighbouring / last frame's motion counts as agreeing
     float localAperture = 0.3f;      // smallest/largest structure-tensor eigenvalue below which motion is not determined
     int workMargin = 128;            // input px around the region where the luma pyramid is built (it is needed only there)
+    bool commandLists = true;        // record each texture's passes once into a command list and replay it (fewer calls
+                                     // on SteamVR's thread); off: issue them call by call
     bool sharpHistory = false;       // resample the history with Lanczos-3 (else Catmull-Rom: cheaper, a little softer)
     bool bilinearEdges = false;      // outside temporalArea: bilinear instead of Catmull-Rom (cheaper, softer)
 
@@ -214,6 +216,8 @@ struct DebugStats {
     LONG drawHookCalls;
     LONG copyHookCalls;
     LONG extraBodies;     // context-method bodies hooked after the first installation
+    LONG listsRecorded;   // temporal runs recorded into a command list
+    LONG listsReplayed;   // temporal runs replayed from one
 };
 extern DebugStats g_stats;
 

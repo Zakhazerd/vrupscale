@@ -156,6 +156,19 @@ protected:
     ~TexState() override;
 };
 
+// The temporal passes of one view, recorded once into a command list and replayed for every run
+// after (temporal.cpp: StreamListReady), with what they were recorded for: the stream (by id, never
+// reused) and the views the passes bind (held, so their addresses cannot be reused either), the
+// texture's size, and which passes and shader variants were recorded (shape).
+struct RecordedRun {
+    Ref<ID3D11CommandList> list;
+    int streamId = 0;
+    Ref<ID3D11ShaderResourceView> src;
+    Ref<ID3D11UnorderedAccessView> proxy, probeMem, probeBox, link;
+    UINT tw = 0, th = 0, n = 0;
+    uint32_t shape = 0;
+};
+
 class ViewEntry final : public RefObj {
 public:
     ViewEntry();
@@ -165,6 +178,7 @@ public:
     Ref<TexState> tex;
     Ref<ID3D11ShaderResourceView> srcRead;   // all slices of the source, typed for reading
     Ref<ID3D11ShaderResourceView> proxySRV;  // same desc as the compositor's view, on the proxy
+    RecordedRun rec;                         // render thread only (g_workLock)
 protected:
     ~ViewEntry() override;
 };
@@ -196,6 +210,12 @@ struct DevState {
     Ref<ID3D11ComputeShader> cs[SH_COUNT];
     Ref<ID3D11Buffer> cb;          // spatial-path parameters
     Ref<ID3D11Buffer> tcb;         // temporal-path parameters
+    // Recording the temporal passes into command lists: the deferred context they are recorded on,
+    // and the parameters the lists read (updated before each replay). Made on first use.
+    Ref<ID3D11DeviceContext> rec;
+    Ref<ID3D11Buffer> tcbRec;
+    bool recFailed = false;        // not available on this device: passes issued call by call
+    uint32_t batchSeq = 0;         // batches of work on the immediate context (a sample is timed)
     Ref<ID3D11SamplerState> samp;  // linear clamp
     Ref<ID3D11Texture2D> scratch;
     Ref<ID3D11ShaderResourceView> scratchSRV;
@@ -211,7 +231,6 @@ struct DevState {
     int activeBatch = -1;          // the QuerySet timing the batch being recorded now (-1: none)
     // content check of the spatial path: fingerprint and the indirect args it leaves (used at once)
     Ref<ID3D11Buffer> gateFp, gateArgs;
-    Ref<ID3D11ShaderResourceView> gateFpSRV;
     Ref<ID3D11UnorderedAccessView> gateFpUAV, gateArgsUAV;
     double passMs[kTPasses] = {};    // sums over new frames' updates since the last stats line / debug read
     int passRuns = 0;                // those updates
@@ -224,12 +243,76 @@ struct DevState {
 
 bool UavStoreSupported(DevState *ds, DXGI_FORMAT f);
 
-// Sets compute SRV slots 0..7 and UAV slots 0..7 (unlisted slots become null). UAVs are cleared
-// first so a texture written by the previous pass can be bound for reading by this one.
+// Sets compute SRV slots 0..7 and UAV slots 0..7 (unlisted slots become null). The UAVs are set
+// first, so a texture written by the previous pass can be bound for reading by this one.
 void BindCS(ID3D11DeviceContext *ctx, std::initializer_list<ID3D11ShaderResourceView *> srvs,
             std::initializer_list<ID3D11UnorderedAccessView *> uavs);
+void SetCS(ID3D11DeviceContext *ctx, ID3D11ComputeShader *shader);
+void SetCSConstants(ID3D11DeviceContext *ctx, ID3D11Buffer *cb);   // slot 0
+// The compute bindings our passes last made on one context, so that BindCS, SetCS and
+// SetCSConstants skip what is bound already (consecutive passes share many views, and every one of
+// these calls costs SteamVR's thread CPU time). Active for its scope (a nested scope saves and
+// restores the outer one); used under g_workLock. cleared: the context's compute stage is known to
+// be empty (a deferred context that was just reset); otherwise the first binding of each is made in full.
+struct CsCache {
+    ID3D11DeviceContext *ctx = nullptr;
+    ID3D11ComputeShader *shader = nullptr;
+    ID3D11Buffer *cb = nullptr;
+    ID3D11ShaderResourceView *srv[kCsSrvSlots] = {};
+    ID3D11UnorderedAccessView *uav[kCsUavSlots] = {};
+    UINT nsrv = 0, nuav = 0;   // slots that may hold something other than null
+};
+void CsCacheBegin(ID3D11DeviceContext *ctx, bool cleared, CsCache &outer);   // outer: saved, for CsCacheEnd
+void CsCacheEnd(const CsCache &outer);
+class CsCacheScope {
+public:
+    CsCacheScope(ID3D11DeviceContext *ctx, bool cleared);
+    ~CsCacheScope();
+    CsCacheScope(const CsCacheScope &) = delete;
+    CsCacheScope &operator=(const CsCacheScope &) = delete;
+private:
+    CsCache saved_;
+};
 
 // ---- temporal.cpp ---------------------------------------------------------------------------
+
+struct TParams {   // cbuffer TParams in temporal.hlsl
+    uint32_t size01[4];
+    uint32_t size23[4];
+    uint32_t size4out[4];
+    float scaleInfo[4];
+    uint32_t rcasCon[4];
+    float tune0[4];
+    float tune1[4];
+    uint32_t misc[4];
+    float debugFlow[4];
+    float tune2[4];
+    uint32_t region[4];      // output region with history: x0, y0, w, h
+    uint32_t lkCells[4];     // L3 cells: first x, y, count x, y (strided)
+    uint32_t refCells[4];    // L2 cells: first x, y, count x, y
+    uint32_t searchBox[4];   // L4 pixels: x0, y0, w, h
+    uint32_t strides[4];     // LK cell step, global-fit step (in LK cells), 0, 0
+    uint32_t srcRect[4];     // content origin in the source x, y | source texture w, h
+    uint32_t dstRect[4];     // content origin in the proxy x, y | proxy w, h
+    uint32_t marks[4];       // gaze ring x, y | calibration cross x, y (content output px; ~0u = none)
+    float tune3[4];          // localCheck (bits), localAgree (input px), localAperture, 0
+    uint32_t work[4];        // L4 pixels the pyramid is built over (x0, y0, x1, y1): the region and a margin
+    uint32_t sharp[4];       // the sharpening area: w, h (centred on the region, at least its size), 0, 0
+};
+static_assert(sizeof(TParams) == 336, "cbuffer layout must match temporal.hlsl");
+
+class ContentProbe;
+// One temporal run: its parameters and what it binds, worked out on the CPU (PrepareStream), then
+// issued call by call or by replaying the view's recorded command list (RunStream).
+struct StreamRun {
+    StreamLink *link = nullptr;
+    ViewEntry *ve = nullptr;
+    ContentProbe *probe = nullptr;
+    uint32_t sliceMask = 0;
+    UINT tw = 0, th = 0, n = 0;
+    uint32_t shape = 0;        // which passes and shader variants it issues (SHAPE_* in temporal.cpp)
+    TParams p;
+};
 
 // Identifies where a draw renders to (render target description + viewport). Used only to
 // decide whether a new texture continues an existing eye history; robust to swap-chain rotation.
@@ -253,7 +336,13 @@ StreamLink *ResolveStream(DevState *ds, ID3D11DeviceContext *ctx, ViewEntry *ve,
 void ReleaseLink(StreamLink &l);
 bool StreamWantsRun(StreamLink *link, TexState *ts, LONGLONG now, LONGLONG dedupeTicks);
 void StreamTouch(StreamLink *link, TexState *ts, LONGLONG now);
-void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now);
+void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, StreamRun &r);
+// True if r can be replayed from its view's command list: recorded now if it has none for r's
+// stream, views and shape. False when command lists are not available (then issue it call by call).
+bool StreamListReady(DevState *ds, StreamRun &r);
+// replay: from the command list (the context's state is left as it was); otherwise call by call,
+// on the context's compute stage as saved by the caller.
+void RunStream(ID3D11DeviceContext *ctx, DevState *ds, StreamRun &r, bool replay, LONGLONG now);
 void ReleaseStreamRef(Stream *s);
 void TemporalSweep();
 void TemporalResetAll(const char *why);
@@ -264,6 +353,9 @@ void TemporalResetAll(const char *why);
 void PollQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait = false);
 extern const char *const kTPassNames[kTPasses];
 extern const UINT kTParamsBytes;   // size of the temporal passes' constant buffer
+// Set when replayed command lists turned out not to run on the GPU (TemporalPollCounters): every
+// run is issued call by call from then on.
+extern volatile LONG g_listsOff;
 // Bumped by every settings change: proxies are repainted even if their source did not change.
 extern volatile LONG g_outGen;
 bool CreateGateResources(DevState *ds);

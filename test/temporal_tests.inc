@@ -844,6 +844,79 @@ static void Upload1(Gfx &g, ID3D11Texture2D *t, const Image &im)
     g.ctx->UpdateSubresource(t, 0, nullptr, bytes.data(), im.w * 4, 0);
 }
 
+// The temporal passes replayed from command lists (the default) must give exactly what they give
+// issued one by one: a swapchain of 3 textures per eye drawn like SteamVR does (all three every
+// frame, newest last, each app frame shown twice), every draw compared pixel for pixel.
+static void RunCommandListTest(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
+{
+    printf("[temporal passes replayed from command lists vs issued one by one]\n");
+    EyeTarget tgt;
+    EnsureEyeTarget(g, tgt, mov.ow, mov.oh);
+    const int n = EnvStr("VRUPSCALE_TEST_CLFRAMES")[0] ? std::min(mov.frames - 1, atoi(EnvStr("VRUPSCALE_TEST_CLFRAMES"))) : 8;
+    std::vector<Image> out[2];
+    LONG recorded[2] = {}, replayed[2] = {}, runs[2] = {};
+    char ini[2048];
+    // no GPU timing: a timed batch issues its runs one by one (to time them pass by pass)
+    std::string base(iniBase);
+    const size_t at = base.find("[general]\n");
+    if (at != std::string::npos) base.insert(at + 10, "gpuTiming=0\n");
+    for (int pass = 0; pass < 2; ++pass) {
+        snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n"
+                 "sharpnessArea=0.8\n[temporal]\ntemporalArea=0.6\ncommandLists=%d\n", base.c_str(), reqShared, F, pass == 0 ? 1 : 0);
+        WriteIni(ini);
+        Pump(g);
+        ID3D11Texture2D *tex[2][3] = {};
+        ID3D11ShaderResourceView *v[2][3] = {};
+        for (int e = 0; e < 2; ++e)
+            for (int k = 0; k < 3; ++k) {
+                tex[e][k] = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, { mov.in[e][0] }, misc);
+                v[e][k] = MakeView(g, tex[e][k], DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, -1);
+            }
+        const DebugStats s0 = Stats();
+        for (int f = 1; f <= n; ++f) {
+            Upload1(g, tex[0][f % 3], mov.in[0][f]);
+            Upload1(g, tex[1][f % 3], mov.in[1][f]);
+            for (int c = 0; c < 2; ++c) {
+                for (int e = 0; e < 2; ++e)
+                    for (int j = 1; j <= 3; ++j) out[pass].push_back(DrawEye(g, tgt, v[e][(f + j) % 3], e, nullptr, true));
+                Sleep(4);
+            }
+        }
+        const DebugStats s1 = Stats();
+        recorded[pass] = s1.listsRecorded - s0.listsRecorded;
+        replayed[pass] = s1.listsReplayed - s0.listsReplayed;
+        runs[pass] = s1.temporalRuns - s0.temporalRuns;
+        ClearAll(g);
+        for (int e = 0; e < 2; ++e)
+            for (int k = 0; k < 3; ++k) { SafeRelease(v[e][k]); SafeRelease(tex[e][k]); }
+        Settle(g);   // the next pass starts with new streams
+    }
+    size_t diff = 0, total = 0;
+    float worst = 0;
+    for (size_t i = 0; i < out[0].size() && i < out[1].size(); ++i)
+        for (size_t k = 0; k < out[0][i].px.size() && k < out[1][i].px.size(); ++k) {
+            const float d = fabsf(out[0][i].px[k] - out[1][i].px[k]);
+            if (d > 0) ++diff;
+            worst = std::max(worst, d);
+            ++total;
+        }
+    if (diff) {   // which draws differ, and which pass is right (the newest texture's draw against the ground truth)
+        for (size_t i = 0; i < out[0].size() && i < out[1].size(); ++i) {
+            const int f = 1 + (int)(i / 12), e = (int)(i % 6) / 3, j = (int)(i % 3);
+            if (j != 2) continue;
+            printf("         frame %d eye %d (newest): lists %.2f dB, one by one %.2f dB vs ground truth\n", f, e,
+                   Compare(out[0][i], mov.gt[e][f]).psnr, Compare(out[1][i], mov.gt[e][f]).psnr);
+        }
+    }
+    CHECK(runs[0] > 0 && replayed[0] == runs[0] && recorded[0] >= 6 && recorded[0] <= 12 && replayed[1] == 0 && recorded[1] == 0,
+          "command lists: every temporal run replayed one (%ld of %ld, %ld recorded for 6 textures); none when off (%ld)",
+          (long)replayed[0], (long)runs[0], (long)recorded[0], (long)replayed[1]);
+    CHECK(out[0].size() == out[1].size() && total > 0 && diff == 0,
+          "replayed from command lists = issued one by one, every draw identical (%zu of %zu values differ, worst %.4f)", diff, total,
+          worst);
+    tgt.Release();
+}
+
 static void RunSwapchainPoolTest(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
 {
     printf("[swapchain drawn every frame, like SteamVR: 3 textures per eye, each app frame shown twice]\n");
@@ -1963,6 +2036,10 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
         return;
     }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "cl") == 0) {
+        RunCommandListTest(g, mov, tIniBase, reqShared, F, misc);
+        return;
+    }
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "sharparea") == 0) {
         EyeTarget t1;
         EnsureEyeTarget(g, t1, OW, OH);
@@ -2304,6 +2381,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         for (int k = 0; k < 3; ++k) { SafeRelease(pv[k][0]); SafeRelease(pv[k][1]); SafeRelease(pool[k]); }
     }
     Settle(g);
+    RunCommandListTest(g, mov, tIniBase, reqShared, F, misc);
     RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
     RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
     RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);

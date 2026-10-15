@@ -74,7 +74,7 @@ LONGLONG g_replanQpc = 0;   // when the textures were last re-planned (a setting
 volatile LONG g_texSerial = 0;
 
 // Interval counters for the periodic stats line
-struct Interval { volatile LONG ps, subs, upscales, draws; } g_iv;
+struct Interval { volatile LONG ps, subs, upscales, draws, batches, timed; } g_iv;
 // CPU time in the hook handlers during the interval: total and longest call (QPC ticks), calls
 volatile LONG64 g_hookTicks = 0, g_hookMax = 0;
 volatile LONG g_hookCalls = 0;
@@ -249,27 +249,111 @@ ViewEntry::ViewEntry() { InterlockedIncrement(&g_stats.liveViewEntries); }
 
 ViewEntry::~ViewEntry()
 {
+    DeferRelease(rec.list.Detach());
+    DeferRelease(rec.src.Detach());
+    DeferRelease(rec.proxy.Detach());
+    DeferRelease(rec.probeMem.Detach());
+    DeferRelease(rec.probeBox.Detach());
+    DeferRelease(rec.link.Detach());
     DeferRelease(proxySRV.Detach());
     DeferRelease(srcRead.Detach());
     DeferRelease(static_cast<IUnknown *>(tex.Detach()));
     InterlockedDecrement(&g_stats.liveViewEntries);
 }
 
+namespace {
+
+CsCache g_cs;   // (see CsCacheScope)
+
+void SetCsSrvs(ID3D11DeviceContext *ctx, UINT n, ID3D11ShaderResourceView *const *t)
+{
+    if (g_origCSSetShaderResources) g_origCSSetShaderResources(ctx, 0, n, t);
+    else ctx->CSSetShaderResources(0, n, t);
+}
+
+} // namespace
+
+void CsCacheBegin(ID3D11DeviceContext *ctx, bool cleared, CsCache &outer)
+{
+    outer = g_cs;
+    CsCache &c = g_cs;
+    c.ctx = ctx;
+    if (cleared) {   // nothing bound (a deferred context that was just reset)
+        c.shader = nullptr;
+        c.cb = nullptr;
+        for (auto &v : c.srv) v = nullptr;
+        for (auto &v : c.uav) v = nullptr;
+        c.nsrv = c.nuav = 0;
+        return;
+    }
+    // What is bound is not known: values no real binding has, so the first of each is set in full.
+    c.shader = reinterpret_cast<ID3D11ComputeShader *>(~uintptr_t(0));
+    c.cb = reinterpret_cast<ID3D11Buffer *>(~uintptr_t(0));
+    for (auto &v : c.srv) v = reinterpret_cast<ID3D11ShaderResourceView *>(~uintptr_t(0));
+    for (auto &v : c.uav) v = reinterpret_cast<ID3D11UnorderedAccessView *>(~uintptr_t(0));
+    c.nsrv = kCsSrvSlots;
+    c.nuav = kCsUavSlots;
+}
+
+void CsCacheEnd(const CsCache &outer) { g_cs = outer; }
+
+CsCacheScope::CsCacheScope(ID3D11DeviceContext *ctx, bool cleared) { CsCacheBegin(ctx, cleared, saved_); }
+
+CsCacheScope::~CsCacheScope() { CsCacheEnd(saved_); }
+
 void BindCS(ID3D11DeviceContext *ctx, std::initializer_list<ID3D11ShaderResourceView *> srvs,
             std::initializer_list<ID3D11UnorderedAccessView *> uavs)
 {
     ID3D11UnorderedAccessView *u[kCsUavSlots] = {};
     ID3D11ShaderResourceView *t[kCsSrvSlots] = {};
+    UINT nu = 0, nt = 0;
+    for (auto *v : uavs) if (nu < kCsUavSlots) u[nu++] = v;
+    for (auto *v : srvs) if (nt < kCsSrvSlots) t[nt++] = v;
     UINT keep[kCsUavSlots];
     for (UINT i = 0; i < kCsUavSlots; ++i) keep[i] = (UINT)-1;
-    ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, u, keep);
-    UINT i = 0;
-    for (auto *v : srvs) if (i < kCsSrvSlots) t[i++] = v;
-    if (g_origCSSetShaderResources) g_origCSSetShaderResources(ctx, 0, kCsSrvSlots, t);
-    else ctx->CSSetShaderResources(0, kCsSrvSlots, t);
-    i = 0;
-    for (auto *v : uavs) if (i < kCsUavSlots) u[i++] = v;
-    ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, u, keep);
+    CsCache &c = g_cs;
+    if (c.ctx != ctx) {
+        ID3D11UnorderedAccessView *none[kCsUavSlots] = {};
+        ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, none, keep);
+        SetCsSrvs(ctx, kCsSrvSlots, t);
+        ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, u, keep);
+        return;
+    }
+    // The writes first: they replace the previous pass's, which this pass may read. A view the
+    // previous pass read and this one writes is unbound from reading by the runtime; the reads then
+    // differ from the ones remembered (a pass never reads what it writes), so they are all set again.
+    const UINT un = std::max(nu, c.nuav);
+    if (un > 0 && memcmp(u, c.uav, un * sizeof(u[0])) != 0) {
+        ctx->CSSetUnorderedAccessViews(0, un, u, keep);
+        memcpy(c.uav, u, sizeof(u));
+    }
+    c.nuav = nu;
+    const UINT tn = std::max(nt, c.nsrv);
+    if (tn > 0 && memcmp(t, c.srv, tn * sizeof(t[0])) != 0) {
+        SetCsSrvs(ctx, tn, t);
+        memcpy(c.srv, t, sizeof(t));
+    }
+    c.nsrv = nt;
+}
+
+void SetCS(ID3D11DeviceContext *ctx, ID3D11ComputeShader *shader)
+{
+    CsCache &c = g_cs;
+    if (c.ctx == ctx) {
+        if (c.shader == shader) return;
+        c.shader = shader;
+    }
+    ctx->CSSetShader(shader, nullptr, 0);
+}
+
+void SetCSConstants(ID3D11DeviceContext *ctx, ID3D11Buffer *cb)
+{
+    CsCache &c = g_cs;
+    if (c.ctx == ctx) {
+        if (c.cb == cb) return;
+        c.cb = cb;
+    }
+    ctx->CSSetConstantBuffers(0, 1, &cb);
 }
 
 bool UavStoreSupported(DevState *ds, DXGI_FORMAT f)
@@ -945,6 +1029,9 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
 {
     ViewEntry *ve = job.ve;
     TexState *ts = ve->tex.Get();
+    // a command list recorded for this view's temporal passes holds its history's resources: not
+    // while the view is upscaled spatially (Temporal was switched off, or its eye is held spatial)
+    if (ve->rec.list) ve->rec = RecordedRun();
     const UINT w = ts->src.Width, h = ts->src.Height, slices = ts->src.ArraySize;
     const UINT first = job.first, count = job.count;
     const UINT ow = ts->plan.outW, oh = ts->plan.outH;
@@ -996,8 +1083,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         else if (argOffset == 24) ctx->Dispatch(gx, gy, count);
         else ctx->Dispatch(ax, ay, count);
     };
-    ID3D11Buffer *cb = ds->cb.Get();
-    ctx->CSSetConstantBuffers(0, 1, &cb);
+    SetCSConstants(ctx, ds->cb.Get());
 
     Params p = {};
     p.outSize[0] = ow; p.outSize[1] = oh;
@@ -1008,11 +1094,11 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         FsrEasuCon(p.con0, p.con1, p.con2, p.con3, (AF1)w, (AF1)h, (AF1)w, (AF1)h, (AF1)ow, (AF1)oh);
         p.flags = rcas ? 0u : finalFlags;
         if (!WriteParams(ctx, ds, p)) return;
-        ctx->CSSetShader(ds->cs[SH_FSR_EASU_X0 + x].Get(), nullptr, 0);
+        SetCS(ctx, ds->cs[SH_FSR_EASU_X0 + x].Get());
     } else {
         p.flags = finalFlags;
         if (!WriteParams(ctx, ds, p)) return;
-        ctx->CSSetShader(ds->cs[SH_FSR_BILIN_X0 + x].Get(), nullptr, 0);
+        SetCS(ctx, ds->cs[SH_FSR_BILIN_X0 + x].Get());
     }
     BindCS(ctx, { ve->srcRead.Get(), ve->srcRead.Get() }, { rcas ? ds->scratchUAV.Get() : ts->proxyUAV.Get() });
     Run(0);
@@ -1026,7 +1112,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         r.pad[0] = first;
         Common(r);
         if (WriteParams(ctx, ds, r)) {
-            ctx->CSSetShader(ds->cs[SH_FSR_RCAS_X0 + x].Get(), nullptr, 0);
+            SetCS(ctx, ds->cs[SH_FSR_RCAS_X0 + x].Get());
             BindCS(ctx, { ds->scratchSRV.Get(), ve->srcRead.Get() }, { ts->proxyUAV.Get() });
             Run(12);
         }
@@ -1041,7 +1127,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         o.pad[0] = first;
         Common(o);
         if (WriteParams(ctx, ds, o)) {
-            ctx->CSSetShader(ds->cs[(sharpOut ? SH_FSR_OUTSH_X0 : SH_FSR_OUTER_X0) + x].Get(), nullptr, 0);
+            SetCS(ctx, ds->cs[(sharpOut ? SH_FSR_OUTSH_X0 : SH_FSR_OUTER_X0) + x].Get());
             BindCS(ctx, { ve->srcRead.Get(), ve->srcRead.Get() }, { ts->proxyUAV.Get() });
             Run(24);
         }
@@ -1061,74 +1147,127 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     if (k < g_tallyCount) g_tally[k].count++;
 }
 
+// The compute-stage bindings of the compositor's context (and its pixel-shader views), saved before
+// the first pass issued call by call and restored when the batch is done. Runs replayed from
+// command lists need none of it: ExecuteCommandList restores the context's state itself.
+class SavedState {
+public:
+    explicit SavedState(CtxState *cs) : cs_(cs) {}
+    ~SavedState() { Restore(); }
+    SavedState(const SavedState &) = delete;
+    SavedState &operator=(const SavedState &) = delete;
+
+    void Take(DevState *ds)
+    {
+        if (taken_) return;
+        taken_ = true;
+        ID3D11DeviceContext *ctx = cs_->ctx;
+        ctx->CSGetShader(oldCS_.Put(), nullptr, nullptr);
+        ctx->CSGetShaderResources(0, kCsSrvSlots, oldSRV_);
+        ctx->CSGetUnorderedAccessViews(0, kCsUavSlots, oldUAV_);
+        if (cs_->ctx1) cs_->ctx1->CSGetConstantBuffers1(0, 1, &oldCB_, &cbFirst_, &cbNum_);
+        else ctx->CSGetConstantBuffers(0, 1, &oldCB_);
+        ctx->CSGetSamplers(0, 1, &oldSamp_);
+        // Binding a proxy as a UAV makes the runtime silently unbind it from PS slots; remember them.
+        nps_ = (UINT)(cs_->hi + 1);
+        if (nps_ > 0) ctx->PSGetShaderResources(0, nps_, oldPS_);
+        CsCacheBegin(ctx, false, outerCache_);
+        ID3D11SamplerState *samp = ds->samp.Get();
+        ctx->CSSetSamplers(0, 1, &samp);
+    }
+
+    bool taken() const { return taken_; }
+
+private:
+    void Restore()
+    {
+        if (!taken_) return;
+        taken_ = false;
+        ID3D11DeviceContext *ctx = cs_->ctx;
+        // Restore compute state exactly as it was (ours unbound first, so nothing conflicts).
+        BindCS(ctx, {}, {});
+        CsCacheEnd(outerCache_);
+        ctx->CSSetShader(oldCS_.Get(), nullptr, 0);
+        if (g_origCSSetShaderResources) g_origCSSetShaderResources(ctx, 0, kCsSrvSlots, oldSRV_);
+        else ctx->CSSetShaderResources(0, kCsSrvSlots, oldSRV_);
+        UINT keep[kCsUavSlots];
+        for (UINT i = 0; i < kCsUavSlots; ++i) keep[i] = (UINT)-1;
+        ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, oldUAV_, keep);
+        if (cs_->ctx1 && oldCB_ && (cbFirst_ != 0 || cbNum_ != D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT))
+            cs_->ctx1->CSSetConstantBuffers1(0, 1, &oldCB_, &cbFirst_, &cbNum_);   // keep D3D11.1 offsets
+        else
+            ctx->CSSetConstantBuffers(0, 1, &oldCB_);
+        ctx->CSSetSamplers(0, 1, &oldSamp_);
+        for (UINT i = 0; i < kCsSrvSlots; ++i) if (oldSRV_[i]) oldSRV_[i]->Release();
+        for (UINT i = 0; i < kCsUavSlots; ++i) if (oldUAV_[i]) oldUAV_[i]->Release();
+        if (oldCB_) oldCB_->Release();
+        if (oldSamp_) oldSamp_->Release();
+        // Re-bind the pixel-shader views (including the proxies the UAV binding just evicted).
+        if (nps_ > 0) {
+            g_origPSSetShaderResources(ctx, 0, nps_, oldPS_);
+            for (UINT s = 0; s < nps_; ++s)
+                if (oldPS_[s]) oldPS_[s]->Release();
+        }
+    }
+
+    CtxState *cs_;
+    bool taken_ = false;
+    Ref<ID3D11ComputeShader> oldCS_;
+    ID3D11ShaderResourceView *oldSRV_[kCsSrvSlots] = {};
+    ID3D11UnorderedAccessView *oldUAV_[kCsUavSlots] = {};
+    ID3D11Buffer *oldCB_ = nullptr;
+    UINT cbFirst_ = 0, cbNum_ = 0;
+    ID3D11SamplerState *oldSamp_ = nullptr;
+    UINT nps_ = 0;
+    ID3D11ShaderResourceView *oldPS_[kSlots] = {};
+    CsCache outerCache_;
+};
+
 void RunJobs(CtxState *cs, SJob *spatial, int ns, TJob *tj, int nt, LONGLONG now)
 {
     DevState *ds = cs->ds;
     ID3D11DeviceContext *ctx = cs->ctx;
 
-    // Snapshot every compute-stage binding our passes touch.
-    Ref<ID3D11ComputeShader> oldCS;
-    ctx->CSGetShader(oldCS.Put(), nullptr, nullptr);
-    ID3D11ShaderResourceView *oldSRV[kCsSrvSlots] = {};
-    ctx->CSGetShaderResources(0, kCsSrvSlots, oldSRV);
-    ID3D11UnorderedAccessView *oldUAV[kCsUavSlots] = {};
-    ctx->CSGetUnorderedAccessViews(0, kCsUavSlots, oldUAV);
-    ID3D11Buffer *oldCB = nullptr;
-    UINT cbFirst = 0, cbNum = 0;
-    if (cs->ctx1) cs->ctx1->CSGetConstantBuffers1(0, 1, &oldCB, &cbFirst, &cbNum);
-    else ctx->CSGetConstantBuffers(0, 1, &oldCB);
-    ID3D11SamplerState *oldSamp = nullptr;
-    ctx->CSGetSamplers(0, 1, &oldSamp);
-    // Binding a proxy as a UAV makes the runtime silently unbind it from PS slots; remember them.
-    const UINT nps = (UINT)(cs->hi + 1);
-    ID3D11ShaderResourceView *oldPS[kSlots] = {};
-    if (nps > 0) ctx->PSGetShaderResources(0, nps, oldPS);
-
-    // Deferred contexts cannot read query results, so only immediate-context work is timed. The
-    // temporal runs take their per-pass timestamps inside this batch's disjoint query.
-    QuerySet *qs = (cs->immediate && g_cfg.gpuTiming) ? AcquireQuerySet(ds, ctx) : nullptr;
-    if (cs->immediate) InterlockedIncrement(&g_jobBatches);
+    // Deferred contexts cannot read query results, so only immediate-context work is timed: a sample
+    // of the batches (the app's GPU figure; every timed batch adds queries and their readback to
+    // SteamVR's frame), and with them at most 20 temporal runs a second pass by pass, inside the
+    // batch's disjoint query.
+    const bool passDue = nt > 0 && now - ds->passTimedQpc >= g_qpf.QuadPart / 20;
+    QuerySet *qs = nullptr;
+    if (cs->immediate) {
+        InterlockedIncrement(&g_jobBatches);
+        if (g_cfg.gpuTiming && (passDue || ++ds->batchSeq % 7 == 0)) qs = AcquireQuerySet(ds, ctx);
+    }
+    InterlockedIncrement(&g_iv.batches);
+    if (qs) InterlockedIncrement(&g_iv.timed);
     if (qs) {
         ctx->Begin(qs->dj.Get());
         ctx->End(qs->t0.Get());
         ds->activeBatch = (int)(qs - ds->q);
     }
-    ID3D11SamplerState *samp = ds->samp.Get();
-    ctx->CSSetSamplers(0, 1, &samp);
 
+    // Temporal runs replay their view's command list (recorded on first use) unless this batch times
+    // them pass by pass; anything issued call by call saves the context's compute state first.
+    const bool replayOk = cs->immediate && g_cfg.commandLists && !g_listsOff && !(qs && passDue);
+    SavedState saved(cs);
+    if (ns > 0) saved.Take(ds);
     for (int i = 0; i < ns; ++i) SpatialUpscale(ctx, ds, spatial[i], now);
-    for (int i = 0; i < nt; ++i) RunStream(ctx, ds, tj[i].link, tj[i].ve, now);
+    for (int i = 0; i < nt; ++i) {
+        StreamRun r;
+        PrepareStream(ds, tj[i].link, tj[i].ve, now, r);
+        const bool replay = replayOk && StreamListReady(ds, r);
+        if (!replay) {
+            saved.Take(ds);
+            if (tj[i].ve->rec.list && (!g_cfg.commandLists || g_listsOff)) tj[i].ve->rec = RecordedRun();   // (holds the history's resources)
+        }
+        RunStream(ctx, ds, r, replay, now);
+    }
     ds->activeBatch = -1;
 
     if (qs) {
         ctx->End(qs->t1.Get());
         ctx->End(qs->dj.Get());
         qs->busy = true;
-    }
-
-    // Restore compute state exactly as it was (ours unbound first, so nothing conflicts).
-    BindCS(ctx, {}, {});
-    ctx->CSSetShader(oldCS.Get(), nullptr, 0);
-    if (g_origCSSetShaderResources) g_origCSSetShaderResources(ctx, 0, kCsSrvSlots, oldSRV);
-    else ctx->CSSetShaderResources(0, kCsSrvSlots, oldSRV);
-    UINT keep[kCsUavSlots];
-    for (UINT i = 0; i < kCsUavSlots; ++i) keep[i] = (UINT)-1;
-    ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, oldUAV, keep);
-    if (cs->ctx1 && oldCB && (cbFirst != 0 || cbNum != D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT))
-        cs->ctx1->CSSetConstantBuffers1(0, 1, &oldCB, &cbFirst, &cbNum);   // keep D3D11.1 offsets
-    else
-        ctx->CSSetConstantBuffers(0, 1, &oldCB);
-    ctx->CSSetSamplers(0, 1, &oldSamp);
-    for (UINT i = 0; i < kCsSrvSlots; ++i) if (oldSRV[i]) oldSRV[i]->Release();
-    for (UINT i = 0; i < kCsUavSlots; ++i) if (oldUAV[i]) oldUAV[i]->Release();
-    if (oldCB) oldCB->Release();
-    if (oldSamp) oldSamp->Release();
-
-    // Re-bind the pixel-shader views (including the proxies the UAV binding just evicted).
-    if (nps > 0) {
-        g_origPSSetShaderResources(ctx, 0, nps, oldPS);
-        for (UINT s = 0; s < nps; ++s)
-            if (oldPS[s]) oldPS[s]->Release();
     }
 }
 
@@ -1261,6 +1400,17 @@ void LogStats(ID3D11DeviceContext *ctx, double seconds)
         char hits[256];
         FormatHookVariantHits(hits, sizeof(hits));
         if (hits[0]) LOGI("stats:   %s", hits);
+    }
+    {   // how the temporal runs were issued (command lists: two calls each on SteamVR's thread)
+        static LONG lastRuns = 0, lastReplayed = 0, lastRecorded = 0;
+        const LONG runs = g_stats.temporalRuns, replayed = g_stats.listsReplayed, recorded = g_stats.listsRecorded;
+        const LONG batches = InterlockedExchange(&g_iv.batches, 0), timed = InterlockedExchange(&g_iv.timed, 0);
+        if (runs != lastRuns)
+            LOGI("stats:   temporal runs=%ld (%ld replayed from command lists, %ld recorded) in %ld batches of work (%ld GPU-timed)",
+                 (long)(runs - lastRuns), (long)(replayed - lastReplayed), (long)(recorded - lastRecorded), (long)batches, (long)timed);
+        lastRuns = runs;
+        lastReplayed = replayed;
+        lastRecorded = recorded;
     }
     for (int k = 0; k < g_tallyCount; ++k)
         LOGI("stats:   spatial %ux%u x%u %s -> %ux%u: %ld draws checked (upscaled when the content changed)", g_tally[k].w,

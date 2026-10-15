@@ -19,7 +19,7 @@
 struct DebugStats {
     LONG hooksInstalled, shadersReady, liveTexStates, liveViewEntries, upscales, psHookCalls, substitutions,
         rejects, sharedOpened, copiesMarked, deferredPending, liveStreams, temporalRuns, csHookCalls, drawHookCalls,
-        copyHookCalls, extraBodies;
+        copyHookCalls, extraBodies, listsRecorded, listsReplayed;
 };
 typedef int (*PFN_GetStats)(void *, int);
 typedef void (*PFN_Reload)();
@@ -604,6 +604,26 @@ int main(int argc, char **argv)
             WritePrivateProfileStringA("general", "hotkeys", "1", g_iniPath.c_str());
             WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
             g_reload();
+        }
+        {   // VRUPSCALE_TEST_SERVE_SET: "section.key=value;..." settings on top (e.g. temporal.commandLists=0)
+            std::string set = EnvStr("VRUPSCALE_TEST_SERVE_SET");
+            bool any = false;
+            for (size_t i = 0; i < set.size();) {
+                size_t j = set.find(';', i);
+                if (j == std::string::npos) j = set.size();
+                const std::string item = set.substr(i, j - i);
+                const size_t dot = item.find('.'), eq = item.find('=');
+                if (dot != std::string::npos && eq != std::string::npos && dot < eq) {
+                    WritePrivateProfileStringA(item.substr(0, dot).c_str(), item.substr(dot + 1, eq - dot - 1).c_str(),
+                                               item.substr(eq + 1).c_str(), g_iniPath.c_str());
+                    any = true;
+                }
+                i = j + 1;
+            }
+            if (any) {
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                g_reload();
+            }
         }
         ID3D11ShaderResourceView *ev[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
                                             MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };

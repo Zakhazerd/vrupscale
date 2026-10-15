@@ -8,8 +8,8 @@
 // the input pixels.
 //
 // Passes (TPASS), in dispatch order for one eye stream:
-//   FP      1/64 input  sparse frame fingerprint (one sample per 8x8 block)
-//   DECIDE  1 thread    new frame? -> indirect-dispatch args for everything below
+//   FP      1/64 input  sparse frame fingerprint (one sample per 8x8 block); then its last group
+//                       DECIDEs: new frame? -> indirect-dispatch args for everything below
 //   LUMA    input res   perceptual luma, straight to the L1 level of the pyramid
 //   DOWN    L2..L4      2x2 pyramid, plus (I, dI/dx, dI/dy) packs for L1..L3
 //   SEARCH  L4          integer block search (+ last frame's flow as predictor)
@@ -22,10 +22,10 @@
 //                       RCAS over that inside the sharpening area (SHARPEN)
 //   MARGIN  proxy res   outside the content rectangle (repaints only; see below)
 //   COPY    L1..L4      cur pyramid -> prev pyramid
-// Every pass after DECIDE is launched with DispatchIndirect; for a repeated frame (the compositor
+// Every pass after FP is launched with DispatchIndirect; for a repeated frame (the compositor
 // re-sampling the same app frame, or drawing the app's other swapchain textures) the arguments are
-// zero and nothing runs. The spatial path uses FP too, with SDECIDE, so it also upscales a texture
-// only when its content changed. History is ping-ponged
+// zero and nothing runs. The spatial path uses FP too, deciding with SDECIDE, so it also upscales
+// a texture only when its content changed. History is ping-ponged
 // between two textures whose roles are tracked on the GPU, so the CPU never needs a readback.
 //
 // Foveation: history, accumulation and motion estimation cover only Region, a centred rectangle
@@ -52,7 +52,6 @@
 // Colour is processed in a perceptual space (see XFORM), exactly like the FSR 1 path.
 
 #define TP_LUMA   0
-#define TP_DECIDE 1
 #define TP_DOWN   2
 #define TP_SEARCH 3
 #define TP_LK     4
@@ -63,7 +62,6 @@
 #define TP_REFINE 9
 #define TP_OUTER  10
 #define TP_FP     11
-#define TP_SDECIDE 12
 #define TP_MARGIN 13
 
 #ifndef TPASS
@@ -80,6 +78,9 @@
 #endif
 #ifndef LOCAL        // REFINE: 1 = search local motion where the global model fails (localTrust > 0)
 #define LOCAL 1
+#endif
+#ifndef FPMODE       // FP: what its last group decides: 1 = DECIDE (temporal), 2 = SDECIDE (spatial)
+#define FPMODE 1
 #endif
 
 #define A_GPU 1
@@ -252,11 +253,128 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
 
 // Frame fingerprint from one pixel per 8x8 block (at a fixed pseudo-random spot in each block):
 // cheap enough to run every time the compositor draws a texture, and any real new frame (head
-// motion moves the whole image; animation moves whole regions) changes it.
-Texture2DArray<float4> Src : register(t0);
-RWByteAddressBuffer    Fp : register(u0);
-RWByteAddressBuffer    ProbeMem : register(u1);   // last sample of each 8x8 block (per slice), bit 31 set
-RWByteAddressBuffer    ProbeBox : register(u2);   // changed samples: min x, min y, ~max x, ~max y (min only)
+// motion moves the whole image; animation moves whole regions) changes it. The group that finishes
+// last (a counter in Fp) then decides, in the same dispatch: DECIDE (temporal) or SDECIDE (spatial).
+Texture2DArray<float4>               Src : register(t0);
+globallycoherent RWByteAddressBuffer Fp : register(u0);         // fingerprint x, y; groups done
+RWByteAddressBuffer                  ProbeMem : register(u1);   // last sample of each 8x8 block (per slice), bit 31 set
+RWByteAddressBuffer                  ProbeBox : register(u2);   // changed samples: min x, min y, ~max x, ~max y (min only)
+
+#if FPMODE == 1
+// ---- DECIDE: new frame? Indirect-dispatch args for the passes after FP, and where the region is.
+RWByteAddressBuffer State : register(u3);
+RWByteAddressBuffer Args : register(u4);
+RWByteAddressBuffer Ctrl : register(u5);
+RWByteAddressBuffer Link : register(u6);   // this texture's proxy: fingerprint it shows (x, y), valid
+
+// State (bytes): 0 cur history, 4 valid, 8 ring count, 12 ring head, 16..47 ring (4 x uint2),
+//                48 new frames, 52 calls, 56 forced outputs, 60 origin of the history (packed)
+#define RING 4
+// Indirect-argument entries (12 bytes each); must match temporal.cpp
+#define A_DOWN2  0
+#define A_DOWN3  1
+#define A_DOWN4  2
+#define A_SEARCH 3
+#define A_LK     4
+#define A_ACC01  5
+#define A_ACC10  6
+#define A_OUT1   7
+#define A_OUT0   8
+#define A_COPY   9
+#define A_GLOBAL 10
+#define A_REFINE 11
+#define A_OUTER  12
+#define A_LUMA   13
+#define A_MARGIN 14
+
+void SetArgs(uint e, uint3 g) { Args.Store3(e * 12, g); }
+uint3 G8(uint2 s)  { return uint3((s + 7) / 8, Misc.z); }
+uint3 G16(uint2 s) { return uint3((s + 15) / 16, Misc.z); }
+
+void Decide(uint2 fp)
+{
+    uint cur = State.Load(0);
+    uint valid = State.Load(4);
+    uint count = State.Load(8);
+    uint head = State.Load(12);
+    if (Misc.y & TF_RESET) { valid = 0; count = 0; head = 0; cur = 0; }
+
+    bool seen = false;
+    [unroll] for (uint i = 0; i < RING; ++i) {
+        uint2 e = State.Load2(16 + i * 8);
+        if (i < count && e.x == fp.x && e.y == fp.y) seen = true;
+    }
+    bool isNew = !seen;
+    bool first = valid == 0;
+    if (isNew) {
+        State.Store2(16 + head * 8, fp);
+        head = (head + 1) % RING;
+        count = min(count + 1, RING);
+    }
+
+    uint3 z0 = uint3(0, 0, 0);
+    uint want = PackOrg(Region.xy);
+    uint held = first ? want : State.Load(60);    // no history yet: nothing to carry over
+    uint use = isNew ? want : held;
+    SetArgs(A_LUMA,   isNew ? G8(WorkHi(1) - WorkLo(1)) : z0);   // a group: 8x8 L1 pixels
+    SetArgs(A_DOWN2,  isNew ? G8(WorkHi(2) - WorkLo(2)) : z0);
+    SetArgs(A_DOWN3,  isNew ? G8(WorkHi(3) - WorkLo(3)) : z0);
+    SetArgs(A_DOWN4,  isNew ? G8(WorkHi(4) - WorkLo(4)) : z0);
+    SetArgs(A_SEARCH, isNew ? G8(SearchBox.zw) : z0);
+    SetArgs(A_LK,     isNew ? G8(LkCells.zw) : z0);
+    SetArgs(A_ACC01,  (isNew && cur == 0) ? G16(Region.zw) : z0);
+    SetArgs(A_ACC10,  (isNew && cur != 0) ? G16(Region.zw) : z0);
+    uint ncur = isNew ? (1 - cur) : cur;
+    // The history always holds the stream's newest frame. Repaint this texture's proxy when this
+    // frame is new, when the proxy was never written, or when the texture now holds the newest
+    // frame but its proxy shows something else (a rotating pool re-filled with an identical frame).
+    // An older frame shown again (e.g. by motion smoothing) keeps the proxy it already has.
+    uint2 newest = State.Load2(16 + ((head + RING - 1) % RING) * 8);
+    uint3 lk = Link.Load3(0);
+    bool stale = lk.z == 0 || lk.x != fp.x || lk.y != fp.y;
+    bool writeOut = isNew || (Misc.y & TF_FORCE) != 0 || (stale && count > 0 && newest.x == fp.x && newest.y == fp.y);
+    if (writeOut) Link.Store3(0, uint3(fp, 1u));
+    SetArgs(A_OUT1,   (writeOut && ncur == 1) ? G16(Region.zw) : z0);
+    SetArgs(A_OUT0,   (writeOut && ncur == 0) ? G16(Region.zw) : z0);
+    OuterTiles ot = GetOuterTiles(UnpackOrg(use));
+    uint on = OuterCount(ot);
+    SetArgs(A_OUTER,  (writeOut && on > 0u) ? uint3(ot.tx, (on + ot.tx - 1u) / ot.tx, Misc.z) : z0);
+    SetArgs(A_MARGIN, ((Misc.y & TF_FORCE) != 0 || ((Misc.y & TF_MARGIN) != 0 && writeOut)) ? G16(DstRect.zw) : z0);
+    SetArgs(A_COPY,   isNew ? G8(WorkHi(1) - WorkLo(1)) : z0);
+    SetArgs(A_GLOBAL, isNew ? uint3(1, 1, Misc.z) : z0);
+    SetArgs(A_REFINE, isNew ? G8(RefCells.zw) : z0);
+
+    State.Store(0, ncur);
+    State.Store(4, isNew ? 1u : valid);
+    State.Store(8, count);
+    State.Store(12, head);
+    State.Store(48, State.Load(48) + (isNew ? 1u : 0u));
+    State.Store(52, State.Load(52) + 1u);
+    State.Store(56, State.Load(56) + ((!isNew && writeOut) ? 1u : 0u));
+    State.Store(60, use);
+    Ctrl.Store4(0, uint4(first ? 1u : 0u, isNew ? 1u : 0u, held, use));
+}
+#else
+// ---- SDECIDE (spatial path): upscale only if this texture range's content changed since its proxy
+// was written (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the passes over the
+// area (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2).
+RWByteAddressBuffer Gate : register(u3);   // 0: fingerprint the proxy shows (x, y), 8: valid, 12: updates, 16: checks
+RWByteAddressBuffer Args : register(u4);   // three indirect-dispatch entries
+
+void Decide(uint2 fp)
+{
+    uint2 shown = Gate.Load2(0);
+    bool isNew = (Misc.y & TF_FORCE) != 0 || Gate.Load(8) == 0 || shown.x != fp.x || shown.y != fp.y;
+    uint3 g = isNew ? Strides.xyz : uint3(0, 0, 0);
+    Args.Store3(0, g);
+    Args.Store3(12, g);
+    Args.Store3(24, isNew ? uint3(Size23.xy, Strides.z) : uint3(0, 0, 0));
+    Gate.Store2(0, fp);
+    Gate.Store(8, 1u);
+    Gate.Store(12, Gate.Load(12) + (isNew ? 1u : 0u));
+    Gate.Store(16, Gate.Load(16) + 1u);
+}
+#endif
 
 groupshared uint2 gsH[64];
 groupshared uint gsBox[4];
@@ -322,132 +440,20 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
             ProbeBox.InterlockedMin(8, gsBox[2], dummy);
             ProbeBox.InterlockedMin(12, gsBox[3], dummy);
         }
+        // The group that counts itself done last finds every group's share in Fp (each added its
+        // share before counting itself): it decides.
+        DeviceMemoryBarrier();
+        uint done;
+        Fp.InterlockedAdd(8, 1u, done);
+        const uint groups = ((tex.x + 63u) / 64u) * ((tex.y + 63u) / 64u) * Misc.z;   // (the dispatch's size)
+        if (done == groups - 1u) {
+            DeviceMemoryBarrier();
+            uint fx, fy;
+            Fp.InterlockedAdd(0, 0u, fx);
+            Fp.InterlockedAdd(4, 0u, fy);
+            Decide(uint2(fx, fy));
+        }
     }
-}
-
-// =============================================================================================
-#elif TPASS == TP_SDECIDE
-
-// Spatial path: upscale only if this texture range's content changed since its proxy was written
-// (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the passes over the area
-// (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2).
-ByteAddressBuffer   Fp : register(t0);
-RWByteAddressBuffer Gate : register(u0);   // 0: fingerprint the proxy shows (x, y), 8: valid, 12: updates, 16: checks
-RWByteAddressBuffer Args : register(u1);   // three indirect-dispatch entries
-
-[numthreads(1, 1, 1)]
-void main()
-{
-    uint2 fp = Fp.Load2(0);
-    uint2 shown = Gate.Load2(0);
-    bool isNew = (Misc.y & TF_FORCE) != 0 || Gate.Load(8) == 0 || shown.x != fp.x || shown.y != fp.y;
-    uint3 g = isNew ? Strides.xyz : uint3(0, 0, 0);
-    Args.Store3(0, g);
-    Args.Store3(12, g);
-    Args.Store3(24, isNew ? uint3(Size23.xy, Strides.z) : uint3(0, 0, 0));
-    Gate.Store2(0, fp);
-    Gate.Store(8, 1u);
-    Gate.Store(12, Gate.Load(12) + (isNew ? 1u : 0u));
-    Gate.Store(16, Gate.Load(16) + 1u);
-}
-
-// =============================================================================================
-#elif TPASS == TP_DECIDE
-
-ByteAddressBuffer   Fp : register(t0);
-RWByteAddressBuffer State : register(u0);
-RWByteAddressBuffer Args : register(u1);
-RWByteAddressBuffer Ctrl : register(u2);
-RWByteAddressBuffer Link : register(u3);   // this texture's proxy: fingerprint it shows (x, y), valid
-
-// State (bytes): 0 cur history, 4 valid, 8 ring count, 12 ring head, 16..47 ring (4 x uint2),
-//                48 new frames, 52 calls, 56 forced outputs, 60 origin of the history (packed)
-#define RING 4
-// Indirect-argument entries (12 bytes each); must match temporal.cpp
-#define A_DOWN2  0
-#define A_DOWN3  1
-#define A_DOWN4  2
-#define A_SEARCH 3
-#define A_LK     4
-#define A_ACC01  5
-#define A_ACC10  6
-#define A_OUT1   7
-#define A_OUT0   8
-#define A_COPY   9
-#define A_GLOBAL 10
-#define A_REFINE 11
-#define A_OUTER  12
-#define A_LUMA   13
-#define A_MARGIN 14
-
-void SetArgs(uint e, uint3 g) { Args.Store3(e * 12, g); }
-uint3 G8(uint2 s)  { return uint3((s + 7) / 8, Misc.z); }
-uint3 G16(uint2 s) { return uint3((s + 15) / 16, Misc.z); }
-
-[numthreads(1, 1, 1)]
-void main()
-{
-    uint2 fp = Fp.Load2(0);
-    uint cur = State.Load(0);
-    uint valid = State.Load(4);
-    uint count = State.Load(8);
-    uint head = State.Load(12);
-    if (Misc.y & TF_RESET) { valid = 0; count = 0; head = 0; cur = 0; }
-
-    bool seen = false;
-    [unroll] for (uint i = 0; i < RING; ++i) {
-        uint2 e = State.Load2(16 + i * 8);
-        if (i < count && e.x == fp.x && e.y == fp.y) seen = true;
-    }
-    bool isNew = !seen;
-    bool first = valid == 0;
-    if (isNew) {
-        State.Store2(16 + head * 8, fp);
-        head = (head + 1) % RING;
-        count = min(count + 1, RING);
-    }
-
-    uint3 z0 = uint3(0, 0, 0);
-    uint want = PackOrg(Region.xy);
-    uint held = first ? want : State.Load(60);    // no history yet: nothing to carry over
-    uint use = isNew ? want : held;
-    SetArgs(A_LUMA,   isNew ? G8(WorkHi(1) - WorkLo(1)) : z0);   // a group: 8x8 L1 pixels
-    SetArgs(A_DOWN2,  isNew ? G8(WorkHi(2) - WorkLo(2)) : z0);
-    SetArgs(A_DOWN3,  isNew ? G8(WorkHi(3) - WorkLo(3)) : z0);
-    SetArgs(A_DOWN4,  isNew ? G8(WorkHi(4) - WorkLo(4)) : z0);
-    SetArgs(A_SEARCH, isNew ? G8(SearchBox.zw) : z0);
-    SetArgs(A_LK,     isNew ? G8(LkCells.zw) : z0);
-    SetArgs(A_ACC01,  (isNew && cur == 0) ? G16(Region.zw) : z0);
-    SetArgs(A_ACC10,  (isNew && cur != 0) ? G16(Region.zw) : z0);
-    uint ncur = isNew ? (1 - cur) : cur;
-    // The history always holds the stream's newest frame. Repaint this texture's proxy when this
-    // frame is new, when the proxy was never written, or when the texture now holds the newest
-    // frame but its proxy shows something else (a rotating pool re-filled with an identical frame).
-    // An older frame shown again (e.g. by motion smoothing) keeps the proxy it already has.
-    uint2 newest = State.Load2(16 + ((head + RING - 1) % RING) * 8);
-    uint3 lk = Link.Load3(0);
-    bool stale = lk.z == 0 || lk.x != fp.x || lk.y != fp.y;
-    bool writeOut = isNew || (Misc.y & TF_FORCE) != 0 || (stale && count > 0 && newest.x == fp.x && newest.y == fp.y);
-    if (writeOut) Link.Store3(0, uint3(fp, 1u));
-    SetArgs(A_OUT1,   (writeOut && ncur == 1) ? G16(Region.zw) : z0);
-    SetArgs(A_OUT0,   (writeOut && ncur == 0) ? G16(Region.zw) : z0);
-    OuterTiles ot = GetOuterTiles(UnpackOrg(use));
-    uint on = OuterCount(ot);
-    SetArgs(A_OUTER,  (writeOut && on > 0u) ? uint3(ot.tx, (on + ot.tx - 1u) / ot.tx, Misc.z) : z0);
-    SetArgs(A_MARGIN, ((Misc.y & TF_FORCE) != 0 || ((Misc.y & TF_MARGIN) != 0 && writeOut)) ? G16(DstRect.zw) : z0);
-    SetArgs(A_COPY,   isNew ? G8(WorkHi(1) - WorkLo(1)) : z0);
-    SetArgs(A_GLOBAL, isNew ? uint3(1, 1, Misc.z) : z0);
-    SetArgs(A_REFINE, isNew ? G8(RefCells.zw) : z0);
-
-    State.Store(0, ncur);
-    State.Store(4, isNew ? 1u : valid);
-    State.Store(8, count);
-    State.Store(12, head);
-    State.Store(48, State.Load(48) + (isNew ? 1u : 0u));
-    State.Store(52, State.Load(52) + 1u);
-    State.Store(56, State.Load(56) + ((!isNew && writeOut) ? 1u : 0u));
-    State.Store(60, use);
-    Ctrl.Store4(0, uint4(first ? 1u : 0u, isNew ? 1u : 0u, held, use));
 }
 
 // =============================================================================================
