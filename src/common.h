@@ -15,7 +15,7 @@
 #include <vector>
 #include <utility>
 
-#define VU_VERSION_STR "0.6.4"
+#define VU_VERSION_STR "0.6.6"
 
 namespace vu {
 
@@ -150,7 +150,7 @@ extern std::wstring g_iniPath;
 bool LoadConfig(Config &out);        // returns false if the file is missing (defaults kept)
 void SanitizeConfig(Config &c);
 void PrintConfig(const Config &c);
-bool ConfigFileChanged();            // cheap mtime poll
+bool ConfigFileChanged(bool *switched = nullptr);   // cheap mtime poll (switched: now another file)
 
 // ---------------------------------------------------------------------------------------------
 // Hooks / runtime

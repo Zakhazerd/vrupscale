@@ -600,6 +600,11 @@ int main(int argc, char **argv)
         snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n", kIniBase,
                  reqShared, F);
         WriteIni(ini);
+        if (EnvStr("VRUPSCALE_TEST_SERVE_HOTKEYS")[0] == '1') {   // the shortcuts, for pressing them from outside
+            WritePrivateProfileStringA("general", "hotkeys", "1", g_iniPath.c_str());
+            WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+            g_reload();
+        }
         ID3D11ShaderResourceView *ev[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
                                             MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
         std::vector<Image> wide = { Quantize8(MakePattern(1600, 400, 0, 1.0f)) };
@@ -645,7 +650,26 @@ int main(int argc, char **argv)
             for (int e = 0; e < 2; ++e)
                 for (int k = 0; k < 3; ++k) { SafeRelease(pv[e][k]); SafeRelease(pt[e][k]); }
         }
+        // VRUPSCALE_TEST_SERVE_HOTKEYS: a file "press" next to the harness holding a shortcut's number
+        // (0 = Ctrl+F1) presses it, as the upscaler's key polling would (for trying the app's mirroring)
+        typedef void (*PFN_Hotkey)(int);
+        HMODULE dxgiMod = GetModuleHandleA("dxgi.dll");
+        PFN_Hotkey serveHotkey = dxgiMod ? (PFN_Hotkey)GetProcAddress(dxgiMod, "VrUpscaleDebugHotkey") : nullptr;
+        const std::string pressFile = std::string(dir) + "\\press";
+        const bool pressFromFile = EnvStr("VRUPSCALE_TEST_SERVE_HOTKEYS")[0] == '1';
         while ((int32_t)(GetTickCount() - end) < 0) {
+            if (pressFromFile && serveHotkey) {
+                if (FILE *pf = fopen(pressFile.c_str(), "rb")) {
+                    int idx = -1;
+                    if (fscanf(pf, "%d", &idx) != 1) idx = -1;
+                    fclose(pf);
+                    DeleteFileA(pressFile.c_str());
+                    if (idx >= 0) {
+                        printf("pressed shortcut %d at %lu\n", idx, GetTickCount());
+                        serveHotkey(idx);
+                    }
+                }
+            }
             for (UINT e = 0; e < 2; ++e) {   // a 16x16 block: the frame fingerprint samples one pixel per 8x8
                 uint32_t px[256];
                 for (auto &p : px) p = 0xff000000u | (200u << 16) | ((128u + ((serial >> 7) & 127u)) << 8) | (128u + (serial & 127u));
@@ -795,14 +819,15 @@ int main(int argc, char **argv)
             PFN_Hotkey hotkey = dxgi ? (PFN_Hotkey)GetProcAddress(dxgi, "VrUpscaleDebugHotkey") : nullptr;
             CHECK(hotkey != nullptr, "shortcut test export present");
             if (hotkey) {
-                struct Before { float f; int32_t fast, bil; };
+                struct Before { float f; int32_t fast, bil, on; };
                 auto press = [&](int idx) {   // until the status shows the change
-                    const Before before = { st.current.upscaleFactor, st.current.fastHistory, st.current.bilinearEdges };
+                    const Before before = { st.current.upscaleFactor, st.current.fastHistory, st.current.bilinearEdges,
+                                            st.current.enabled };
                     hotkey(idx);
                     WaitStatus(g, sh, st, [](const VuStatus &x, const void *p) {
                         const Before *b = (const Before *)p;
                         return fabsf(x.current.upscaleFactor - b->f) > 0.001f || x.current.fastHistory != b->fast ||
-                               x.current.bilinearEdges != b->bil;
+                               x.current.bilinearEdges != b->bil || x.current.enabled != b->on;
                     }, &before);
                 };
                 auto factorNow = [&]() { return st.current.upscaleFactor; };
@@ -849,6 +874,55 @@ int main(int argc, char **argv)
                 press(6);
                 CHECK(bil0 == 0 && bil1 == 1 && st.current.bilinearEdges == 0,
                       "Ctrl+F7 switches Bilinear edges on and off again (off by default: %d %d %d)", bil0, bil1, st.current.bilinearEdges);
+
+                // A shortcut pressed twice in quick succession while the app saves the settings file in
+                // between: the app mirrors each change and saves it a moment later, so the file lags a
+                // step behind. Reading the file again must not take that older state back.
+                auto settle = [&]() {   // > 1 s: the upscaler looks at the file once a second
+                    for (int k = 0; k < 30; ++k) { Pump(g); Sleep(50); }
+                    ReadStatus(sh, st);
+                };
+                const int32_t on0 = st.current.enabled;
+                press(0);
+                const int32_t on1 = st.current.enabled;
+                WritePrivateProfileStringA("upscale", "enabled", "0", g_iniPath.c_str());   // the app saves what it mirrored
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                press(0);
+                const int32_t on2 = st.current.enabled;
+                settle();
+                CHECK(on0 == 1 && on1 == 0 && on2 == 1 && st.current.enabled == 1,
+                      "Ctrl+F1 twice in quick succession: on again, though the app saved the moment it was off in between "
+                      "(%d %d %d, then %d)", on0, on1, on2, st.current.enabled);
+                // the other way round: the app saves the second state first, then the file is read
+                WritePrivateProfileStringA("upscale", "enabled", "1", g_iniPath.c_str());
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                settle();
+                const int32_t bil2 = st.current.bilinearEdges;
+                press(6);   // Bilinear edges on
+                press(6);   // and off again before the app saved "on"
+                WritePrivateProfileStringA("temporal", "bilinearEdges", "1", g_iniPath.c_str());
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                settle();
+                CHECK(bil2 == 0 && st.current.bilinearEdges == 0 && st.current.enabled == 1,
+                      "Ctrl+F7 twice: off again, though the app saved the moment it was on (%d, then %d)", bil2,
+                      st.current.bilinearEdges);
+                // an edit by hand still counts
+                WritePrivateProfileStringA("upscale", "debugTint", "1", g_iniPath.c_str());
+                WritePrivateProfileStringA("temporal", "bilinearEdges", "0", g_iniPath.c_str());
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                settle();
+                const int32_t tintEdit = st.current.tint;
+                WritePrivateProfileStringA("upscale", "enabled", "0", g_iniPath.c_str());
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                settle();
+                const int32_t onEdit = st.current.enabled;
+                WritePrivateProfileStringA("upscale", "debugTint", "0", g_iniPath.c_str());
+                WritePrivateProfileStringA("upscale", "enabled", "1", g_iniPath.c_str());
+                WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
+                settle();
+                CHECK(tintEdit == 1 && onEdit == 0 && st.current.tint == 0 && st.current.enabled == 1,
+                      "edits to the settings file by hand still apply (debug tint %d, off %d, back %d %d)", tintEdit, onEdit,
+                      st.current.tint, st.current.enabled);
             }
 
             // excluding the eye texture's size leaves it alone, and the list says why

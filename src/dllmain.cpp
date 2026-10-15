@@ -199,6 +199,8 @@ void Init(HMODULE self, bool dynamicLoad, bool realCompositor)
     vu::PrintConfig(vu::g_cfg);
     vu::UpscalerInit();
     vu::ControlInit(realCompositor);
+    vu::ControlFileRead(vu::g_cfg);
+    vu::ControlNoteState(vu::g_cfg);
 
     // Static load (we are dxgi.dll in the compositor's folder): d3d11.dll is already mapped, so
     // start watching device creation now, before the compositor's main() can create its device.

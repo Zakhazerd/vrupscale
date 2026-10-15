@@ -3,6 +3,8 @@
 #include "internal.h"
 #include "control_shared.h"
 
+#include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -321,6 +323,113 @@ void ControlNoteEvent(int level, const char *line)
     snprintf(g_events[g_eventN % kVuEvents], sizeof(g_events[0]), "%s", line);
     g_eventN++;
     ReleaseSRWLockExclusive(&g_ctlLock);
+}
+
+// ---- the settings file, re-read while the app writes it ----------------------------------------
+// The app saves the settings file with what the upscaler runs with: its own changes (sent through the
+// channel first) and the ones made here (shortcuts, calibration), which it mirrors and saves a moment
+// later. So the file can hold a state the upscaler has already moved on from: a shortcut pressed twice
+// in quick succession, the app saving the first press after the second. Taking the whole file would
+// undo the second press. A changed file is therefore taken field by field (the fields the app shows):
+// one the file did not change keeps its current value; one it changed to a value the upscaler has had
+// since the file was last read is that older state coming back, and the current value stays; any other
+// change is an edit, and is taken. (Settings only the file holds come from the file, as before.)
+
+namespace {
+
+struct FileField {
+    size_t offset, words;   // in VuSettings (32-bit words)
+    float tol;              // floats: how far apart the file (rounded) and the value held still match; 0 = integers
+    const char *name;
+};
+#define VU_FIELD(m, tol, name) { offsetof(VuSettings, m), sizeof(((VuSettings *)nullptr)->m) / 4, tol, name }
+const FileField kFileFields[] = {
+    VU_FIELD(enabled, 0.0f, "enabled"), VU_FIELD(mode, 0.0f, "mode"), VU_FIELD(upscaleFactor, 0.006f, "upscaleFactor"),
+    VU_FIELD(sharpness, 0.006f, "sharpness"), VU_FIELD(tint, 0.0f, "debugTint"), VU_FIELD(hotkeys, 0.0f, "hotkeys"),
+    VU_FIELD(maxWeight, 0.006f, "maxWeight"), VU_FIELD(localTrust, 0.006f, "localTrust"),
+    VU_FIELD(residualTol, 0.006f, "residualTol"), VU_FIELD(clipGamma, 0.006f, "clipGamma"),
+    VU_FIELD(maxStreams, 0.0f, "maxStreams"), VU_FIELD(requireShared, 0.0f, "requireShared"),
+    VU_FIELD(minWidth, 0.0f, "minWidth"), VU_FIELD(minHeight, 0.0f, "minHeight"), VU_FIELD(minAspect, 0.006f, "minAspect"),
+    VU_FIELD(maxAspect, 0.006f, "maxAspect"),
+    { offsetof(VuSettings, excludeCount), 1 + kVuMaxExclude, 0.0f, "excludeSizes" },   // (count and list together)
+    VU_FIELD(temporalArea, 0.006f, "temporalArea"), VU_FIELD(fastHistory, 0.0f, "sharpHistory"),
+    VU_FIELD(bilinearEdges, 0.0f, "bilinearEdges"), VU_FIELD(gazeFollow, 0.0f, "followGaze"),
+    VU_FIELD(gazeShow, 0.0f, "showGaze"), VU_FIELD(gazeOffset, 0.0002f, "offset"), VU_FIELD(eyeProj, 0.0002f, "projection"),
+    VU_FIELD(gazeArea, 0.006f, "gazeArea"), VU_FIELD(sharpArea, 0.006f, "sharpnessArea"),
+    VU_FIELD(gazeSharpArea, 0.006f, "gazeSharpnessArea"),
+};
+#undef VU_FIELD
+static_assert(offsetof(VuSettings, exclude) == offsetof(VuSettings, excludeCount) + 4, "excludeCount, then exclude");
+
+SRWLOCK g_fileLock = SRWLOCK_INIT;
+VuSettings g_fileSettings;        // the file's, as last read
+bool g_haveFile = false;
+constexpr int kHeld = 32;
+VuSettings g_held[kHeld];          // every state applied since, oldest first
+int g_heldN = 0;
+
+bool SameField(const VuSettings &a, const VuSettings &b, const FileField &f, bool exact)
+{
+    const uint32_t *x = (const uint32_t *)((const char *)&a + f.offset), *y = (const uint32_t *)((const char *)&b + f.offset);
+    for (size_t i = 0; i < f.words; ++i) {
+        if (x[i] == y[i]) continue;
+        if (exact || f.tol <= 0.0f) return false;
+        float u, v;
+        memcpy(&u, &x[i], 4);
+        memcpy(&v, &y[i], 4);
+        if (!(fabsf(u - v) <= f.tol)) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+void ControlFileRead(const Config &file)
+{
+    AcquireSRWLockExclusive(&g_fileLock);
+    ConfigToSettings(file, g_fileSettings);
+    g_haveFile = true;
+    g_heldN = 0;
+    ReleaseSRWLockExclusive(&g_fileLock);
+}
+
+void ControlNoteState(const Config &c)
+{
+    AcquireSRWLockExclusive(&g_fileLock);
+    if (g_heldN == kHeld) {
+        memmove(&g_held[0], &g_held[1], sizeof(g_held[0]) * (kHeld - 1));
+        --g_heldN;
+    }
+    ConfigToSettings(c, g_held[g_heldN++]);
+    ReleaseSRWLockExclusive(&g_fileLock);
+}
+
+int ControlMergeFile(Config &file, const Config &cur, char *kept, size_t keptSize)
+{
+    if (kept && keptSize) kept[0] = 0;
+    VuSettings f, c;
+    ConfigToSettings(file, f);
+    ConfigToSettings(cur, c);
+    VuSettings m = f;
+    int n = 0;
+    size_t len = 0;
+    AcquireSRWLockShared(&g_fileLock);
+    const bool have = g_haveFile;
+    for (const FileField &ff : kFileFields) {
+        if (!have) break;
+        bool keep = SameField(f, g_fileSettings, ff, true);   // not changed in the file: ours stays
+        if (!keep) {
+            for (int i = 0; i < g_heldN && !keep; ++i) keep = SameField(f, g_held[i], ff, false);
+            if (keep && !SameField(f, c, ff, false)) {   // an older state of ours: the current one stays
+                ++n;
+                if (kept && len + 32 < keptSize) len += snprintf(kept + len, keptSize - len, "%s%s", len ? ", " : "", ff.name);
+            }
+        }
+        if (keep) memcpy((char *)&m + ff.offset, (const char *)&c + ff.offset, ff.words * 4);
+    }
+    ReleaseSRWLockShared(&g_fileLock);
+    if (have) SettingsToConfig(m, file);
+    return n;
 }
 
 // Called with g_workLock held: from the render-thread tick, or from the worker thread while the

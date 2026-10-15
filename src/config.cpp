@@ -240,13 +240,15 @@ const char *ModeName(Mode m)
     return m == Mode::Temporal ? "temporal" : (m == Mode::Fsr ? "fsr" : "bilinear");
 }
 
-bool ConfigFileChanged()
+bool ConfigFileChanged(bool *switched)
 {
+    if (switched) *switched = false;
     // The app's settings file appeared after we started on a fallback: switch to it.
     if (!g_iniPreferred.empty() && g_iniPath != g_iniPreferred &&
         GetFileAttributesW(g_iniPreferred.c_str()) != INVALID_FILE_ATTRIBUTES) {
         g_iniPath = g_iniPreferred;
         g_iniTime = {};
+        if (switched) *switched = true;
         return true;
     }
     FILETIME t;

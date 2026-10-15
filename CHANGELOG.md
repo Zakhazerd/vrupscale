@@ -2,6 +2,10 @@
 
 What changed in each version of vrupscale, newest first.
 
+## 0.6.6
+
+- Fixed: with the app open, pressing a shortcut twice in quick succession (Ctrl+F1 off and straight back on, say) could undo the second press a moment later.
+
 ## 0.6.4
 
 - The app starts with SteamVR, minimized, and closes when SteamVR does. It adds itself to SteamVR's startup apps the first time SteamVR runs while it is open. **Start with SteamVR** switches this off.

@@ -345,5 +345,10 @@ int ControlCommandLists();
 int ControlNoteTexture(const D3D11_TEXTURE2D_DESC &td, bool upscaled, UINT outW, UINT outH, const char *reason);
 void ControlTouchTexture(int token);
 void ControlNoteTextureUse(int token, bool eye, UINT contentW, UINT contentH, UINT contentOutW, UINT contentOutH);
+// The settings file, re-read while the app writes it (see control.cpp): what was read from it last,
+// every state applied since, and a changed file merged against those.
+void ControlFileRead(const Config &file);
+void ControlNoteState(const Config &c);
+int ControlMergeFile(Config &file, const Config &cur, char *kept, size_t keptSize);
 
 } // namespace vu

@@ -1203,11 +1203,24 @@ void PollHotkeys()
     }
 }
 
-void ReloadConfig()
+// merge: the file changed on its own (the app saved it, or an edit by hand), so it is taken field by
+// field against what is running (ControlMergeFile); otherwise (asked to, or another file) as it is.
+void ReloadConfig(bool merge)
 {
     Config nc;
     bool found = LoadConfig(nc);
     LOGI("config: settings file %ls%s", g_iniPath.c_str(), found ? "" : " (missing: defaults)");
+    const Config fromFile = nc;
+    if (merge && found) {
+        Config cur;
+        AcquireSRWLockShared(&g_cfgLock);
+        cur = g_cfg;
+        ReleaseSRWLockShared(&g_cfgLock);
+        char kept[192];
+        if (ControlMergeFile(nc, cur, kept, sizeof(kept)) > 0)
+            LOGI("config: the file holds an earlier value of %s (saved after it changed again): keeping the current one", kept);
+    }
+    ControlFileRead(fromFile);
     ApplyConfig(nc, "the settings file");
     PrintConfig(nc);
 }
@@ -1299,7 +1312,9 @@ void RenderTick(ID3D11DeviceContext *ctx)
     GazeTick();
     if (g_reloadRequested || now.QuadPart - g_lastCfgPoll > f) {
         g_lastCfgPoll = now.QuadPart;
-        if (InterlockedExchange(&g_reloadRequested, 0) || ConfigFileChanged()) ReloadConfig();
+        const bool requested = InterlockedExchange(&g_reloadRequested, 0) != 0;
+        bool switched = false;
+        if (requested || ConfigFileChanged(&switched)) ReloadConfig(!requested && !switched);
     }
     if (now.QuadPart - g_lastProbePoll > f / 20) {   // content rectangles (render size)
         g_lastProbePoll = now.QuadPart;
@@ -1374,6 +1389,7 @@ void ApplyConfig(const Config &nc, const char *source)
     }
     InterlockedIncrement(&g_outGen);   // repaint every proxy once with the new settings
     ReleaseSRWLockExclusive(&g_cfgLock);
+    ControlNoteState(nc);   // (so that the app saving this state later is recognised: ReloadConfig)
     if (nc.enabled && !old.enabled) TemporalResetAll("re-enabled");
     else if (nc.mode == Mode::Temporal && old.mode != Mode::Temporal) TemporalResetAll("mode switch");
     char excl[160] = "";
