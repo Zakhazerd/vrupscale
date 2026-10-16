@@ -17,6 +17,7 @@ cp build/dxgi.dll $P/payload/
 cp LICENSE $P/LICENSES/vrupscale-MIT.txt
 cp third_party/minhook/LICENSE.txt $P/LICENSES/MinHook-BSD2.txt
 cp third_party/ffx/LICENSE.txt $P/LICENSES/FidelityFX-FSR1-MIT.txt
+cp third_party/ffx/LICENSE-FSR2.txt $P/LICENSES/FidelityFX-FSR2-MIT.txt
 cp third_party/rubik/OFL.txt $P/LICENSES/Rubik-OFL.txt
 cp third_party/openvr/LICENSE.txt $P/LICENSES/OpenVR-BSD3.txt
 cp build/dxgi.dll build/selftest.exe $P/selftest/
