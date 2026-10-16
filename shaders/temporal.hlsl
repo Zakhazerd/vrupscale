@@ -85,6 +85,9 @@
 #ifndef DF           // ACCUM: 1 = with FSR 2's thin-feature locks and luma instability (TF_LOCKS, TF_LSTAB)
 #define DF 0
 #endif
+#ifndef FSRACC       // ACCUM (with DF): 1 = FSR 2's accumulation in place of ours ([temporal] fsrHistory)
+#define FSRACC 0
+#endif
 
 #define A_GPU 1
 #define A_HLSL 1
@@ -1138,6 +1141,198 @@ float LocksAndFlicker(int2 q, int2 i0, uint z, float2 u, float3 mu, float3 sigma
 }
 #endif
 
+#if FSRACC
+// ---- FSR 2's accumulation ([temporal] fsrHistory; ffx_fsr2_accumulate.h, ffx_fsr2_upsample.h,
+// ffx_fsr2_sample.h, ffx_fsr2_postprocess_lock_status.h; MIT, Advanced Micro Devices) in place of
+// ours. This frame goes through a Lanczos-2 kernel sized to the output pixels; the history weighs
+// 1 against this frame's ~1/12 (on top of an input sample), and while things move at most ten
+// times this frame. History outside the neighbourhood's colour box is clamped and its weight cut to
+// 0.1, unless a lock or the input's flicker keeps it. The box is wide (up to 20 sigma, the 3x3's
+// min / max in practice) and narrows to 1 sigma with fast motion. After a reset or a disocclusion
+// the history's weight ramps up over about ten frames, from a reactive factor kept in its alpha
+// (negative: moving). FSR 2's depth clip is our motion's doubt (1 - confidence); there is no
+// reactive mask.
+
+// FSR 1's Lanczos-2 approximation, taking x*x (FSR 2's Lanczos2ApproxSq)
+float Lanczos2Sq(float x2)
+{
+    x2 = min(x2, 4.0);
+    const float a = 0.4 * x2 - 1.0, b = 0.25 * x2 - 1.0;
+    return (1.5625 * a * a - 0.5625) * (b * b);
+}
+
+// FSR 2's history sampler: Lanczos-2 over 4x4 texels, deringed against the 2x2 nearest
+float4 SampleHistoryFsr(float2 pos, uint z)
+{
+    const float2 t = clamp(pos - 0.5, 0.0, float2(Region.zw));
+    const int2 tc = int2(floor(t));
+    const float2 f = t - float2(tc);
+    float wx[4], wy[4];
+    float sx = 0.0, sy = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        wx[k] = Lanczos2(float(k - 1) - f.x);
+        wy[k] = Lanczos2(float(k - 1) - f.y);
+        sx += wx[k];
+        sy += wy[k];
+    }
+    const int2 mx = int2(Region.zw) - 1;
+    float4 c = 0.0, lo = 1e9, hi = -1e9;
+    [unroll] for (int j = 0; j < 4; ++j) {
+        float4 row = 0.0;
+        [unroll] for (int i = 0; i < 4; ++i) {
+            const float4 h = Hist.Load(int4(clamp(tc + int2(i - 1, j - 1), 0, mx), z, 0));
+            row += h * wx[i];
+            if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = min(lo, h); hi = max(hi, h); }
+        }
+        c += row * wy[j];
+    }
+    return clamp(c / (sx * sy), lo, hi);
+}
+
+void AccumulateFsr(int2 q, int2 i0, uint z, bool first, int2 org, int2 prevOrg)
+{
+    const bool useLocks = (Misc.y & TF_LOCKS) != 0, useStab = (Misc.y & TF_LSTAB) != 0;
+    const float2 sp = (float2(q) + 0.5) * ScaleInfo.zw;      // this output pixel's centre, in input px
+    const int2 n = int2(floor(sp));                          // the input pixel it falls in
+    const int2 inMax = int2(Size01.xy) - 1;
+
+    // where it was last frame
+    float4 fl = 0.0;
+    float2 qp = 0.0;
+    bool existing = false;
+    if (!first) {
+        fl = Flow2.SampleLevel(LinearClamp, float3(sp * 0.25 / float2(Size23.xy), z), 0);
+        qp = (float2(q - prevOrg) + 0.5) + fl.xy * ScaleInfo.xy;
+        existing = all(qp >= 0.0) && all(qp <= float2(Region.zw));
+    }
+    const bool isNew = !existing;
+    const float vel = length(fl.xy * ScaleInfo.xy);           // output px per frame
+    const float depthClip = 1.0 - fl.z;
+    const float3 hq = float3(qp / float2(Region.zw), z);
+
+    // the history, and the reactive factor it carries (FSR 2's ReprojectHistoryColor)
+    float3 hy = 0.0;
+    float reactive = 0.0;
+    bool movedLast = false;
+    if (existing) {
+        const float4 h = SampleHistoryFsr(qp, z);
+        hy = ToYCoCg(h.rgb);
+        reactive = saturate(abs(h.a));
+        movedLast = h.a < 0.0;
+    }
+
+    // the lock (FSR 2's UpdateLockStatus), kept up without TF_LOCKS too: a change of the shading it
+    // watches makes the pixel reactive
+    float2 lock = 0.0;
+    if (existing) lock = LockIn.SampleLevel(LinearClamp, hq, 0);
+    bool newLock = false;
+    {
+        const int2 nc = int2(ceil(float2(q) * ScaleInfo.zw - 0.5));
+        if (all(float2(nc) < (float2(q) + 1.0) * ScaleInfo.zw - 0.5)) newLock = ThinFeature(nc - i0);
+    }
+    const float shading = pow(max(Luma4.SampleLevel(LinearClamp, float3(sp / (16.0 * float2(Size4Out.xy)), z), 0), 1e-4), 2.2 / 6.0);
+    if (lock.y == 0.0) lock.y = shading;
+    const float lumaDiff = 1.0 - MinDivMax(lock.y, shading);
+    if (newLock) {
+        lock.y = shading;
+        lock.x = (lock.x != 0.0) ? 2.0 : 1.0;
+    } else if (lock.x <= 1.0) {
+        lock.y = lerp(lock.y, shading, 0.5);
+    } else if (lumaDiff > 0.1) {
+        lock.x = 0.0;
+    }
+    reactive = max(reactive, saturate((lumaDiff - 0.1) * 10.0));
+    lock.x *= (1.0 - reactive) * (depthClip < 0.1 ? 1.0 : 0.0);
+    const float lockC = useLocks ? saturate(saturate((lock.x - 1.0) * 4.0) * saturate(MinDivMax(lock.y, shading))) : 0.0;
+
+    // this frame through a Lanczos-2 kernel sized to the output pixels (wider while reactive), and
+    // the colour box (FSR 2's ComputeUpsampledColorAndWeight)
+    const float kReactive = max(reactive, isNew ? 1.0 : 0.0);
+    const float biasMax = min(1.99, ScaleInfo.x) * (1.0 - kReactive);
+    const float biasMin = max(1.0, (1.0 + biasMax) * 0.3);
+    const float bias = lerp(biasMax, biasMin, max(0.25 * depthClip, kReactive));
+    const float curve = lerp(-2.0, -3.0, saturate(vel / 50.0));
+    float3 sum = 0.0, bc = 0.0, bv = 0.0, amin = 1e5, amax = -1e5;
+    float wsum = 0.0, bw = 0.0;
+    [unroll] for (int ky = -1; ky <= 1; ++ky)
+        [unroll] for (int kx = -1; kx <= 1; ++kx) {
+            const int2 p = n + int2(kx, ky);
+            const int2 t = p - i0;
+            const float3 c = ToYCoCg(sIn[t.y * TILE + t.x]);
+            const float2 off = float2(p) + 0.5 - sp;
+            const float d2 = dot(off, off);
+            const float w = (all(p >= 0) && all(p <= inMax)) ? Lanczos2Sq(d2 * bias * bias) : 0.0;
+            sum += c * w;
+            wsum += w;
+            const float bwk = exp(curve * d2);
+            bc += c * bwk;
+            bv += c * c * bwk;
+            bw += bwk;
+            amin = min(amin, c);
+            amax = max(amax, c);
+        }
+    bc /= bw;
+    bv = sqrt(abs(bv / bw - bc * bc));
+    float3 up = bc;
+    float upW = 0.0;
+    if (wsum > 1e-3) {
+        up = clamp(sum / wsum, amin, amax);
+        upW = wsum * (1.0 / 12.0);
+    }
+
+    // luma instability (FSR 2's ComputeLumaInstabilityFactor)
+    float4 lumaH = 0.0;
+    float instab = 0.0;
+    {
+        const float cl = round(bc.x * 255.0) / 255.0;
+        if (existing && max(depthClip, lumaDiff) < 0.1) lumaH = LumaIn.SampleLevel(LinearClamp, hq, 0);
+        const float d0 = cl - lumaH.x;
+        float mn = abs(d0);
+        if (mn >= 1.0 / 255.0) {
+            [unroll] for (int i = 1; i < 4; ++i) {
+                const float d1 = cl - lumaH[i];
+                if (sign(d0) == sign(d1)) mn = min(mn, abs(d1));
+            }
+            instab = (mn != abs(d0) && bv.x > 0.1 * pow(1.0 / 255.0, 1.0 / 6.0)) ? 1.0 : 0.0;
+            instab *= 1.0 - pow(reactive, 1.0 / 6.0);
+        }
+        lumaH = float4(cl, lumaH.xyz);
+        if (lumaH.w == 0.0 || !useStab) instab = 0.0;
+    }
+
+    // how much the history weighs (FSR 2's ComputeBaseAccumulationWeight)
+    float base = existing ? (1.0 - reactive) * (1.0 - depthClip) : 0.0;
+    base = min(base, lerp(base, upW * 10.0, max(movedLast ? 1.0 : 0.0, saturate(vel * 10.0))));
+    base = min(base, lerp(base, upW, saturate(vel / 20.0)));
+
+    float3 outY = up;
+    if (existing) {
+        // FSR 2's RectifyHistory and Accumulate
+        const float boxScale = lerp(min(20.0, pow(ScaleInfo.x * ScaleInfo.y, 3.0)), 1.0, max(depthClip, saturate(vel / 20.0)));
+        const float3 bmin = max(amin, bc - bv * boxScale), bmax = min(amax, bc + bv * boxScale);
+        if (any(hy < bmin) || any(hy > bmax)) {
+            const float keep = saturate(max(instab, lockC));
+            hy = lerp(clamp(hy, bmin, bmax), hy, keep);
+            base = lerp(min(base, 0.1), base, keep);
+        }
+        outY = lerp(hy, up, upW / max(1e-3, base + upW));
+    }
+
+    // the lock wears off with the weight of this frame's samples (FSR 2's FinalizeLockStatus)
+    lock.x = max(0.0, lock.x - upW / (max(1.0, floor(8.0 * ScaleInfo.x * ScaleInfo.x)) * (0.74 / 12.0)));
+    LockOut[uint3(q - org, z)] = lock;
+    LumaOut[uint3(q - org, z)] = lumaH;
+
+    // the reactive factor the next frame starts from (FSR 2's ComputeTemporalReactiveFactor)
+    float nf = min(0.99, reactive);
+    nf = max(nf, lerp(nf, 0.4, saturate(vel)));
+    nf = max(nf * nf, depthClip * 0.1);
+    if (isNew) nf = 1.0;
+    if (vel >= 0.1) nf = -max(1e-3, nf);
+    HistOut[uint3(q - org, z)] = float4(FromYCoCg(outY), nf);
+}
+#endif
+
 void Accumulate(int2 q, int2 i0, uint z, bool first, int2 org, int2 prevOrg)
 {
     float2 u = (float2(q) + 0.5) * ScaleInfo.zw - 0.5;        // input pixel coordinates
@@ -1232,7 +1427,11 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
     bool first = Ctrl.Load(0) != 0;
     [unroll] for (uint j = 0; j < 4; ++j) {
         int2 q = q0 + int2(gt.xy) + int2(j & 1, j >> 1) * 8;
+#if FSRACC
+        if (all(q < qEnd)) AccumulateFsr(q, i0, z, first, org, prevOrg);
+#else
         if (all(q < qEnd)) Accumulate(q, i0, z, first, org, prevOrg);
+#endif
     }
 }
 
