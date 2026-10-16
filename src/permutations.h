@@ -32,6 +32,9 @@
     X(T_ACCUM_X0,      "temporal.hlsl", "TPASS=5;XFORM=0")                    \
     X(T_ACCUM_X1,      "temporal.hlsl", "TPASS=5;XFORM=1")                    \
     X(T_ACCUM_X2,      "temporal.hlsl", "TPASS=5;XFORM=2")                    \
+    X(T_ACCUMDF_X0,    "temporal.hlsl", "TPASS=5;XFORM=0;DF=1")               \
+    X(T_ACCUMDF_X1,    "temporal.hlsl", "TPASS=5;XFORM=1;DF=1")               \
+    X(T_ACCUMDF_X2,    "temporal.hlsl", "TPASS=5;XFORM=2;DF=1")               \
     X(T_OUTCOPY_X0,    "temporal.hlsl", "TPASS=6;XFORM=0;SHARPEN=0")          \
     X(T_OUTCOPY_X1,    "temporal.hlsl", "TPASS=6;XFORM=1;SHARPEN=0")          \
     X(T_OUTCOPY_X2,    "temporal.hlsl", "TPASS=6;XFORM=2;SHARPEN=0")          \

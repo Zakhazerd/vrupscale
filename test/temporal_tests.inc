@@ -188,8 +188,9 @@ static V3 SceneAt(const World &Wd, const SceneFrame &f, int eye, float sx, float
     return Wd.At((sx + f.ox + bx) * kWorldScale, (sy + f.oy) * kWorldScale);
 }
 
-// Renders w x h pixels whose footprint is `scale` input px each (1 = input buffer), 4x4 supersampled.
-static Image RenderScene(const World &Wd, const SceneFrame &f, int eye, int w, int h, float scale)
+// Renders w x h pixels whose footprint is `scale` input px each (1 = input buffer), spp x spp
+// supersampled (4: anti-aliased; 1: one sample per pixel, aliased like a game without anti-aliasing).
+static Image RenderScene(const World &Wd, const SceneFrame &f, int eye, int w, int h, float scale, int spp = 4)
 {
     Image im;
     im.w = w; im.h = h;
@@ -197,13 +198,14 @@ static Image RenderScene(const World &Wd, const SceneFrame &f, int eye, int w, i
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             float r = 0, g = 0, b = 0;
-            for (int j = 0; j < 4; ++j)
-                for (int i = 0; i < 4; ++i) {
-                    V3 c = SceneAt(Wd, f, eye, (x + (i + 0.5f) / 4.0f) * scale, (y + (j + 0.5f) / 4.0f) * scale);
+            for (int j = 0; j < spp; ++j)
+                for (int i = 0; i < spp; ++i) {
+                    V3 c = SceneAt(Wd, f, eye, (x + (i + 0.5f) / spp) * scale, (y + (j + 0.5f) / spp) * scale);
                     r += c.r; g += c.g; b += c.b;
                 }
             float *p = im.at(x, y);
-            p[0] = r / 16; p[1] = g / 16; p[2] = b / 16; p[3] = 1.0f;
+            const float n = (float)(spp * spp);
+            p[0] = r / n; p[1] = g / n; p[2] = b / n; p[3] = 1.0f;
         }
     return Quantize8(im);
 }
@@ -396,9 +398,11 @@ static Sequence MakeSequence(const World &Wd, int w, int h, int ow, int oh, int 
         }
     }
     const float r = (float)w / (float)ow;
+    // VRUPSCALE_TEST_INPUT_SPP: samples per axis of the input frames (default 4; 1 = aliased input)
+    const int spp = EnvStr("VRUPSCALE_TEST_INPUT_SPP")[0] ? std::max(1, atoi(EnvStr("VRUPSCALE_TEST_INPUT_SPP"))) : 4;
     for (int i = 0; i < frames; ++i)
         for (int e = 0; e < 2; ++e) {
-            q.in[e].push_back(RenderScene(Wd, q.f[i], e, w, h, 1.0f));
+            q.in[e].push_back(RenderScene(Wd, q.f[i], e, w, h, 1.0f, spp));
             q.gt[e].push_back(RenderScene(Wd, q.f[i], e, ow, oh, r));
         }
     return q;
@@ -2079,6 +2083,11 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     printf("         whole frame  %6.2f    %6.2f\n", rf.all.Psnr(), rt.all.Psnr());
     printf("         steadiness   %6.2f    %6.2f   (frame-to-frame error change, higher = less shimmer)\n", rf.flicker.Psnr(), rt.flicker.Psnr());
     if (EnvStr("VRUPSCALE_TEST_TUNE_ONLY")[0] == '1') {   // tuning sweeps: the table is all that is wanted
+        if (EnvStr("VRUPSCALE_TEST_SAVE")[0] == '1') {   // the last frame, for a look
+            char path[512];
+            snprintf(path, sizeof(path), "%s\\t_gt.ppm", outDir); SavePpm(rt.lastGt, path);
+            snprintf(path, sizeof(path), "%s\\t_temporal.ppm", outDir); SavePpm(rt.lastOut, path);
+        }
         ClearAll(g);
         SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
         tgt.Release();
@@ -2124,6 +2133,18 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
                rc.grating.Psnr(), rc.flicker.Psnr(), rt.bg.Psnr(), rt.grating.Psnr(), rt.flicker.Psnr());
         CHECK(AllFinite(rc.lastOut) && rc.grating.Psnr() > rt.grating.Psnr() + 0.3,
               "Sharp history on keeps more fine detail (+%.2f dB on the grating)", rc.grating.Psnr() - rt.grating.Psnr());
+        // FSR 2's locks and flicker damping (experimental, off by default): their accumulate variant
+        // runs, and is no worse than without
+        snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=1\n"
+                 "locks=1\nlumaStability=1\n", tIniBase, reqShared, F);
+        WriteIni(ini);
+        Pump(g);
+        SeqResult rl = RunSequence(g, tgt, mov, app, views, 8);
+        printf("         locks + lumaStability: background %.2f dB, trail %.2f dB, object %.2f dB, whole frame %.2f dB, steadiness %.2f dB\n",
+               rl.bg.Psnr(), rl.trail.Psnr(), rl.obj.Psnr(), rl.all.Psnr(), rl.flicker.Psnr());
+        CHECK(AllFinite(rl.lastOut) && rl.all.Psnr() > rt.all.Psnr() - 0.2 && rl.flicker.Psnr() > rt.flicker.Psnr() - 0.2,
+              "locks and lumaStability on: no worse than off (%+.2f dB whole frame, %+.2f dB steadiness)", rl.all.Psnr() - rt.all.Psnr(),
+              rl.flicker.Psnr() - rt.flicker.Psnr());
         snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=0.5\n[temporal]\ntemporalArea=1\n",
                  tIniBase, reqShared, F);
         WriteIni(ini);
@@ -2173,8 +2194,9 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
             g_debugStream(i, st);
             newFrames += st[12];
         }
-        // (the two comparison runs above, Moving objects off and Sharp history on, continue the same histories)
-        const int expect = 2 * (mov.frames + 1) + (extraStr.empty() ? 2 * 2 * mov.frames : 0);
+        // (the comparison runs above, Moving objects off, Sharp history on and locks + lumaStability,
+        // continue the same histories)
+        const int expect = 2 * (mov.frames + 1) + (extraStr.empty() ? 3 * 2 * mov.frames : 0);
         CHECK(newFrames == (uint32_t)expect, "every new app frame advanced the history exactly once (%u of %d)", newFrames, expect);
     }
 

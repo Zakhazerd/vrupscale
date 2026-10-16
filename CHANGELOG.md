@@ -8,6 +8,7 @@ What changed in each version of vrupscale, newest first.
 - Fixed: every settings change (in the app, or the file by hand) held up SteamVR for a few milliseconds, often a dropped frame. The settings file is now read in the background.
 - Less work inside SteamVR's frame: Temporal records each texture's passes once and replays them, two calls per texture instead of about a hundred; the log is written in the background, and GPU timing is taken on a sample of frames.
 - The log's stats lines show the CPU time vrupscale takes on SteamVR's compositor threads.
+- Experimental settings `locks` and `lumaStability` (`[temporal]`, off by default): FSR 2's protection of thin details and its flicker damping, the parts that work without a depth buffer.
 
 ## 0.6.4
 

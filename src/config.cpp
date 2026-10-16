@@ -134,6 +134,8 @@ bool LoadConfig(Config &c, std::wstring *pathOut)
     c.workMargin = ReadInt(ini, L"temporal", L"workMargin", d.workMargin);
     c.commandLists = ReadBool(ini, L"temporal", L"commandLists", d.commandLists);
     c.bilinearEdges = ReadBool(ini, L"temporal", L"bilinearEdges", d.bilinearEdges);
+    c.locks = ReadBool(ini, L"temporal", L"locks", d.locks);
+    c.lumaStability = ReadBool(ini, L"temporal", L"lumaStability", d.lumaStability);
 
     c.gazeFollow = ReadBool(ini, L"eyes", L"followGaze", d.gazeFollow);
     c.gazeShow = ReadBool(ini, L"eyes", L"showGaze", d.gazeShow);
@@ -236,10 +238,10 @@ void PrintConfig(const Config &c)
          c.sharpHistory, c.bilinearEdges, c.gazeFollow, c.gazeShow, c.gazeOffset[0], c.gazeOffset[1]);
     LOGI("config: temporal maxWeight=%.1f clipGamma=%.2f residualTol=%.3f sampleSigma=%.2f minNewWeight=%.3f lkEps=%.4f "
          "searchLambda=%.4f clipReject=%.2f localTrust=%.2f localGate=%.2f localRatio=%.2f temporalArea=%.2f gazeArea=%.2f maxStreams=%d "
-         "linkPools=%d linkGapMs=%.1f detectContent=%d probeWindowMs=%d commandLists=%d",
+         "linkPools=%d linkGapMs=%.1f detectContent=%d probeWindowMs=%d commandLists=%d locks=%d lumaStability=%d",
          c.maxWeight, c.clipGamma, c.residualTol, c.sampleSigma, c.minNewWeight, c.lkEps, c.searchLambda, c.clipReject,
          c.localTrust, c.localGate, c.localRatio, c.temporalArea, c.gazeArea, c.maxStreams, c.linkPools, c.linkGapMs, c.detectContent,
-         c.probeWindowMs, c.commandLists);
+         c.probeWindowMs, c.commandLists, c.locks, c.lumaStability);
     LOGI("config: match min=%dx%d aspect=[%.2f, %.2f] requireShared=%d followCopies=%d maxArraySize=%d onlySizes=%zu excludeSizes=%zu",
          c.minWidth, c.minHeight, c.minAspect, c.maxAspect, c.requireShared, c.followCopies, c.maxArraySize,
          c.onlySizes.size(), c.excludeSizes.size());

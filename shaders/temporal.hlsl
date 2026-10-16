@@ -82,6 +82,9 @@
 #ifndef FPMODE       // FP: what its last group decides: 1 = DECIDE (temporal), 2 = SDECIDE (spatial)
 #define FPMODE 1
 #endif
+#ifndef DF           // ACCUM: 1 = with FSR 2's thin-feature locks and luma instability (TF_LOCKS, TF_LSTAB)
+#define DF 0
+#endif
 
 #define A_GPU 1
 #define A_HLSL 1
@@ -133,6 +136,8 @@ uint2 UnpackOrg(uint v) { return uint2(v & 0xffffu, v >> 16); }
 #define TF_BILINEAR 32u   // OUT / OUTER / MARGIN: the spatial upscale outside the region is bilinear
 #define TF_MARGIN 64u     // DECIDE: MARGIN runs with every new frame, not only on repaints (after a resolution change)
 #define TF_SHARPOUT 128u  // OUT / OUTER: the sharpening area reaches past the region (RcasCon set)
+#define TF_LOCKS 256u     // ACCUM (DF): thin-feature locks keep history the clip would drop (FSR 2's locks)
+#define TF_LSTAB 512u     // ACCUM (DF): luma instability keeps history where the input flickers (FSR 2)
 
 SamplerState LinearClamp : register(s0);
 
@@ -941,9 +946,19 @@ Texture2DArray<float4>   Flow2 : register(t1);
 Texture2DArray<float4>   Hist : register(t2);
 ByteAddressBuffer        Ctrl : register(t3);
 RWTexture2DArray<float4> HistOut : register(u0);
+#if DF
+Texture2DArray<float>    Luma4 : register(t4);     // this frame's L4 luma (the shading a lock watches)
+Texture2DArray<float2>   LockIn : register(t5);    // the history's locks: lifetime left, luma when locked
+Texture2DArray<float4>   LumaIn : register(t6);    // the history's box-centre luma of the last 4 frames (N-1 .. N-4)
+RWTexture2DArray<float2> LockOut : register(u1);
+RWTexture2DArray<float4> LumaOut : register(u2);
+#endif
 
 #define TILE 20
 groupshared float3 sIn[TILE * TILE];
+#if DF
+groupshared float sLk[TILE * TILE];   // luma^(1/6), for finding thin features (FSR 2's lock luma)
+#endif
 
 float3 ToYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
 float3 FromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
@@ -1023,6 +1038,106 @@ float4 SampleHistory(float2 pos, uint z)
     return SampleHistoryCR(pos, z);
 }
 
+#if DF
+// ---- after FSR 2 (ffx_fsr2_lock.h, ffx_fsr2_postprocess_lock_status.h, ffx_fsr2_accumulate.h;
+// MIT, Advanced Micro Devices): the parts that need no depth ([temporal] locks, lumaStability).
+//
+// Thin features (a line one input pixel wide, a pixel brighter or darker than everything around
+// it) are what the history clip throws away: the 3x3 neighbourhood of a sample that missed the line
+// does not contain its colour. A pixel found thin two frames running holds a lock for a while, and a
+// locked history pixel is not clipped. A change of the shading around it (the L4 luma) ends it.
+//
+// Luma instability: the box centre's luma of the last four frames is kept per history pixel; if
+// this frame's goes back towards an older one rather than on from the last (the input flickers,
+// as aliasing does), the history is not clipped there either.
+
+float MinDivMax(float a, float b)
+{
+    float m = max(a, b);
+    return m != 0.0 ? min(a, b) / m : 0.0;
+}
+
+// FSR 2's ComputeThinFeatureConfidence: the nucleus is a luma extremum against the neighbours that
+// differ from it, and no 2x2 block around it is all alike (so whatever resembles it is one pixel wide)
+bool ThinFeature(int2 t)
+{
+    const float nuc = sLk[t.y * TILE + t.x];
+    float dmin = 1e9, dmax = 0.0;
+    uint mask = 1u << 4;
+    uint idx = 0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) {
+            if (x != 0 || y != 0) {
+                const float v = sLk[(t.y + y) * TILE + t.x + x];
+                if (max(v, nuc) < 1.05 * min(v, nuc)) mask |= 1u << idx;
+                else { dmin = min(dmin, v); dmax = max(dmax, v); }
+            }
+            ++idx;
+        }
+    if (!(nuc > dmax || nuc < dmin)) return false;
+    const uint q0 = 0x1Bu, q1 = 0x36u, q2 = 0xD8u, q3 = 0x1B0u;   // the four 2x2 blocks holding the centre
+    return (mask & q0) != q0 && (mask & q1) != q1 && (mask & q2) != q2 && (mask & q3) != q3;
+}
+
+// Updates this pixel's lock and luma history (for the next frame) and returns how far they keep
+// its history from the clip this frame. qp: where it was last frame (history px), valid if histOk.
+float LocksAndFlicker(int2 q, int2 i0, uint z, float2 u, float3 mu, float3 sigma, float4 fl, float2 qp, bool histOk, int2 org)
+{
+    const bool useLocks = (Misc.y & TF_LOCKS) != 0, useStab = (Misc.y & TF_LSTAB) != 0;
+    const float3 hq = float3(qp / float2(Region.zw), z);
+    float2 lock = 0.0;      // lifetime left, temporal luma
+    float4 lumaH = 0.0;     // box-centre luma, frames N-1 .. N-4
+    float lockC = 0.0, instab = 0.0, lumaDiff = 0.0;
+    if (useLocks) {   // FSR 2's UpdateLockStatus
+        // a new lock where this frame's input sample inside this output pixel (if one is) is thin
+        bool newLock = false;
+        const int2 nc = int2(ceil(float2(q) * ScaleInfo.zw - 0.5));
+        if (all(float2(nc) < (float2(q) + 1.0) * ScaleInfo.zw - 0.5)) newLock = ThinFeature(nc - i0);
+        // the shading around this pixel as linear luma^(1/6) (FSR 2 takes a 1/32 mip; ours is 1/16)
+        const float shading = pow(max(Luma4.SampleLevel(LinearClamp, float3((u + 0.5) / (16.0 * float2(Size4Out.xy)), z), 0), 1e-4),
+                                  2.2 / 6.0);
+        if (histOk) lock = LockIn.SampleLevel(LinearClamp, hq, 0);
+        if (lock.y == 0.0) lock.y = shading;
+        lumaDiff = 1.0 - MinDivMax(lock.y, shading);
+        if (newLock) {
+            lock.y = shading;
+            lock.x = (lock.x != 0.0) ? 2.0 : 1.0;
+        } else if (lock.x <= 1.0) {
+            lock.y = lerp(lock.y, shading, 0.5);
+        } else if (lumaDiff > 0.1) {
+            lock.x = 0.0;   // the shading changed: something else is here now
+        }
+        // FSR 2 also ends a lock where depth says the history is not this surface; here: where the
+        // motion is not trusted
+        lock.x *= (1.0 - saturate((lumaDiff - 0.1) * 10.0)) * saturate((fl.z - 0.25) * 2.0);
+        lockC = saturate(saturate((lock.x - 1.0) * 4.0) * saturate(MinDivMax(lock.y, shading)));
+        // it wears off over about as many frames as FSR 2's jitter sequence has at this scale
+        lock.x = max(lock.x - 1.0 / max(8.0, ceil(8.0 * ScaleInfo.x * ScaleInfo.y)), 0.0);
+    }
+    if (useStab) {   // FSR 2's ComputeLumaInstabilityFactor, on the perceptual box centre
+        const float cl = round(mu.x * 255.0) / 255.0;
+        if (histOk && lumaDiff < 0.1 && fl.z > 0.5) lumaH = LumaIn.SampleLevel(LinearClamp, hq, 0);
+        const float d0 = cl - lumaH.x;
+        float mn = abs(d0);
+        if (mn >= 1.0 / 255.0) {
+            // closer to an older frame's luma (on the same side) than to the last one's
+            [unroll] for (int i = 1; i < 4; ++i) {
+                const float d1 = cl - lumaH[i];
+                if (sign(d0) == sign(d1)) mn = min(mn, abs(d1));
+            }
+            // ... where there is contrast: FSR 2's pow(saturate(boxSize / 0.1), 6) > 1/255
+            instab = (mn != abs(d0) && sigma.x > 0.1 * pow(1.0 / 255.0, 1.0 / 6.0)) ? 1.0 : 0.0;
+        }
+        lumaH = float4(cl, lumaH.xyz);
+        if (lumaH.w == 0.0) instab = 0.0;   // four frames of history first
+    }
+    // (both written either way: one switched on later finds nothing old)
+    LockOut[uint3(q - org, z)] = lock;
+    LumaOut[uint3(q - org, z)] = lumaH;
+    return saturate(max(lockC, instab) * fl.z);
+}
+#endif
+
 void Accumulate(int2 q, int2 i0, uint z, bool first, int2 org, int2 prevOrg)
 {
     float2 u = (float2(q) + 0.5) * ScaleInfo.zw - 0.5;        // input pixel coordinates
@@ -1056,31 +1171,42 @@ void Accumulate(int2 q, int2 i0, uint z, bool first, int2 org, int2 prevOrg)
     float wNew = max(exp(-dot(o, o) / (2.0 * Tune0.w * Tune0.w)), Tune1.x);
     float3 outC = cur;
     float outW = wNew;
+    const float3 mu = m1 * (1.0 / 9.0);
+    const float3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mu * mu, 0.0));
 
+    bool histOk = false;
+    float2 qp = 0.0;
+    float4 fl = 0.0;
     if (!first) {
-        float4 fl = Flow2.SampleLevel(LinearClamp, float3((u + 0.5) * 0.25 / float2(Size23.xy), z), 0);
+        fl = Flow2.SampleLevel(LinearClamp, float3((u + 0.5) * 0.25 / float2(Size23.xy), z), 0);
         // where this pixel was last frame, in the history's pixels (made at last frame's region)
-        float2 qp = (float2(q - prevOrg) + 0.5) + fl.xy * ScaleInfo.xy;
-        if (all(qp >= 0.0) && all(qp <= float2(Region.zw))) {
-            float4 h = SampleHistory(qp, z);
-            float W = min(h.a, Tune0.x) * fl.z;     // flow confidence
-            float3 mu = m1 * (1.0 / 9.0);
-            float3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mu * mu, 0.0));
-            float3 ext = Tune0.y * sigma + 1.0 / 512.0;
-            float3 bmin = max(mu - ext, ymin), bmax = min(mu + ext, ymax);
-            float3 hy = ToYCoCg(h.rgb);
-            // clip towards the neighbourhood mean (Salvi / Playdead)
-            float3 ctrB = 0.5 * (bmin + bmax);
-            float3 halfB = max(0.5 * (bmax - bmin), 1.0 / 1024.0);
-            float3 r = hy - ctrB;
-            float k = max(max(abs(r.x) / halfB.x, abs(r.y) / halfB.y), abs(r.z) / halfB.z);
-            float3 hc = (k > 1.0) ? ctrB + r / k : hy;
-            // history far outside the plausible range: disocclusion or bad motion -> forget it
-            W *= saturate(1.0 + Tune1.w * (1.0 - k));
-            float a = wNew / (W + wNew);
-            outC = lerp(FromYCoCg(hc), cur, a);
-            outW = W + wNew;
-        }
+        qp = (float2(q - prevOrg) + 0.5) + fl.xy * ScaleInfo.xy;
+        histOk = all(qp >= 0.0) && all(qp <= float2(Region.zw));
+    }
+    float keep = 0.0;   // how far a lock or the input's flicker keeps the history from the clip
+#if DF
+    keep = LocksAndFlicker(q, i0, z, u, mu, sigma, fl, qp, histOk, org);
+#endif
+    if (histOk) {
+        float4 h = SampleHistory(qp, z);
+        float W = min(h.a, Tune0.x) * fl.z;     // flow confidence
+        float3 ext = Tune0.y * sigma + 1.0 / 512.0;
+        float3 bmin = max(mu - ext, ymin), bmax = min(mu + ext, ymax);
+        float3 hy = ToYCoCg(h.rgb);
+        // clip towards the neighbourhood mean (Salvi / Playdead)
+        float3 ctrB = 0.5 * (bmin + bmax);
+        float3 halfB = max(0.5 * (bmax - bmin), 1.0 / 1024.0);
+        float3 r = hy - ctrB;
+        float k = max(max(abs(r.x) / halfB.x, abs(r.y) / halfB.y), abs(r.z) / halfB.z);
+        float3 hc = (k > 1.0) ? ctrB + r / k : hy;
+        // history far outside the plausible range: disocclusion or bad motion -> forget it (unless
+        // kept: FSR 2's RectifyHistory)
+        const float Wclip = W * saturate(1.0 + Tune1.w * (1.0 - k));
+        hc = lerp(hc, hy, keep);
+        W = lerp(Wclip, W, keep);
+        float a = wNew / (W + wNew);
+        outC = lerp(FromYCoCg(hc), cur, a);
+        outW = W + wNew;
     }
     HistOut[uint3(q - org, z)] = float4(outC, outW);
 }
@@ -1096,7 +1222,11 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
     int2 inMax = int2(Size01.xy) - 1;
     for (uint k = gi; k < TILE * TILE; k += 64) {
         int2 p = clamp(i0 + int2(k % TILE, k / TILE), 0, inMax);
-        sIn[k] = saturate(InX(Src.Load(int4(min(p + int2(SrcRect.xy), int2(SrcRect.zw) - 1), z + Misc.x, 0)).rgb));
+        const float3 c = saturate(InX(Src.Load(int4(min(p + int2(SrcRect.xy), int2(SrcRect.zw) - 1), z + Misc.x, 0)).rgb));
+        sIn[k] = c;
+#if DF
+        sLk[k] = pow(max(Luma(c), 1e-5), 1.0 / 6.0);
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     bool first = Ctrl.Load(0) != 0;

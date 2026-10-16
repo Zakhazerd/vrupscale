@@ -100,9 +100,10 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OUT0, A_COPY, A_GLOBAL, A_REFINE, A_OUTER,
        A_LUMA, A_MARGIN, A_COUNT };
 // StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
-constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64;
+constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64,
+                   SHAPE_DF = 128;
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
-               TF_SHARPOUT = 128;
+               TF_SHARPOUT = 128, TF_LOCKS = 256, TF_LSTAB = 512;
 constexpr UINT kStateBytes = 64;
 
 struct Tex {
@@ -160,6 +161,10 @@ public:
     int side = -1;                 // which eye it shows (StreamSide), as of its last run
     OutSig sig;
     Tex cur[5], prev[5], pack[4], flow4, flowLoc, flow2, flowPrev, hist[2];   // cur/prev [0] unused
+    // [temporal] locks / lumaStability (after FSR 2), per history pixel and ping-ponged with it: the
+    // thin-feature lock (lifetime left, luma when locked) and the luma of the last four frames
+    Tex lock[2], lumaH[2];
+    bool dfOn = false, dfFailed = false;
     Buf fp, state, ctrl, args, model;
     Ref<ID3D11Buffer> staging, debugStaging;
     bool stagingPending = false;
@@ -189,6 +194,8 @@ protected:
         model.Drop();
         hist[0].Drop();
         hist[1].Drop();
+        for (auto &t : lock) t.Drop();
+        for (auto &t : lumaH) t.Drop();
         fp.Drop();
         state.Drop();
         ctrl.Drop();
@@ -244,6 +251,28 @@ bool CreateTex(ID3D11Device *dev, Tex &t, UINT w, UINT h, UINT n, DXGI_FORMAT f,
     u.Texture2DArray.ArraySize = n;
     if (FAILED(dev->CreateUnorderedAccessView(t.tex.Get(), &u, t.uav.Put()))) return false;
     bytes += (size_t)w * h * n * bpp;
+    return true;
+}
+
+// The locks' and luma history's textures, made when the settings first want them. Zeroed: no lock
+// and no luma seen yet (a history start writes them before it reads them, so later this is moot).
+bool EnsureDepthFree(ID3D11Device *dev, Stream *s)
+{
+    if (s->lock[0].tex) return true;
+    if (s->dfFailed) return false;
+    bool ok = true;
+    size_t b = 0;
+    for (int i = 0; i < 2 && ok; ++i)
+        ok = CreateTex(dev, s->lock[i], s->rw, s->rh, s->slices, DXGI_FORMAT_R16G16_FLOAT, 4, b, true) &&
+             CreateTex(dev, s->lumaH[i], s->rw, s->rh, s->slices, DXGI_FORMAT_R8G8B8A8_UNORM, 4, b, true);
+    if (!ok) {
+        for (auto &t : s->lock) t.Drop();
+        for (auto &t : s->lumaH) t.Drop();
+        s->dfFailed = true;
+        LOGE("temporal: stream #%d: no memory for locks / lumaStability; running without them", s->id);
+        return false;
+    }
+    s->bytes += b;
     return true;
 }
 
@@ -395,6 +424,7 @@ Stream *CreateStream(DevState *ds, const TexState *ts, UINT count, const OutSig 
         s->Release();
         return nullptr;
     }
+    if (g_cfg.locks || g_cfg.lumaStability) EnsureDepthFree(dev, s);
     s->ok = true;
     s->AddRef();   // list reference
     Streams().push_back(s);
@@ -1073,6 +1103,13 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     TexState *ts = ve->tex.Get();
     const int x = s->xform;
     const UINT n = link->count;
+    // locks / lumaStability: switched on, their textures hold nothing current, so the history starts over
+    bool df = g_cfg.locks || g_cfg.lumaStability;
+    if (df && !s->dfOn) {
+        if (EnsureDepthFree(ds->dev.Get(), s)) s->needReset = true;
+        else df = false;
+    }
+    s->dfOn = df;
     const bool reset = s->needReset || s->resetGen != g_resetGen;
 
     TParams &p = r.p;
@@ -1119,6 +1156,7 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     p.sharp[1] = std::max(s->rh, AreaSide(s->outH, SharpArea(g_cfg)));
     const bool sharpOut = sharp > 0.0f && s->foveated && (p.sharp[0] > s->rw || p.sharp[1] > s->rh);
     if (sharpOut) p.misc[1] |= TF_SHARPOUT;
+    if (df) p.misc[1] |= (g_cfg.locks ? TF_LOCKS : 0u) | (g_cfg.lumaStability ? TF_LSTAB : 0u);
     const LinkGeo &geo = link->geo;
     const UINT tw = ts->src.Width, th = ts->src.Height;
     p.srcRect[0] = geo.sx; p.srcRect[1] = geo.sy; p.srcRect[2] = tw; p.srcRect[3] = th;
@@ -1142,7 +1180,7 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     r.n = n;
     r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
               ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
-              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u);
+              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (df ? SHAPE_DF : 0u);
 }
 
 namespace {
@@ -1208,11 +1246,23 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Indirect((r.shape & SHAPE_LOCAL) ? SH_T_REFINE : SH_T_REFINE_G, A_REFINE);
     Mark();
 
-    // 5. accumulate into whichever history is not current (the GPU knows which)
-    BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get() }, { s->hist[1].uav.Get() });
-    Indirect(SH_T_ACCUM_X0 + x, A_ACC01);
-    BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[1].srv.Get(), s->ctrl.srv.Get() }, { s->hist[0].uav.Get() });
-    Indirect(SH_T_ACCUM_X0 + x, A_ACC10);
+    // 5. accumulate into whichever history is not current (the GPU knows which); with locks /
+    //    lumaStability their state goes along, and this frame's L4 luma is the shading it watches
+    if (r.shape & SHAPE_DF) {
+        BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get(), s->cur[4].srv.Get(), s->lock[0].srv.Get(),
+                      s->lumaH[0].srv.Get() },
+               { s->hist[1].uav.Get(), s->lock[1].uav.Get(), s->lumaH[1].uav.Get() });
+        Indirect(SH_T_ACCUMDF_X0 + x, A_ACC01);
+        BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[1].srv.Get(), s->ctrl.srv.Get(), s->cur[4].srv.Get(), s->lock[1].srv.Get(),
+                      s->lumaH[1].srv.Get() },
+               { s->hist[0].uav.Get(), s->lock[0].uav.Get(), s->lumaH[0].uav.Get() });
+        Indirect(SH_T_ACCUMDF_X0 + x, A_ACC10);
+    } else {
+        BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get() }, { s->hist[1].uav.Get() });
+        Indirect(SH_T_ACCUM_X0 + x, A_ACC01);
+        BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[1].srv.Get(), s->ctrl.srv.Get() }, { s->hist[0].uav.Get() });
+        Indirect(SH_T_ACCUM_X0 + x, A_ACC10);
+    }
     Mark();
 
     // 6. output into this texture's proxy (RCAS or copy)

@@ -113,6 +113,9 @@ struct Config {
                                      // on SteamVR's thread); off: issue them call by call
     bool sharpHistory = false;       // resample the history with Lanczos-3 (else Catmull-Rom: cheaper, a little softer)
     bool bilinearEdges = false;      // outside temporalArea: bilinear instead of Catmull-Rom (cheaper, softer)
+    bool locks = false;              // after FSR 2: thin features (one input pixel wide) lock the history there
+                                     // against the clip for a while
+    bool lumaStability = false;      // after FSR 2: where the input's luma flickers, history is not clipped
 
     // [eyes] eye tracking (Bigscreen Beyond 2e)
     bool gazeFollow = false;         // the temporal area follows the gaze
