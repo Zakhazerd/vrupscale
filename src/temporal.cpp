@@ -101,7 +101,7 @@ enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OU
        A_LUMA, A_MARGIN, A_COUNT };
 // StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
 constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64,
-                   SHAPE_DF = 128, SHAPE_FSR = 256;
+                   SHAPE_DF = 128;
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
                TF_SHARPOUT = 128, TF_LOCKS = 256, TF_LSTAB = 512;
 constexpr UINT kStateBytes = 64;
@@ -165,7 +165,6 @@ public:
     // thin-feature lock (lifetime left, luma when locked) and the luma of the last four frames
     Tex lock[2], lumaH[2];
     bool dfOn = false, dfFailed = false;
-    bool fsrOn = false;            // [temporal] fsrHistory, as of the last run (its history differs from ours)
     Buf fp, state, ctrl, args, model;
     Ref<ID3D11Buffer> staging, debugStaging;
     bool stagingPending = false;
@@ -270,7 +269,7 @@ bool EnsureDepthFree(ID3D11Device *dev, Stream *s)
         for (auto &t : s->lock) t.Drop();
         for (auto &t : s->lumaH) t.Drop();
         s->dfFailed = true;
-        LOGE("temporal: stream #%d: no memory for locks / lumaStability / fsrHistory; running without them", s->id);
+        LOGE("temporal: stream #%d: no memory for locks / lumaStability; running without them", s->id);
         return false;
     }
     s->bytes += b;
@@ -425,7 +424,7 @@ Stream *CreateStream(DevState *ds, const TexState *ts, UINT count, const OutSig 
         s->Release();
         return nullptr;
     }
-    if (g_cfg.locks || g_cfg.lumaStability || g_cfg.fsrHistory) EnsureDepthFree(dev, s);
+    if (g_cfg.locks || g_cfg.lumaStability) EnsureDepthFree(dev, s);
     s->ok = true;
     s->AddRef();   // list reference
     Streams().push_back(s);
@@ -1104,17 +1103,13 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     TexState *ts = ve->tex.Get();
     const int x = s->xform;
     const UINT n = link->count;
-    // locks / lumaStability / fsrHistory: switched on, their textures hold nothing current, so the
-    // history starts over; so it does when fsrHistory changes (FSR 2's history is not ours)
-    bool df = g_cfg.locks || g_cfg.lumaStability || g_cfg.fsrHistory;
+    // locks / lumaStability: switched on, their textures hold nothing current, so the history starts over
+    bool df = g_cfg.locks || g_cfg.lumaStability;
     if (df && !s->dfOn) {
         if (EnsureDepthFree(ds->dev.Get(), s)) s->needReset = true;
         else df = false;
     }
     s->dfOn = df;
-    const bool fsr = df && g_cfg.fsrHistory;
-    if (fsr != s->fsrOn) s->needReset = true;
-    s->fsrOn = fsr;
     const bool reset = s->needReset || s->resetGen != g_resetGen;
 
     TParams &p = r.p;
@@ -1185,7 +1180,7 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     r.n = n;
     r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
               ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
-              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (df ? SHAPE_DF : 0u) | (fsr ? SHAPE_FSR : 0u);
+              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (df ? SHAPE_DF : 0u);
 }
 
 namespace {
@@ -1252,18 +1247,16 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Mark();
 
     // 5. accumulate into whichever history is not current (the GPU knows which); with locks /
-    //    lumaStability / fsrHistory their state goes along, and this frame's L4 luma is the shading
-    //    the locks watch
+    //    lumaStability their state goes along, and this frame's L4 luma is the shading it watches
     if (r.shape & SHAPE_DF) {
-        const int acc = ((r.shape & SHAPE_FSR) ? SH_T_ACCUMFSR_X0 : SH_T_ACCUMDF_X0) + x;
         BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get(), s->cur[4].srv.Get(), s->lock[0].srv.Get(),
                       s->lumaH[0].srv.Get() },
                { s->hist[1].uav.Get(), s->lock[1].uav.Get(), s->lumaH[1].uav.Get() });
-        Indirect(acc, A_ACC01);
+        Indirect(SH_T_ACCUMDF_X0 + x, A_ACC01);
         BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[1].srv.Get(), s->ctrl.srv.Get(), s->cur[4].srv.Get(), s->lock[1].srv.Get(),
                       s->lumaH[1].srv.Get() },
                { s->hist[0].uav.Get(), s->lock[0].uav.Get(), s->lumaH[0].uav.Get() });
-        Indirect(acc, A_ACC10);
+        Indirect(SH_T_ACCUMDF_X0 + x, A_ACC10);
     } else {
         BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get() }, { s->hist[1].uav.Get() });
         Indirect(SH_T_ACCUM_X0 + x, A_ACC01);

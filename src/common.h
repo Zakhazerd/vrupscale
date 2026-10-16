@@ -116,8 +116,6 @@ struct Config {
     bool locks = false;              // after FSR 2: thin features (one input pixel wide) lock the history there
                                      // against the clip for a while
     bool lumaStability = false;      // after FSR 2: where the input's luma flickers, history is not clipped
-    bool fsrHistory = false;         // FSR 2's accumulation instead of ours: a long history, clamped to a wide box and
-                                     // then nearly forgotten (locks / lumaStability as above protect it)
 
     // [eyes] eye tracking (Bigscreen Beyond 2e)
     bool gazeFollow = false;         // the temporal area follows the gaze
