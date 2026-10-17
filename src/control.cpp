@@ -97,6 +97,7 @@ void ConfigToSettings(const Config &c, VuSettings &s)
     s.gazeArea = c.gazeArea;
     s.sharpArea = c.sharpArea;
     s.gazeSharpArea = c.gazeSharpArea;
+    s.fxaa = c.fxaa;
     s.requireShared = c.requireShared;
     s.minWidth = c.minWidth;
     s.minHeight = c.minHeight;
@@ -132,6 +133,7 @@ void SettingsToConfig(const VuSettings &s, Config &c)
     if (s.gazeArea > 0.0f) c.gazeArea = s.gazeArea;   // (0: an app from before 0.6.1)
     if (s.sharpArea > 0.0f) c.sharpArea = s.sharpArea;   // (0: an app from before 0.6.4)
     if (s.gazeSharpArea > 0.0f) c.gazeSharpArea = s.gazeSharpArea;
+    c.fxaa = (s.fxaa == kFxaaBefore || s.fxaa == kFxaaAfter) ? s.fxaa : kFxaaOff;
     c.requireShared = s.requireShared != 0;
     c.minWidth = s.minWidth;
     c.minHeight = s.minHeight;
@@ -356,7 +358,7 @@ const FileField kFileFields[] = {
     VU_FIELD(bilinearEdges, 0.0f, "bilinearEdges"), VU_FIELD(gazeFollow, 0.0f, "followGaze"),
     VU_FIELD(gazeShow, 0.0f, "showGaze"), VU_FIELD(gazeOffset, 0.0002f, "offset"), VU_FIELD(eyeProj, 0.0002f, "projection"),
     VU_FIELD(gazeArea, 0.006f, "gazeArea"), VU_FIELD(sharpArea, 0.006f, "sharpnessArea"),
-    VU_FIELD(gazeSharpArea, 0.006f, "gazeSharpnessArea"),
+    VU_FIELD(gazeSharpArea, 0.006f, "gazeSharpnessArea"), VU_FIELD(fxaa, 0.0f, "fxaa"),
 };
 #undef VU_FIELD
 static_assert(offsetof(VuSettings, exclude) == offsetof(VuSettings, excludeCount) + 4, "excludeCount, then exclude");

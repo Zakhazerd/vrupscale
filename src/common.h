@@ -15,7 +15,7 @@
 #include <vector>
 #include <utility>
 
-#define VU_VERSION_STR "0.6.6"
+#define VU_VERSION_STR "0.6.7"
 
 namespace vu {
 
@@ -64,6 +64,9 @@ const char *FormatName(DXGI_FORMAT f);
 // thread after startup, except g_logLevel which is atomic.
 enum class Mode : int { Temporal = 0, Fsr = 1, Bilinear = 2 };
 const char *ModeName(Mode m);
+// [upscale] fxaa: FXAA on the game's picture before it is upscaled, or on the upscaled picture
+enum : int { kFxaaOff = 0, kFxaaBefore = 1, kFxaaAfter = 2 };
+const char *FxaaName(int f);
 
 struct Size2 { int w, h; };
 
@@ -73,6 +76,7 @@ struct Config {
     Mode mode = Mode::Temporal;      // temporal | fsr | bilinear
     float upscaleFactor = 1.3f;      // per-axis output/input ratio
     float sharpness = 1.0f;          // 0 = RCAS off, 1 = max
+    int fxaa = kFxaaOff;             // FXAA before the upscale, after it, or off (Ctrl+F9 cycles)
     int minWidth = 1000;
     int minHeight = 1000;
     float minAspect = 0.6f;          // width / height, per array slice

@@ -98,9 +98,10 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 }
 
 enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OUT0, A_COPY, A_GLOBAL, A_REFINE, A_OUTER,
-       A_LUMA, A_MARGIN, A_COUNT };
+       A_LUMA, A_MARGIN, A_FXPRE, A_FXPOST, A_COUNT };
 // StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
-constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64;
+constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64,
+                   SHAPE_FXPRE = 128, SHAPE_FXPOST = 256;   // FXAA before / after the upscale
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
                TF_SHARPOUT = 128;
 constexpr UINT kStateBytes = 64;
@@ -1143,6 +1144,9 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
               ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
               (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u);
+    const int fx = EnsureFxaa(ds, ts, g_cfg.fxaa);
+    if (fx == kFxaaBefore) r.shape |= SHAPE_FXPRE;
+    if (fx == kFxaaAfter) r.shape |= SHAPE_FXPOST;
 }
 
 namespace {
@@ -1167,16 +1171,24 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
         SetCS(ctx, ds->cs[shader].Get());
         ctx->DispatchIndirect(args, entry * 12);
     };
-    ID3D11ShaderResourceView *src = r.ve->srcRead.Get();
+    // what the passes after FP read: the source, or with FXAA before the upscale its result
+    ID3D11ShaderResourceView *srcRead = r.ve->srcRead.Get();
+    ID3D11ShaderResourceView *src = (r.shape & SHAPE_FXPRE) ? ts->fxSRV.Get() : srcRead;
+    // where OUT, OUTER and MARGIN write: the proxy, or with FXAA after the upscale what FXAA reads
+    ID3D11UnorderedAccessView *out = (r.shape & SHAPE_FXPOST) ? ts->fxUAV.Get() : ts->proxyUAV.Get();
 
     // 1. sparse fingerprint of the whole texture, whose last group decides (always: the only work
     //    for a frame already processed), then luma straight to L1 (new frames only)
     const UINT zero[4] = { 0, 0, 0, 0 };
     ctx->ClearUnorderedAccessViewUint(s->fp.uav.Get(), zero);
     SetCS(ctx, ds->cs[SH_T_FPD_X0 + x].Get());
-    BindCS(ctx, { src }, { s->fp.uav.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
-                           s->state.uav.Get(), s->args.uav.Get(), s->ctrl.uav.Get(), link->linkUAV });
+    BindCS(ctx, { srcRead }, { s->fp.uav.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
+                               s->state.uav.Get(), s->args.uav.Get(), s->ctrl.uav.Get(), link->linkUAV });
     ctx->Dispatch((r.tw + 63) / 64, (r.th + 63) / 64, r.n);   // one sample per 8x8 block (the shader counts these groups)
+    if (r.shape & SHAPE_FXPRE) {   // FXAA before the upscale, whenever the proxy is written
+        BindCS(ctx, { srcRead }, { ts->fxUAV.Get() });   // (the args buffer must not stay bound as a UAV)
+        Indirect(SH_T_FXPRE_X0 + x, A_FXPRE);
+    }
     BindCS(ctx, { src }, { s->cur[1].uav.Get() });   // (the args buffer must not stay bound as a UAV)
     Indirect(SH_T_LUMA_X0 + x, A_LUMA);
     Mark();
@@ -1217,17 +1229,21 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
 
     // 6. output into this texture's proxy (RCAS or copy)
     const int outShader = ((r.shape & SHAPE_RCAS) ? SH_T_OUTRCAS_X0 : SH_T_OUTCOPY_X0) + x;
-    BindCS(ctx, { s->hist[1].srv.Get(), src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
+    BindCS(ctx, { s->hist[1].srv.Get(), src, s->ctrl.srv.Get() }, { out });
     Indirect(outShader, A_OUT1);
-    BindCS(ctx, { s->hist[0].srv.Get(), src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
+    BindCS(ctx, { s->hist[0].srv.Get(), src, s->ctrl.srv.Get() }, { out });
     Indirect(outShader, A_OUT0);
     if (r.shape & SHAPE_OUTER) {   // outside the region (and around the content rectangle): this frame alone
-        BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { ts->proxyUAV.Get() });
+        BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { out });
         Indirect(((r.shape & SHAPE_SHARPOUT) ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
     }
     if (r.shape & SHAPE_MARGIN) {   // outside the content rectangle (the compositor does not sample it): repaints only
-        BindCS(ctx, { nullptr, src }, { ts->proxyUAV.Get() });
+        BindCS(ctx, { nullptr, src }, { out });
         Indirect(SH_T_MARGIN_X0 + x, A_MARGIN);
+    }
+    if (r.shape & SHAPE_FXPOST) {   // FXAA after the upscale: over all of it, into the proxy (in its encoding)
+        BindCS(ctx, { ts->fxSRV.Get() }, { ts->proxyUAV.Get() });
+        Indirect(x == kFloat ? SH_T_FXPOST_X2 : SH_T_FXPOST_X0, A_FXPOST);
     }
     Mark();
 
@@ -1272,6 +1288,16 @@ bool EnsureRecorder(DevState *ds)
 
 } // namespace
 
+// the FXAA views a run binds (none without FXAA)
+static ID3D11ShaderResourceView *FxSRV(const TexState *ts, const StreamRun &r)
+{
+    return (r.shape & (SHAPE_FXPRE | SHAPE_FXPOST)) ? ts->fxSRV.Get() : nullptr;
+}
+static ID3D11UnorderedAccessView *FxUAV(const TexState *ts, const StreamRun &r)
+{
+    return (r.shape & (SHAPE_FXPRE | SHAPE_FXPOST)) ? ts->fxUAV.Get() : nullptr;
+}
+
 bool StreamListReady(DevState *ds, StreamRun &r)
 {
     ViewEntry *ve = r.ve;
@@ -1282,7 +1308,7 @@ bool StreamListReady(DevState *ds, StreamRun &r)
     ID3D11UnorderedAccessView *box = r.probe ? r.probe->boxUAV.Get() : nullptr;
     if (rec.list && rec.streamId == s->id && rec.src.Get() == ve->srcRead.Get() && rec.proxy.Get() == ts->proxyUAV.Get() &&
         rec.probeMem.Get() == mem && rec.probeBox.Get() == box && rec.link.Get() == r.link->linkUAV && rec.tw == r.tw &&
-        rec.th == r.th && rec.n == r.n && rec.shape == r.shape)
+        rec.th == r.th && rec.n == r.n && rec.shape == r.shape && rec.fxSRV.Get() == FxSRV(ts, r) && rec.fxUAV.Get() == FxUAV(ts, r))
         return true;
     rec = RecordedRun();
     if (!EnsureRecorder(ds)) return false;
@@ -1313,6 +1339,8 @@ bool StreamListReady(DevState *ds, StreamRun &r)
     rec.th = r.th;
     rec.n = r.n;
     rec.shape = r.shape;
+    rec.fxSRV = Ref<ID3D11ShaderResourceView>(FxSRV(ts, r), true);
+    rec.fxUAV = Ref<ID3D11UnorderedAccessView>(FxUAV(ts, r), true);
     InterlockedIncrement(&g_stats.listsRecorded);
     return true;
 }
@@ -1398,7 +1426,8 @@ void ReleaseGate(ContentGate &g)
 }
 
 bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11ShaderResourceView *src, UINT first,
-                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2)
+                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2,
+                    UINT gx3, UINT gy3)
 {
     if (!ds->gateFpUAV || !EnsureGate(ds, g)) return false;
     const UINT w = ts->src.Width, h = ts->src.Height;
@@ -1413,6 +1442,7 @@ bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11
     p.misc[2] = count;
     p.strides[0] = gx; p.strides[1] = gy; p.strides[2] = gz;
     p.size23[0] = gx2; p.size23[1] = gy2;
+    p.size4out[0] = gx3; p.size4out[1] = gy3;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx->Map(ds->tcb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
     memcpy(m.pData, &p, sizeof(p));

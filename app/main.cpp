@@ -37,7 +37,7 @@ enum : int {
     IDC_TINT, IDC_HOTKEYS, IDC_AREA, IDC_AREAVAL, IDC_AREAHINT, IDC_HIST, IDC_HISTVAL, IDC_MOVING, IDC_MOVINGVAL, IDC_TOL, IDC_TOLVAL,
     IDC_DEFAULTS, IDC_SAVED, IDC_OPENLOG, IDC_OPENFOLDER, IDC_STATUS, IDC_DETAIL, IDC_TEXLIST, IDC_TEXHINT, IDC_EVENTS,
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
-    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR, IDC_SHARPAREA, IDC_SHARPAREAVAL,
+    IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR, IDC_SHARPAREA, IDC_SHARPAREAVAL, IDC_FXAA,
 };
 enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
@@ -129,14 +129,14 @@ DWORD g_lastInstallCheck = 0;
 
 // ---- layout (logical pixels) ------------------------------------------------------------------
 
-constexpr float kW = 1120, kH = 866;   // the page
+constexpr float kW = 1120, kH = 900;   // the page
 constexpr float kColW = 348;
-const RectF kCardUp = { 24, 214, kColW, 410 };
-const RectF kCardEye = { 24, 638, kColW, 210 };
+const RectF kCardUp = { 24, 214, kColW, 444 };
+const RectF kCardEye = { 24, 672, kColW, 210 };
 const RectF kCardTemp = { 386, 214, kColW, 302 };
-const RectF kCardVR = { 386, 530, kColW, 318 };   // SteamVR, and the settings file
+const RectF kCardVR = { 386, 530, kColW, 352 };   // SteamVR, and the settings file
 const RectF kCardTex = { 748, 214, kColW, 262 };
-const RectF kCardEv = { 748, 490, kColW, 358 };
+const RectF kCardEv = { 748, 490, kColW, 392 };
 const RectF kList = { kCardTex.x + 14, kCardTex.y + 52, kColW - 28, 160 };
 const RectF kLog = { kCardEv.x + 14, kCardEv.y + 52, kColW - 28, kCardEv.h - 66 };
 constexpr float kRowH = 40, kLogLineH = 15;
@@ -328,6 +328,7 @@ void ModelToUi()
     SetCheck(IDC_ENABLED, g_s.enabled != 0);
     SetSel(IDC_MODE, g_s.mode);
     SetSel(IDC_SCALE, VuScalePreset(g_s.upscaleFactor));
+    SetSel(IDC_FXAA, g_s.fxaa);
     SetPos(IDC_SHARP, (int)lroundf(g_s.sharpness * 100));
     SetCheck(IDC_TINT, g_s.tint != 0);
     SetCheck(IDC_HOTKEYS, g_s.hotkeys != 0);
@@ -1467,10 +1468,18 @@ void CreateControls()
     }
     AddSlider(IDC_SHARP, { U.x + 20, U.y + 270, U.w - 40, 30 }, L"Sharpness", 0, 100, 128);
     AddSlider(IDC_SHARPAREA, { U.x + 20, U.y + 304, U.w - 40, 30 }, L"Sharpness area", 30, 100, 128);
-    AddWidget(IDC_TINT, Kind::Toggle, { U.x + 20, U.y + 342, U.w - 40, 26 }, L"Debug tint", ui::BtnOutline,
+    {
+        ui::Widget w;   // FXAA: off, before the upscale, after it (the label is drawn beside it)
+        w.id = IDC_FXAA;
+        w.kind = Kind::Segment;
+        w.r = { U.x + 148, U.y + 338, U.w - 168, 30 };
+        w.items = { L"Off", L"Before", L"After" };
+        g_w.push_back(w);
+    }
+    AddWidget(IDC_TINT, Kind::Toggle, { U.x + 20, U.y + 376, U.w - 40, 26 }, L"Debug tint", ui::BtnOutline,
               L"magenta = upscaled");
-    AddWidget(IDC_HOTKEYS, Kind::Toggle, { U.x + 20, U.y + 372, U.w - 40, 26 }, L"Shortcuts in VR", ui::BtnOutline,
-              L"Ctrl+F1 to F8");
+    AddWidget(IDC_HOTKEYS, Kind::Toggle, { U.x + 20, U.y + 406, U.w - 40, 26 }, L"Shortcuts in VR", ui::BtnOutline,
+              L"Ctrl+F1 to F9");
     AddSlider(IDC_AREA, { T.x + 20, T.y + 50, T.w - 40, 30 }, L"Temporal area", 30, 100, 128);
     AddSlider(IDC_HIST, { T.x + 20, T.y + 122, T.w - 40, 30 }, L"History strength", 10, 200, 128);
     AddSlider(IDC_MOVING, { T.x + 20, T.y + 156, T.w - 40, 30 }, L"Moving objects", 0, 100, 128);
@@ -1484,10 +1493,10 @@ void CreateControls()
     AddWidget(IDC_GAZESHOW, Kind::Toggle, { Y.x + 20, Y.y + 92, Y.w - 40, 26 }, L"Show gaze", ui::BtnOutline, L"a green ring in VR");
     AddWidget(IDC_CALIBRATE, Kind::Button, { Y.x + 20, Y.y + 126, 112, 32 }, L"Calibrate", ui::BtnPrimary);
     AddWidget(IDC_CALCLEAR, Kind::Button, { Y.x + 142, Y.y + 126, 150, 32 }, L"Clear calibration");
-    AddWidget(IDC_WITHVR, Kind::Toggle, { V.x + 20, V.y + 226, V.w - 40, 26 }, L"Start with SteamVR", ui::BtnOutline,
+    AddWidget(IDC_WITHVR, Kind::Toggle, { V.x + 20, V.y + 260, V.w - 40, 26 }, L"Start with SteamVR", ui::BtnOutline,
               L"and close with it");
-    AddWidget(IDC_DEFAULTS, Kind::Button, { V.x + 20, V.y + 266, 150, 32 }, L"Restore defaults");
-    AddWidget(IDC_OPENFOLDER, Kind::Button, { V.x + 180, V.y + 266, 120, 32 }, L"Settings file");
+    AddWidget(IDC_DEFAULTS, Kind::Button, { V.x + 20, V.y + 300, 150, 32 }, L"Restore defaults");
+    AddWidget(IDC_OPENFOLDER, Kind::Button, { V.x + 180, V.y + 300, 120, 32 }, L"Settings file");
     AddWidget(IDC_BROWSE, Kind::Button, { V.r() - 140, V.y + 14, 120, 30 }, L"Choose folder…");
     AddWidget(IDC_INSTALL, Kind::Button, { V.x + 20, V.y + 112, 120, 34 }, L"Install", ui::BtnPrimary);
     AddWidget(IDC_UNINSTALL, Kind::Button, { V.x + 150, V.y + 112, 112, 34 }, L"Uninstall");
@@ -1771,8 +1780,14 @@ std::wstring TipText(int id, int part, std::wstring &title)
     case IDC_HOTKEYS:
         title = L"Shortcuts in VR";
         return L"Function-key shortcuts that work while you are in VR: Ctrl+F1 on/off, F2 mode, F3 debug tint, F4 sharpness, "
-               L"F5 next scaling preset, F6 Sharp history, F7 Bilinear edges, F8 calibrate the eye tracking. The app's "
-               L"controls follow along and save the change.";
+               L"F5 next scaling preset, F6 Sharp history, F7 Bilinear edges, F8 calibrate the eye tracking, F9 FXAA (off, "
+               L"before, after). The app's controls follow along and save the change.";
+    case IDC_FXAA:
+        title = L"FXAA";
+        return L"FXAA anti-aliasing, before the upscale (on the game's picture, so the upscale works from it) or after it (on "
+               L"the upscaled picture), in every mode. It smooths stair-stepped edges and costs some fine detail. In testing it "
+               L"made Temporal softer either way; it steadied a game without anti-aliasing of its own, most in FSR 1 mode. "
+               L"Default off. Ctrl+F9 in VR steps through off, before and after.";
     case IDC_AREA:
         title = g_s.gazeFollow ? L"Temporal area, following your gaze" : L"Temporal area";
         return L"The width and height of the part of each eye's picture that gets the full treatment: history and motion "
@@ -1975,6 +1990,7 @@ void DrawPage(ui::Canvas &c)
     c.Text(ui::F_SMALL, en && en->on ? L"On" : L"Off", en->r.x - 10, ui::Mid(ui::F_SMALL, en->r.cy()), col::inkSoft, 2);
     c.Wrap(ui::F_SMALL, kModeCaption[std::max(0, std::min(2, (int)g_s.mode))], { U.x + 22, U.y + 90, U.w - 44, 34 }, 17, col::inkSoft, 2);
     c.Text(ui::F_LABEL, L"Scaling", U.x + 20, ui::Mid(ui::F_LABEL, U.y + 143), col::ink);
+    c.Text(ui::F_LABEL, L"FXAA", U.x + 20, ui::Mid(ui::F_LABEL, U.y + 353), col::ink);
     c.Text(ui::F_VALUE, TextOf(IDC_FACTORVAL), U.r() - 20, ui::Mid(ui::F_VALUE, U.y + 143), col::ink, 2);
     c.Wrap(ui::F_SMALL, TextOf(IDC_FACTORHINT), { U.x + 22, U.y + 198, U.w - 44, 51 }, 17, col::inkSoft, 3);
     // Eye tracking
@@ -1993,9 +2009,9 @@ void DrawPage(ui::Canvas &c)
     c.PathText(ui::F_SMALL, TextOf(IDC_STEAMPATH), V.x + 20, V.y + 60, V.w - 40, col::inkSoft);
     c.Wrap(ui::F_LABEL, TextOf(IDC_INSTALLSTATE), { V.x + 20, V.y + 68, V.w - 40, 40 }, 19, col::ink, 2);
     const std::wstring saveError = TextOf(IDC_SAVED);   // (settings that couldn't be saved come first)
-    c.Wrap(ui::F_SMALL, saveError.empty() ? TextOf(IDC_INSTALLMSG) : saveError, { V.x + 20, V.y + 154, V.w - 40, 50 }, 16,
+    c.Wrap(ui::F_SMALL, saveError.empty() ? TextOf(IDC_INSTALLMSG) : saveError, { V.x + 20, V.y + 154, V.w - 40, 84 }, 16,
            saveError.empty() ? col::inkSoft : col::red, 3);
-    c.Fill({ V.x + 20, V.y + 214, V.w - 40, 1.5f }, col::inkFaint);
+    c.Fill({ V.x + 20, V.y + 248, V.w - 40, 1.5f }, col::inkFaint);
 
     // Textures
     const RectF X = kCardTex;
@@ -2186,6 +2202,11 @@ void OnSegment(int id, int part)
 {
     if (id == IDC_MODE) OnMode(part);
     else if (id == IDC_SCALE) OnScale(part);
+    else if (id == IDC_FXAA && part >= 0 && part <= 2 && part != g_s.fxaa) {
+        g_s.fxaa = part;
+        ModelToUi();
+        Changed(true);
+    }
 }
 
 // Arrow keys on a segment control: one step, no wrapping. The scaling presets step from a
@@ -2644,9 +2665,10 @@ int WriteStatusFile(const std::wstring &path, int waitMs)
         const VuSettings &c = st.current;
         snprintf(line, sizeof(line),
                  "enabled=%d\nmode=%s\nupscaleFactor=%.2f\nsharpHistory=%d\nbilinearEdges=%d\nsharpness=%.2f\ntint=%d\nhotkeys=%d\n"
-                 "maxWeight=%.2f\nlocalTrust=%.2f\nresidualTol=%.2f\ntemporalArea=%.2f\nsharpnessArea=%.2f\nexcluded=%d\ngpuMsPerSec=%.3f\n",
+                 "maxWeight=%.2f\nlocalTrust=%.2f\nresidualTol=%.2f\ntemporalArea=%.2f\nsharpnessArea=%.2f\nfxaa=%d\nexcluded=%d\n"
+                 "gpuMsPerSec=%.3f\n",
                  c.enabled, Narrow(ModeLabel(c.mode)).c_str(), c.upscaleFactor, c.fastHistory ? 0 : 1, c.bilinearEdges, c.sharpness, c.tint,
-                 c.hotkeys, c.maxWeight, c.localTrust, c.residualTol, c.temporalArea, c.sharpArea, c.excludeCount, st.gpuMsPerSec);
+                 c.hotkeys, c.maxWeight, c.localTrust, c.residualTol, c.temporalArea, c.sharpArea, c.fxaa, c.excludeCount, st.gpuMsPerSec);
         out += line;
         for (uint32_t k = 0; k < st.texCount && k < kVuMaxTex; ++k) {
             const VuTexInfo &t = st.tex[k];

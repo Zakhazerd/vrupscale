@@ -20,6 +20,9 @@
     X(FSR_OUTSH_X0,    "upscale.hlsl",  "PASS=3;XFORM=0;OSHARP=1")            \
     X(FSR_OUTSH_X1,    "upscale.hlsl",  "PASS=3;XFORM=1;OSHARP=1")            \
     X(FSR_OUTSH_X2,    "upscale.hlsl",  "PASS=3;XFORM=2;OSHARP=1")            \
+    X(FSR_FXAA_X0,     "upscale.hlsl",  "PASS=4;XFORM=0")                     \
+    X(FSR_FXAA_X1,     "upscale.hlsl",  "PASS=4;XFORM=1")                     \
+    X(FSR_FXAA_X2,     "upscale.hlsl",  "PASS=4;XFORM=2")                     \
     /* temporal path (shaders/temporal.hlsl) */                               \
     X(T_LUMA_X0,       "temporal.hlsl", "TPASS=0;XFORM=0")                    \
     X(T_LUMA_X1,       "temporal.hlsl", "TPASS=0;XFORM=1")                    \
@@ -57,7 +60,13 @@
     X(T_FPS_X2,        "temporal.hlsl", "TPASS=11;FPMODE=2;XFORM=2")          \
     X(T_MARGIN_X0,     "temporal.hlsl", "TPASS=13;XFORM=0")                   \
     X(T_MARGIN_X1,     "temporal.hlsl", "TPASS=13;XFORM=1")                   \
-    X(T_MARGIN_X2,     "temporal.hlsl", "TPASS=13;XFORM=2")
+    X(T_MARGIN_X2,     "temporal.hlsl", "TPASS=13;XFORM=2")                   \
+    /* [upscale] fxaa: before the upscale (the source) and after it (the proxy) */ \
+    X(T_FXPRE_X0,      "temporal.hlsl", "TPASS=14;FXSTAGE=0;XFORM=0")         \
+    X(T_FXPRE_X1,      "temporal.hlsl", "TPASS=14;FXSTAGE=0;XFORM=1")         \
+    X(T_FXPRE_X2,      "temporal.hlsl", "TPASS=14;FXSTAGE=0;XFORM=2")         \
+    X(T_FXPOST_X0,     "temporal.hlsl", "TPASS=14;FXSTAGE=1;XFORM=0")         \
+    X(T_FXPOST_X2,     "temporal.hlsl", "TPASS=14;FXSTAGE=1;XFORM=2")
 
 #ifdef __cplusplus
 namespace vu {

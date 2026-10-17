@@ -113,6 +113,11 @@ bool LoadConfig(Config &c, std::wstring *pathOut)
     c.mode = m0 == L'b' ? Mode::Bilinear : (m0 == L'f' ? Mode::Fsr : Mode::Temporal);
     c.upscaleFactor = ReadFloat(ini, L"upscale", L"upscaleFactor", d.upscaleFactor);
     c.sharpness = ReadFloat(ini, L"upscale", L"sharpness", d.sharpness);
+    {
+        const std::wstring f = ReadStr(ini, L"upscale", L"fxaa", L"off");
+        const wchar_t f0 = f.empty() ? L'o' : towlower(f[0]);
+        c.fxaa = (f0 == L'b' || f0 == L'1') ? kFxaaBefore : ((f0 == L'a' || f0 == L'2') ? kFxaaAfter : kFxaaOff);
+    }
     c.dedupeMs = ReadFloat(ini, L"upscale", L"dedupeMs", d.dedupeMs);
     c.tint = ReadBool(ini, L"upscale", L"debugTint", d.tint);
 
@@ -231,8 +236,8 @@ void SanitizeConfig(Config &c)
 void PrintConfig(const Config &c)
 {
     LOGI("config: active=%d enabled=%d mode=%s upscaleFactor=%.3f sharpness=%.2f sharpnessArea=%.2f gazeSharpnessArea=%.2f "
-         "dedupeMs=%.1f tint=%d sharpHistory=%d bilinearEdges=%d followGaze=%d showGaze=%d gazeOffset=%.3f,%.3f",
-         c.active, c.enabled, ModeName(c.mode), c.upscaleFactor, c.sharpness, c.sharpArea, c.gazeSharpArea, c.dedupeMs, c.tint,
+         "fxaa=%s dedupeMs=%.1f tint=%d sharpHistory=%d bilinearEdges=%d followGaze=%d showGaze=%d gazeOffset=%.3f,%.3f",
+         c.active, c.enabled, ModeName(c.mode), c.upscaleFactor, c.sharpness, c.sharpArea, c.gazeSharpArea, FxaaName(c.fxaa), c.dedupeMs, c.tint,
          c.sharpHistory, c.bilinearEdges, c.gazeFollow, c.gazeShow, c.gazeOffset[0], c.gazeOffset[1]);
     LOGI("config: temporal maxWeight=%.1f clipGamma=%.2f residualTol=%.3f sampleSigma=%.2f minNewWeight=%.3f lkEps=%.4f "
          "searchLambda=%.4f clipReject=%.2f localTrust=%.2f localGate=%.2f localRatio=%.2f temporalArea=%.2f gazeArea=%.2f maxStreams=%d "
@@ -247,6 +252,8 @@ void PrintConfig(const Config &c)
     for (auto &s : c.excludeSizes) LOGI("config:   excludeSize %dx%d", s.w, s.h);
     LOGI("config: logLevel=%d statsIntervalSec=%d hotkeys=%d gpuTiming=%d", c.logLevel, c.statsIntervalSec, c.hotkeys, c.gpuTiming);
 }
+
+const char *FxaaName(int f) { return f == kFxaaBefore ? "before" : (f == kFxaaAfter ? "after" : "off"); }
 
 const char *ModeName(Mode m)
 {

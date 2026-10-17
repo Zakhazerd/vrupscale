@@ -95,7 +95,9 @@ typedef struct VuSettings {
     float gazeArea;               // the area while Follow gaze is on (since 0.6.1; 0 from an older app = the default)
     float sharpArea;              // [upscale] the part RCAS sharpens, at least the area (since 0.6.4; 0 = the default) ...
     float gazeSharpArea;          // ... and while Follow gaze is on
-    int32_t reserved[13];
+    int32_t fxaa;                 // [upscale] FXAA: 0 off, 1 before the upscale, 2 after it (since 0.6.7; 0 from an
+                                  // older app = off)
+    int32_t reserved[12];
 } VuSettings;
 
 typedef struct VuTexInfo {

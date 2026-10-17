@@ -240,6 +240,9 @@ TexState::~TexState()
     if (probe) InterlockedExchange(&probe->dead, 1);   // the render thread drops it from its list
     for (int i = 0; i < nlinks; ++i) ReleaseLink(links[i]);
     for (auto &g : gates) ReleaseGate(g);
+    DeferRelease(fxUAV.Detach());
+    DeferRelease(fxSRV.Detach());
+    DeferRelease(fx.Detach());
     DeferRelease(proxyUAV.Detach());
     DeferRelease(proxy.Detach());
     InterlockedDecrement(&g_stats.liveTexStates);
@@ -255,6 +258,8 @@ ViewEntry::~ViewEntry()
     DeferRelease(rec.probeMem.Detach());
     DeferRelease(rec.probeBox.Detach());
     DeferRelease(rec.link.Detach());
+    DeferRelease(rec.fxUAV.Detach());
+    DeferRelease(rec.fxSRV.Detach());
     DeferRelease(proxySRV.Detach());
     DeferRelease(srcRead.Detach());
     DeferRelease(static_cast<IUnknown *>(tex.Detach()));
@@ -372,6 +377,61 @@ bool UavStoreSupported(DevState *ds, DXGI_FORMAT f)
     ds->uavFmts.push_back({ f, ok });
     LOGI("device %p: typed UAV store for %s: %s", (void *)ds->dev.Get(), FormatName(f), ok ? "yes" : "NO");
     return ok;
+}
+
+int EnsureFxaa(DevState *ds, TexState *ts, int mode)
+{
+    if (ts->fx && ts->fxMode != mode) {   // (a recorded run that binds it holds its own references)
+        DeferRelease(ts->fxUAV.Detach());
+        DeferRelease(ts->fxSRV.Detach());
+        DeferRelease(ts->fx.Detach());
+        ts->fxMode = kFxaaOff;
+    }
+    if (mode == kFxaaOff) return kFxaaOff;
+    if (ts->fx) return mode;
+    if (ts->fxFailed == mode) return kFxaaOff;
+    // before: the source's size and slices, in its own encoding (RGBA16F holds any of them);
+    // after: the proxy's size, slices and format (FXAA reads it as the compositor would)
+    const bool before = mode == kFxaaBefore;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = before ? ts->src.Width : ts->plan.outW;
+    d.Height = before ? ts->src.Height : ts->plan.outH;
+    d.MipLevels = 1;
+    d.ArraySize = ts->src.ArraySize;
+    d.Format = before ? DXGI_FORMAT_R16G16B16A16_FLOAT : ts->plan.proxyFmt;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    const DXGI_FORMAT view = before ? DXGI_FORMAT_R16G16B16A16_FLOAT : ts->plan.uavFmt;
+    HRESULT hr = ds->dev->CreateTexture2D(&d, nullptr, ts->fx.Put());
+    if (SUCCEEDED(hr)) {
+        UINT32 ours = 1;
+        ts->fx->SetPrivateData(kGuidOurs, sizeof(ours), &ours);
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = view;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        sd.Texture2DArray.MipLevels = 1;
+        sd.Texture2DArray.ArraySize = d.ArraySize;
+        hr = ds->dev->CreateShaderResourceView(ts->fx.Get(), &sd, ts->fxSRV.Put());
+    }
+    if (SUCCEEDED(hr)) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = view;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        ud.Texture2DArray.ArraySize = d.ArraySize;
+        hr = ds->dev->CreateUnorderedAccessView(ts->fx.Get(), &ud, ts->fxUAV.Put());
+    }
+    if (FAILED(hr)) {
+        LOGE("fxaa: no %ux%u x%u %s texture for FXAA %s the upscale (0x%08lx); off for this texture", d.Width, d.Height,
+             d.ArraySize, FormatName(d.Format), before ? "before" : "after", (unsigned long)hr);
+        ts->fxUAV.Reset();
+        ts->fxSRV.Reset();
+        ts->fx.Reset();
+        ts->fxFailed = mode;
+        return kFxaaOff;
+    }
+    ts->fxMode = mode;
+    return mode;
 }
 
 namespace {
@@ -1054,6 +1114,13 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     const bool sharpOut = rcas && fov && area.sharpBeyond;
     uint32_t rcasCon[4];
     FsrRcasCon(rcasCon, 2.0f - 2.0f * sharp);
+    // FXAA before the upscale: the passes read the source after FXAA; after it: they write into the
+    // texture FXAA then reads to write the proxy
+    const int fx = EnsureFxaa(ds, ts, g_cfg.fxaa);
+    ID3D11ShaderResourceView *srcIn = fx == kFxaaBefore ? ts->fxSRV.Get() : ve->srcRead.Get();
+    ID3D11UnorderedAccessView *outUAV = fx == kFxaaAfter ? ts->fxUAV.Get() : ts->proxyUAV.Get();
+    const UINT fxW = fx == kFxaaBefore ? w : span[2], fxH = fx == kFxaaBefore ? h : span[3];
+    const UINT fgx = fx ? (fxW + 7) / 8 : 0, fgy = fx ? (fxH + 7) / 8 : 0;
     auto Common = [&](Params &q) {
         q.fov[0] = area.band;
         q.fov[1] = fov ? FOV_ON | (g_cfg.bilinearEdges ? FOV_BILINEAR : 0u) | (sharpOut ? FOV_SHARP : 0u) : 0u;
@@ -1074,16 +1141,29 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     ID3D11Buffer *gateArgs = nullptr;
     if (slot >= 0) {
         ContentGate &g = ts->gates[slot];
-        if (RunContentGate(ctx, ds, ts, ve->srcRead.Get(), first, count, x, g, g.outGen != g_outGen, ax, ay, count, gx, gy))
+        if (RunContentGate(ctx, ds, ts, ve->srcRead.Get(), first, count, x, g, g.outGen != g_outGen, ax, ay, count, gx, gy, fgx,
+                           fgy))
             gateArgs = ds->gateArgs.Get();
     }
-    // entries 0 and 1: EASU and RCAS (over the area when foveated, else the span), 2: OUTER (the span)
+    // entries 0 and 1: EASU and RCAS (over the area when foveated, else the span), 2: OUTER (the span),
+    // 3: FXAA (the texture before the upscale, the span after it)
     auto Run = [&](UINT argOffset) {
         if (gateArgs) ctx->DispatchIndirect(gateArgs, argOffset);
+        else if (argOffset == 36) ctx->Dispatch(fgx, fgy, count);
         else if (argOffset == 24) ctx->Dispatch(gx, gy, count);
         else ctx->Dispatch(ax, ay, count);
     };
     SetCSConstants(ctx, ds->cb.Get());
+    auto Fxaa = [&](ID3D11ShaderResourceView *in, ID3D11UnorderedAccessView *out, int xf, UINT x0, UINT y0) {
+        Params f = {};
+        f.pad[0] = first;
+        f.span[0] = x0; f.span[1] = y0; f.span[2] = fxW; f.span[3] = fxH;
+        if (!WriteParams(ctx, ds, f)) return;
+        SetCS(ctx, ds->cs[SH_FSR_FXAA_X0 + xf].Get());
+        BindCS(ctx, { in }, { out });
+        Run(36);
+    };
+    if (fx == kFxaaBefore) Fxaa(ve->srcRead.Get(), ts->fxUAV.Get(), x, 0, 0);
 
     Params p = {};
     p.outSize[0] = ow; p.outSize[1] = oh;
@@ -1100,7 +1180,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         if (!WriteParams(ctx, ds, p)) return;
         SetCS(ctx, ds->cs[SH_FSR_BILIN_X0 + x].Get());
     }
-    BindCS(ctx, { ve->srcRead.Get(), ve->srcRead.Get() }, { rcas ? ds->scratchUAV.Get() : ts->proxyUAV.Get() });
+    BindCS(ctx, { srcIn, srcIn }, { rcas ? ds->scratchUAV.Get() : outUAV });
     Run(0);
 
     if (rcas) {
@@ -1113,7 +1193,7 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         Common(r);
         if (WriteParams(ctx, ds, r)) {
             SetCS(ctx, ds->cs[SH_FSR_RCAS_X0 + x].Get());
-            BindCS(ctx, { ds->scratchSRV.Get(), ve->srcRead.Get() }, { ts->proxyUAV.Get() });
+            BindCS(ctx, { ds->scratchSRV.Get(), srcIn }, { outUAV });
             Run(12);
         }
     }
@@ -1128,15 +1208,18 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
         Common(o);
         if (WriteParams(ctx, ds, o)) {
             SetCS(ctx, ds->cs[(sharpOut ? SH_FSR_OUTSH_X0 : SH_FSR_OUTER_X0) + x].Get());
-            BindCS(ctx, { ve->srcRead.Get(), ve->srcRead.Get() }, { ts->proxyUAV.Get() });
+            BindCS(ctx, { srcIn, srcIn }, { outUAV });
             Run(24);
         }
     }
+    // FXAA after the upscale, over what the passes wrote (the proxy's encoding: raw, or float)
+    if (fx == kFxaaAfter) Fxaa(ts->fxSRV.Get(), ts->proxyUAV.Get(), x == kFloat ? 2 : 0, span[0], span[1]);
 
     if (ts->upscales == 0)
-        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s%s), writing %ux%u at %u,%u", w, h, first,
+        LOGI("upscale: first spatial dispatch %ux%u slices %u..%u -> %ux%u (%s%s%s%s%s), writing %ux%u at %u,%u", w, h, first,
              first + count - 1, ow, oh, fsr ? "EASU" : "bilinear", rcas ? "+RCAS" : "", fov ? ", in the area only" : "",
-             sharpOut ? ", RCAS beyond it" : "", span[2], span[3], span[0], span[1]);
+             sharpOut ? ", RCAS beyond it" : "", fx == kFxaaBefore ? ", FXAA before" : (fx == kFxaaAfter ? ", FXAA after" : ""),
+             span[2], span[3], span[0], span[1]);
     ts->upscales++;
     InterlockedIncrement(&g_stats.upscales);
     InterlockedIncrement(&g_iv.upscales);
@@ -1276,12 +1359,12 @@ void RunJobs(CtxState *cs, SJob *spatial, int ns, TJob *tj, int nt, LONGLONG now
 
 typedef SHORT (WINAPI *PFN_GetAsyncKeyState)(int);
 PFN_GetAsyncKeyState g_getKey = nullptr;
-bool g_keyWasDown[8] = {};
+bool g_keyWasDown[9] = {};
 volatile LONG g_testHotkey = -1;   // a shortcut the self-test asks for (VrUpscaleDebugHotkey)
 SRWLOCK g_tickLock = SRWLOCK_INIT;
 LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0;
 
-// Ctrl+F1..F8. Goes through ApplyConfig like any other change, so a new factor re-plans the
+// Ctrl+F1..F9. Goes through ApplyConfig like any other change, so a new factor re-plans the
 // textures; the app mirrors the result and saves it.
 void ApplyHotkey(int idx)
 {
@@ -1324,6 +1407,10 @@ void ApplyHotkey(int idx)
     case 7:   // eye tracking: calibrate (look straight ahead at the cross)
         GazeStartCalibration("Ctrl+F8");
         return;
+    case 8:
+        nc.fxaa = nc.fxaa == kFxaaOff ? kFxaaBefore : (nc.fxaa == kFxaaBefore ? kFxaaAfter : kFxaaOff);
+        LOGI("hotkey: FXAA %s", nc.fxaa == kFxaaOff ? "off" : (nc.fxaa == kFxaaBefore ? "before the upscale" : "after the upscale"));
+        break;
     default: return;
     }
     ApplyConfig(nc, "a shortcut");
@@ -1338,7 +1425,7 @@ void PollHotkeys()
         if (!g_getKey) return;
     }
     bool ctrl = (g_getKey(VK_CONTROL) & 0x8000) != 0;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 9; ++i) {
         bool down = (g_getKey(VK_F1 + i) & 0x8000) != 0;
         if (ctrl && down && !g_keyWasDown[i]) ApplyHotkey(i);
         g_keyWasDown[i] = down;

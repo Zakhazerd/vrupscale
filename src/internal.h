@@ -152,6 +152,13 @@ public:
     Ref<ContentProbe> probe;  // created on first use
     struct Area { UINT x = 0, y = 0, w = 0, h = 0; bool valid = false; };
     Area area[2];             // spatial path: where the area is in each of (up to) two slices, in the picture
+    // [upscale] fxaa (EnsureFxaa): before the upscale, the source after FXAA, which the upscale reads
+    // instead; after it, what the upscale writes, which FXAA then writes into the proxy
+    Ref<ID3D11Texture2D> fx;
+    Ref<ID3D11ShaderResourceView> fxSRV;
+    Ref<ID3D11UnorderedAccessView> fxUAV;
+    int fxMode = 0;           // what fx is for (kFxaaBefore / kFxaaAfter; 0: none)
+    int fxFailed = 0;         // the mode whose texture could not be made (not tried again)
 protected:
     ~TexState() override;
 };
@@ -164,7 +171,8 @@ struct RecordedRun {
     Ref<ID3D11CommandList> list;
     int streamId = 0;
     Ref<ID3D11ShaderResourceView> src;
-    Ref<ID3D11UnorderedAccessView> proxy, probeMem, probeBox, link;
+    Ref<ID3D11UnorderedAccessView> proxy, probeMem, probeBox, link, fxUAV;
+    Ref<ID3D11ShaderResourceView> fxSRV;
     UINT tw = 0, th = 0, n = 0;
     uint32_t shape = 0;
 };
@@ -242,6 +250,9 @@ struct DevState {
 };
 
 bool UavStoreSupported(DevState *ds, DXGI_FORMAT f);
+// [upscale] fxaa: makes (or drops) ts's FXAA texture for this mode. Returns the mode FXAA runs in for
+// the texture: mode, or kFxaaOff if it is off or its texture could not be made.
+int EnsureFxaa(DevState *ds, TexState *ts, int mode);
 
 // Sets compute SRV slots 0..7 and UAV slots 0..7 (unlisted slots become null). The UAVs are set
 // first, so a texture written by the previous pass can be bound for reading by this one.
@@ -362,10 +373,12 @@ bool CreateGateResources(DevState *ds);
 bool EnsureGate(DevState *ds, ContentGate &g);
 void ReleaseGate(ContentGate &g);
 // Fingerprints the source slices and compares them with what the gate's proxy shows. Leaves the
-// indirect args (2 entries of gx, gy, gz and one of gx2, gy2, gz; zeros when unchanged) in
-// ds->gateArgs. Binds the temporal constant buffer. False: could not run (dispatch directly instead).
+// indirect args (2 entries of gx, gy, gz, one of gx2, gy2, gz and one of gx3, gy3, gz; zeros when
+// unchanged) in ds->gateArgs. Binds the temporal constant buffer. False: could not run (dispatch
+// directly instead).
 bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11ShaderResourceView *src, UINT first,
-                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2);
+                    UINT count, int xform, ContentGate &g, bool force, UINT gx, UINT gy, UINT gz, UINT gx2, UINT gy2,
+                    UINT gx3, UINT gy3);
 // The spatial path's area (FSR 1 inside, a cheap upscale outside): the size and placement rules of
 // a stream's region (temporal.cpp's PlanRegion / PlaceRegion), for the slices first.. of a texture
 // in its picture. side: the eye when the texture is not an array of both (-1 unknown). Fills the

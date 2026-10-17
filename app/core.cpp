@@ -130,6 +130,13 @@ static void IniBool(const std::wstring &p, const wchar_t *sec, const wchar_t *ke
     v = (c == L'1' || c == L't' || c == L'y' || (c == L'o' && s.size() > 1 && towlower(s[1]) == L'n')) ? 1 : 0;
 }
 
+// [upscale] fxaa: off, before (the upscale), after (it); 0, 1, 2 too
+static int32_t FxaaFromText(const std::wstring &v)
+{
+    const wchar_t c = v.empty() ? L'o' : towlower(v[0]);
+    return (c == L'b' || c == L'1') ? 1 : ((c == L'a' || c == L'2') ? 2 : 0);
+}
+
 static void Clamp(VuSettings &s)
 {
     auto cl = [](float v, float lo, float hi) { return !(v == v) ? lo : (v < lo ? lo : (v > hi ? hi : v)); };
@@ -152,6 +159,7 @@ static void Clamp(VuSettings &s)
     s.gazeSharpArea = std::max(s.gazeArea, roundf(cl(s.gazeSharpArea, 0.3f, 1.0f) * 100.0f) / 100.0f);
     s.upscaleFactor = roundf(s.upscaleFactor * 100.0f) / 100.0f;
     if (s.mode < 0 || s.mode > 2) s.mode = kVuModeTemporal;
+    if (s.fxaa < 0 || s.fxaa > 2) s.fxaa = 0;
     if (s.excludeCount < 0) s.excludeCount = 0;
     if (s.excludeCount > (int32_t)kVuMaxExclude) s.excludeCount = kVuMaxExclude;
 }
@@ -172,6 +180,10 @@ bool LoadSettings(const std::wstring &p, VuSettings &s, bool *adjusted)
     IniFloat(p, L"upscale", L"sharpnessArea", s.sharpArea);
     IniFloat(p, L"upscale", L"gazeSharpnessArea", s.gazeSharpArea);
     IniBool(p, L"upscale", L"debugTint", s.tint);
+    {
+        const std::wstring fx = IniStr(p, L"upscale", L"fxaa");
+        if (!fx.empty()) s.fxaa = FxaaFromText(fx);
+    }
     IniBool(p, L"general", L"hotkeys", s.hotkeys);
     IniFloat(p, L"temporal", L"maxWeight", s.maxWeight);
     IniFloat(p, L"temporal", L"localTrust", s.localTrust);
@@ -254,6 +266,7 @@ bool SaveSettings(const std::wstring &p, const VuSettings &s)
     put(L"upscale", L"sharpnessArea", Fmt(L"%.2f", s.sharpArea));
     put(L"upscale", L"gazeSharpnessArea", Fmt(L"%.2f", s.gazeSharpArea));
     put(L"upscale", L"debugTint", s.tint ? L"1" : L"0");
+    put(L"upscale", L"fxaa", s.fxaa == 1 ? L"before" : (s.fxaa == 2 ? L"after" : L"off"));
     put(L"general", L"hotkeys", s.hotkeys ? L"1" : L"0");
     put(L"temporal", L"maxWeight", Fmt(L"%.2f", s.maxWeight));
     put(L"temporal", L"localTrust", Fmt(L"%.2f", s.localTrust));
@@ -290,7 +303,7 @@ bool SameSettings(const VuSettings &a, const VuSettings &b)
         a.gazeShow != b.gazeShow || fabsf(a.gazeOffset[0] - b.gazeOffset[0]) > 0.0002f ||
         fabsf(a.gazeOffset[1] - b.gazeOffset[1]) > 0.0002f ||
         !feq(a.sharpness, b.sharpness) ||
-        a.tint != b.tint || a.hotkeys != b.hotkeys ||
+        a.tint != b.tint || a.hotkeys != b.hotkeys || a.fxaa != b.fxaa ||
         !feq(a.maxWeight, b.maxWeight) || !feq(a.localTrust, b.localTrust) || !feq(a.residualTol, b.residualTol) ||
         !feq(a.temporalArea, b.temporalArea) || !feq(a.gazeArea, b.gazeArea) || a.excludeCount != b.excludeCount ||
         // (0: a DLL from before 0.6.4, which has no Sharpness area)
@@ -326,6 +339,7 @@ bool SetSettingByName(VuSettings &s, const std::wstring &key, const std::wstring
     else if (key == L"offsetY") s.gazeOffset[1] = f;
     else if (key == L"sharpness") s.sharpness = f;
     else if (key == L"debugTint" || key == L"tint") s.tint = b;
+    else if (key == L"fxaa") s.fxaa = FxaaFromText(v);
     else if (key == L"hotkeys") s.hotkeys = b;
     else if (key == L"maxWeight") s.maxWeight = f;
     else if (key == L"localTrust") s.localTrust = f;

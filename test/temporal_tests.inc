@@ -1993,6 +1993,87 @@ static void RunNativeTest(Gfx &g, const World &world, const char *iniBase, const
     Settle(g);
 }
 
+// [upscale] fxaa: FXAA before the upscale (on the game's picture) and after it (on the upscaled
+// picture), in FSR 1 and Temporal mode, on the moving sequence: the passes run (the picture differs
+// from no FXAA) and nothing breaks (the error stays within a few dB of no FXAA).
+static void RunFxaaTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
+{
+    printf("[FXAA before and after the upscale]\n");
+    std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
+    ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
+    ID3D11ShaderResourceView *views[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+                                           MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
+    static const char *const kFx[3] = { "off", "before", "after" };
+    char ini[2048];
+    printf("         mode      FXAA     whole frame  grating  steadiness   (PSNR vs ground truth, dB)\n");
+    for (const char *mode : { "fsr", "temporal" }) {
+        const char *name = strcmp(mode, "fsr") == 0 ? "FSR 1" : "Temporal";
+        SeqResult r[3];
+        for (int f = 0; f < 3; ++f) {
+            snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=%s\nupscaleFactor=%.2f\nsharpness=0.5\nfxaa=%s\n"
+                     "[temporal]\ntemporalArea=1\n", iniBase, reqShared, mode, F, kFx[f]);
+            WriteIni(ini);
+            Pump(g);
+            r[f] = RunSequence(g, tgt, mov, app, views, 8);
+            printf("         %-8s  %-6s     %6.2f    %6.2f     %6.2f\n", name, kFx[f], r[f].all.Psnr(), r[f].grating.Psnr(),
+                   r[f].flicker.Psnr());
+        }
+        CHECK(AllFinite(r[1].lastOut) && AllFinite(r[2].lastOut), "%s, FXAA before and after: output finite and in range", name);
+        Acc db, da;   // the last frame against the one without FXAA
+        for (int y = 0; y < mov.oh; ++y)
+            for (int x = 0; x < mov.ow; ++x) {
+                db.Add(r[1].lastOut.at(x, y), r[0].lastOut.at(x, y));
+                da.Add(r[2].lastOut.at(x, y), r[0].lastOut.at(x, y));
+            }
+        CHECK(db.Psnr() < 45.0 && da.Psnr() < 45.0, "%s: FXAA before and after change the picture (%.1f and %.1f dB from without)",
+              name, db.Psnr(), da.Psnr());
+        CHECK(r[1].all.Psnr() > r[0].all.Psnr() - 4.0 && r[2].all.Psnr() > r[0].all.Psnr() - 4.0,
+              "%s: with FXAA before or after, the error stays near that without (%+.2f, %+.2f dB)", name,
+              r[1].all.Psnr() - r[0].all.Psnr(), r[2].all.Psnr() - r[0].all.Psnr());
+    }
+    ClearAll(g);
+    SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
+    Settle(g);
+
+    // the other encodings (the sequence's is sRGB): a raw UNORM view, read as stored, and linear HDR
+    // float (the frames x3); both modes, both stages, one frame each
+    std::vector<Image> hdr = blank;
+    for (auto &im : hdr) for (auto &v : im.px) v = HalfToFloat(FloatToHalf(SrgbToLinear(v) * 3.0f));
+    struct Enc { const char *name; DXGI_FORMAT tex, view; bool hdr; };
+    const Enc encs[2] = { { "a raw UNORM", DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, false },
+                          { "an HDR float", DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, true } };
+    for (const Enc &e : encs) {
+        bool finite = true;
+        double worst = 0;
+        for (const char *mode : { "fsr", "temporal" })
+            for (int f = 1; f < 3; ++f) {
+                snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=%s\nupscaleFactor=%.2f\nsharpness=0.5\nfxaa=%s\n"
+                         "[temporal]\ntemporalArea=1\n", iniBase, reqShared, mode, F, kFx[f]);
+                WriteIni(ini);
+                Pump(g);
+                const std::vector<Image> &src = e.hdr ? hdr : blank;
+                ID3D11Texture2D *t = MakeTexture(g, e.tex, src, misc);
+                ID3D11ShaderResourceView *v = MakeView(g, t, e.view, 0);
+                Image out = CompositorSample(g, v, mov.ow, mov.oh, e.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
+                double sum = 0, ref = 0;
+                for (size_t i = 0; i < out.px.size(); i += 4)
+                    for (int c = 0; c < 3; ++c) {
+                        if (!(out.px[i + c] >= 0.0f && out.px[i + c] < 65504.0f)) finite = false;
+                        sum += out.px[i + c];
+                    }
+                for (size_t i = 0; i < src[0].px.size(); i += 4)
+                    for (int c = 0; c < 3; ++c) ref += src[0].px[i + c];
+                const double ratio = (sum / (out.px.size() / 4 * 3)) / (ref / (src[0].px.size() / 4 * 3));
+                worst = std::max(worst, fabs(ratio - 1.0));
+                ClearAll(g);
+                SafeRelease(v); SafeRelease(t);
+                Settle(g);
+            }
+        CHECK(finite && worst < 0.03, "FXAA before and after with %s source, FSR 1 and Temporal: finite, brightness kept (within %.2f%%)",
+              e.name, worst * 100.0);
+    }
+}
+
 static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, bool sharedOk, bool qualityOnly)
 {
     LoadDebugExports();
@@ -2038,6 +2119,13 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     }
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "cl") == 0) {
         RunCommandListTest(g, mov, tIniBase, reqShared, F, misc);
+        return;
+    }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "fxaa") == 0) {
+        EyeTarget t1;
+        EnsureEyeTarget(g, t1, OW, OH);
+        RunFxaaTest(g, t1, mov, tIniBase, reqShared, F, misc);
+        t1.Release();
         return;
     }
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "sharparea") == 0) {
@@ -2138,6 +2226,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
         RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
         RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
+        RunFxaaTest(g, tgt, mov, tIniBase, reqShared, F, misc);
         RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
         RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
         RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
@@ -2181,6 +2270,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     RunFoveationTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, rt, outDir);
     RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
     RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
+    RunFxaaTest(g, tgt, mov, tIniBase, reqShared, F, misc);
 
     // ---- still scene: no extra information, must not be worse than FSR 1 by much
     printf("[temporal: still scene]\n");

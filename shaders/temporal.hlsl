@@ -22,6 +22,8 @@
 //                       RCAS over that inside the sharpening area (SHARPEN)
 //   MARGIN  proxy res   outside the content rectangle (repaints only; see below)
 //   COPY    L1..L4      cur pyramid -> prev pyramid
+//   FXAA    texture     [upscale] fxaa: before the upscale (after FP) the source -> a copy the
+//                       passes after read; after it (last) a copy of the proxy -> the proxy
 // Every pass after FP is launched with DispatchIndirect; for a repeated frame (the compositor
 // re-sampling the same app frame, or drawing the app's other swapchain textures) the arguments are
 // zero and nothing runs. The spatial path uses FP too, deciding with SDECIDE, so it also upscales
@@ -63,6 +65,7 @@
 #define TP_OUTER  10
 #define TP_FP     11
 #define TP_MARGIN 13
+#define TP_FXAA   14
 
 #ifndef TPASS
 #define TPASS TP_LUMA
@@ -81,6 +84,9 @@
 #endif
 #ifndef FPMODE       // FP: what its last group decides: 1 = DECIDE (temporal), 2 = SDECIDE (spatial)
 #define FPMODE 1
+#endif
+#ifndef FXSTAGE      // FXAA: 0 = before the upscale (the source), 1 = after it (the proxy)
+#define FXSTAGE 0
 #endif
 
 #define A_GPU 1
@@ -211,6 +217,20 @@ float3 OutX(float3 c)
 #endif
 }
 
+// InX's inverse: perceptual back to the source's own encoding (FXAA before the upscale writes its
+// copy of the source so, and the passes after read the copy as they would the source)
+float3 InvX(float3 c)
+{
+#if XFORM == 1
+    c = saturate(c);
+    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+#elif XFORM == 2
+    return OutX(c);
+#else
+    return c;
+#endif
+}
+
 float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
 // =============================================================================================
@@ -286,6 +306,8 @@ RWByteAddressBuffer Link : register(u6);   // this texture's proxy: fingerprint 
 #define A_OUTER  12
 #define A_LUMA   13
 #define A_MARGIN 14
+#define A_FXPRE  15
+#define A_FXPOST 16
 
 void SetArgs(uint e, uint3 g) { Args.Store3(e * 12, g); }
 uint3 G8(uint2 s)  { return uint3((s + 7) / 8, Misc.z); }
@@ -343,6 +365,9 @@ void Decide(uint2 fp)
     SetArgs(A_COPY,   isNew ? G8(WorkHi(1) - WorkLo(1)) : z0);
     SetArgs(A_GLOBAL, isNew ? uint3(1, 1, Misc.z) : z0);
     SetArgs(A_REFINE, isNew ? G8(RefCells.zw) : z0);
+    // FXAA (when the run binds it): whenever the proxy is written, over the whole texture
+    SetArgs(A_FXPRE,  writeOut ? G8(SrcRect.zw) : z0);
+    SetArgs(A_FXPOST, writeOut ? G8(DstRect.zw) : z0);
 
     State.Store(0, ncur);
     State.Store(4, isNew ? 1u : valid);
@@ -357,7 +382,8 @@ void Decide(uint2 fp)
 #else
 // ---- SDECIDE (spatial path): upscale only if this texture range's content changed since its proxy
 // was written (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the passes over the
-// area (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2).
+// area (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2),
+// Size4Out.xy those of FXAA before or after the upscale (entry 3; 0: no FXAA).
 RWByteAddressBuffer Gate : register(u3);   // 0: fingerprint the proxy shows (x, y), 8: valid, 12: updates, 16: checks
 RWByteAddressBuffer Args : register(u4);   // three indirect-dispatch entries
 
@@ -369,6 +395,7 @@ void Decide(uint2 fp)
     Args.Store3(0, g);
     Args.Store3(12, g);
     Args.Store3(24, isNew ? uint3(Size23.xy, Strides.z) : uint3(0, 0, 0));
+    Args.Store3(36, isNew ? uint3(Size4Out.xy, Strides.z) : uint3(0, 0, 0));
     Gate.Store2(0, fp);
     Gate.Store(8, 1u);
     Gate.Store(12, Gate.Load(12) + (isNew ? 1u : 0u));
@@ -1392,6 +1419,42 @@ void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
     Emit(gxy);
     gxy.x -= 8u;
     Emit(gxy);
+}
+
+// =============================================================================================
+#elif TPASS == TP_FXAA
+
+// FXAA ([upscale] fxaa) over the whole texture, the slices of this run; dispatched indirectly
+// (DECIDE: whenever this run writes the proxy). FXSTAGE 0, before the upscale: the source -> a copy
+// of it, in its own encoding, that every pass after FP reads instead. FXSTAGE 1, after it: what OUT,
+// OUTER and MARGIN wrote (into a copy of the proxy) -> the proxy (XFORM: the proxy's encoding).
+Texture2DArray<float4>   FxIn : register(t0);
+RWTexture2DArray<float4> FxOut : register(u0);
+static uint gFxZ;
+float3 FxColor(int2 p) { return saturate(InX(FxIn.Load(int4(p, gFxZ, 0)).rgb)); }
+#include "fxaa.hlsli"
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+#if FXSTAGE == 0
+    const uint2 size = SrcRect.zw;
+#else
+    const uint2 size = DstRect.zw;
+#endif
+    if (any(id.xy >= size)) return;
+    gFxZ = id.z + Misc.x;
+    gFxLo = int2(0, 0);
+    gFxHi = int2(size) - 1;
+    int2 q;
+    const float w = FxaaBlend(int2(id.xy), q);
+    const float4 c = FxIn.Load(int4(id.xy, gFxZ, 0));
+#if XFORM == 2
+    const float3 o = lerp(c.rgb, FxIn.Load(int4(q, gFxZ, 0)).rgb, w);
+#else
+    const float3 o = w > 0.0 ? InvX(lerp(FxColor(int2(id.xy)), FxColor(q), w)) : c.rgb;
+#endif
+    FxOut[uint3(id.xy, gFxZ)] = float4(o, c.a);
 }
 
 // =============================================================================================

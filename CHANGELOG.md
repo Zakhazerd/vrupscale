@@ -2,6 +2,10 @@
 
 What changed in each version of vrupscale, newest first.
 
+## 0.6.7
+
+- **FXAA** in the Upscaling panel (Ctrl+F9 in VR): off, before the upscale or after it, in every mode. Off by default: in testing it softened Temporal either way.
+
 ## 0.6.6
 
 - Fixed: with the app open, pressing a shortcut twice in quick succession (Ctrl+F1 off and straight back on, say) could undo the second press a moment later.

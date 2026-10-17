@@ -5,6 +5,9 @@
 //   PASS 2  BILINEAR  plain bilinear upscale (A/B baseline)     source  -> proxy
 //   PASS 3  OUTER     outside the area: Catmull-Rom (or bilinear) from the source -> proxy
 //                     (OSHARP: and RCAS over that in the sharpening area)
+//   PASS 4  FXAA      [upscale] fxaa, over Span: before the upscale, the source -> a copy of it
+//                     (in its own encoding) the passes above read instead; after it, what they
+//                     wrote (into a copy of the proxy) -> the proxy (XFORM: the proxy's encoding)
 //
 // The area (as in temporal.hlsl): with FOV_ON, EASU and RCAS cover only an area of each eye's
 // picture (Region[z], centred or around the gaze), blending into OUTER's cheap upscale across a
@@ -114,6 +117,19 @@ float4 InXform4(float4 v)
 float3 InXform3(float3 c)
 {
     return InXform4(float4(c, 0.0)).rgb;
+}
+
+// InXform's inverse: perceptual back to the source's own encoding (FXAA's output)
+float3 InvXform3(float3 c)
+{
+#if XFORM == 1
+    c = saturate(c);
+    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+#elif XFORM == 2
+    return FloatInv3(c);
+#else
+    return c;
+#endif
 }
 
 #define TINT_CENTRE float3(1.0, 0.72, 1.0)
@@ -341,6 +357,29 @@ void OuterSharp(uint2 pos, bool tile)
 }
 #endif
 
+#if PASS == 4
+float3 FxColor(int2 p) { return saturate(InXform3(Src.Load(int4(p, gZ + FirstSlice, 0)).rgb)); }
+#include "fxaa.hlsli"
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    gZ = id.z;
+    if (any(id.xy >= Span.zw)) return;
+    const int2 p = int2(Span.xy + id.xy);
+    gFxLo = int2(Span.xy);
+    gFxHi = int2(Span.xy + Span.zw) - 1;
+    int2 q;
+    const float w = FxaaBlend(p, q);
+    const float4 c = Src.Load(int4(p, gZ + FirstSlice, 0));
+#if XFORM == 2
+    const float3 o = lerp(c.rgb, Src.Load(int4(q, gZ + FirstSlice, 0)).rgb, w);
+#else
+    const float3 o = w > 0.0 ? InvXform3(lerp(FxColor(p), FxColor(q), w)) : c.rgb;
+#endif
+    Dst[uint3(p, gZ + FirstSlice)] = float4(o, c.a);
+}
+#else
 [numthreads(64, 1, 1)]
 void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
@@ -378,3 +417,4 @@ void main(uint3 lt : SV_GroupThreadID, uint3 gid : SV_GroupID)
     Process(gxy);
 #endif
 }
+#endif
