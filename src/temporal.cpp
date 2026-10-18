@@ -101,7 +101,8 @@ enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OU
        A_LUMA, A_MARGIN, A_FXPRE, A_FXPOST, A_COUNT };
 // StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
 constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64,
-                   SHAPE_FXPRE = 128, SHAPE_FXPOST = 256;   // FXAA before / after the upscale
+                   SHAPE_FXPRE = 128, SHAPE_FXPOST = 256,   // FXAA before / after the upscale
+                   SHAPE_SHARPHIST = 512;                    // Lanczos-3 history resampling
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
                TF_SHARPOUT = 128;
 constexpr UINT kStateBytes = 64;
@@ -1143,7 +1144,7 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     r.n = n;
     r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
               ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
-              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u);
+              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (g_cfg.sharpHistory ? SHAPE_SHARPHIST : 0u);
     const int fx = EnsureFxaa(ds, ts, g_cfg.fxaa);
     if (fx == kFxaaBefore) r.shape |= SHAPE_FXPRE;
     if (fx == kFxaaAfter) r.shape |= SHAPE_FXPOST;
@@ -1178,9 +1179,8 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     ID3D11UnorderedAccessView *out = (r.shape & SHAPE_FXPOST) ? ts->fxUAV.Get() : ts->proxyUAV.Get();
 
     // 1. sparse fingerprint of the whole texture, whose last group decides (always: the only work
-    //    for a frame already processed), then luma straight to L1 (new frames only)
-    const UINT zero[4] = { 0, 0, 0, 0 };
-    ctx->ClearUnorderedAccessViewUint(s->fp.uav.Get(), zero);
+    //    for a frame already processed) and zeroes the sums for the next run, then luma straight to
+    //    L1 (new frames only)
     SetCS(ctx, ds->cs[SH_T_FPD_X0 + x].Get());
     BindCS(ctx, { srcRead }, { s->fp.uav.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
                                s->state.uav.Get(), s->args.uav.Get(), s->ctrl.uav.Get(), link->linkUAV });
@@ -1209,10 +1209,28 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     BindCS(ctx, { s->pack[1].srv.Get(), s->pack[2].srv.Get(), s->pack[3].srv.Get(), s->prev[1].srv.Get(),
                   s->prev[2].srv.Get(), s->prev[3].srv.Get(), s->flow4.srv.Get(), s->ctrl.srv.Get() },
            { s->flowLoc.uav.Get() });
-    Indirect(SH_T_LK, A_LK);
+    Indirect((r.shape & SHAPE_LOCAL) ? SH_T_LK_T : SH_T_LK, A_LK);   // (the local search: LK at every cell, in tiles)
     Mark();
+    // OUTER (outside the region, and around the content rectangle: this frame alone) needs nothing
+    // the motion passes make, and the pyramid copy nothing the accumulation does; each shares nothing
+    // with the pass before it either. So they go where the GPU can run them beside that pass: OUTER
+    // beside the global fit (one group per eye), the copy beside the accumulation. A run timed pass by
+    // pass keeps every pass after the one it depends on instead, so that each timestamp follows the
+    // work it times (a timestamp need not wait for work that nothing after it depends on).
+    const bool overlap = pq == nullptr;
+    auto Outer = [&]() {
+        if (!(r.shape & SHAPE_OUTER)) return;
+        BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { out });
+        Indirect(((r.shape & SHAPE_SHARPOUT) ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
+    };
+    auto CopyPyramid = [&]() {   // this frame's pyramid becomes next frame's reference
+        BindCS(ctx, { s->cur[1].srv.Get(), s->cur[2].srv.Get(), s->cur[3].srv.Get(), s->cur[4].srv.Get(), s->flow2.srv.Get() },
+               { s->prev[1].uav.Get(), s->prev[2].uav.Get(), s->prev[3].uav.Get(), s->prev[4].uav.Get(), s->flowPrev.uav.Get() });
+        Indirect(SH_T_COPY, A_COPY);
+    };
     BindCS(ctx, { s->flowLoc.srv.Get(), s->ctrl.srv.Get() }, { s->model.uav.Get() });
     Indirect(SH_T_GLOBAL, A_GLOBAL);
+    if (overlap) Outer();
     Mark();
     BindCS(ctx, { s->flowLoc.srv.Get(), s->model.srv.Get(), s->flowPrev.srv.Get(), s->pack[1].srv.Get(), s->prev[1].srv.Get(),
                   s->ctrl.srv.Get() },
@@ -1221,10 +1239,12 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Mark();
 
     // 5. accumulate into whichever history is not current (the GPU knows which)
+    if (overlap) CopyPyramid();   // (nothing after this reads the previous pyramid)
+    const int accShader = ((r.shape & SHAPE_SHARPHIST) ? SH_T_ACCUML3_X0 : SH_T_ACCUM_X0) + x;
     BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[0].srv.Get(), s->ctrl.srv.Get() }, { s->hist[1].uav.Get() });
-    Indirect(SH_T_ACCUM_X0 + x, A_ACC01);
+    Indirect(accShader, A_ACC01);
     BindCS(ctx, { src, s->flow2.srv.Get(), s->hist[1].srv.Get(), s->ctrl.srv.Get() }, { s->hist[0].uav.Get() });
-    Indirect(SH_T_ACCUM_X0 + x, A_ACC10);
+    Indirect(accShader, A_ACC10);
     Mark();
 
     // 6. output into this texture's proxy (RCAS or copy)
@@ -1233,10 +1253,7 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Indirect(outShader, A_OUT1);
     BindCS(ctx, { s->hist[0].srv.Get(), src, s->ctrl.srv.Get() }, { out });
     Indirect(outShader, A_OUT0);
-    if (r.shape & SHAPE_OUTER) {   // outside the region (and around the content rectangle): this frame alone
-        BindCS(ctx, { nullptr, src, s->ctrl.srv.Get() }, { out });
-        Indirect(((r.shape & SHAPE_SHARPOUT) ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
-    }
+    if (!overlap) Outer();
     if (r.shape & SHAPE_MARGIN) {   // outside the content rectangle (the compositor does not sample it): repaints only
         BindCS(ctx, { nullptr, src }, { out });
         Indirect(SH_T_MARGIN_X0 + x, A_MARGIN);
@@ -1248,9 +1265,7 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Mark();
 
     // 7. this frame's pyramid becomes next frame's reference
-    BindCS(ctx, { s->cur[1].srv.Get(), s->cur[2].srv.Get(), s->cur[3].srv.Get(), s->cur[4].srv.Get(), s->flow2.srv.Get() },
-           { s->prev[1].uav.Get(), s->prev[2].uav.Get(), s->prev[3].uav.Get(), s->prev[4].uav.Get(), s->flowPrev.uav.Get() });
-    Indirect(SH_T_COPY, A_COPY);
+    if (!overlap) CopyPyramid();
     Mark();
     if (pq) {
         ctx->CopyResource(pq->ctrl.Get(), s->ctrl.buf.Get());   // this run's decision (new frame or not)
@@ -1448,9 +1463,7 @@ bool RunContentGate(ID3D11DeviceContext *ctx, DevState *ds, TexState *ts, ID3D11
     memcpy(m.pData, &p, sizeof(p));
     ctx->Unmap(ds->tcb.Get(), 0);
     SetCSConstants(ctx, ds->tcb.Get());
-    const UINT zero[4] = { 0, 0, 0, 0 };
-    ctx->ClearUnorderedAccessViewUint(ds->gateFpUAV.Get(), zero);
-    SetCS(ctx, ds->cs[SH_T_FPS_X0 + xform].Get());
+    SetCS(ctx, ds->cs[SH_T_FPS_X0 + xform].Get());   // (its deciding group leaves the fingerprint sums at zero)
     BindCS(ctx, { src }, { ds->gateFpUAV.Get(), probe ? probe->memUAV.Get() : nullptr, probe ? probe->boxUAV.Get() : nullptr,
                            g.uav, ds->gateArgsUAV.Get() });
     ctx->Dispatch((w + 63) / 64, (h + 63) / 64, count);   // (the shader counts these groups)

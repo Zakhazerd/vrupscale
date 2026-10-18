@@ -1,7 +1,9 @@
 // vrupscale compute shaders. Compiled at runtime with D3DCompile (cs_5_0).
 //
-//   PASS 0  EASU      FSR1 edge-adaptive upscale       source  -> scratch (or proxy if RCAS is off)
-//   PASS 1  RCAS      FSR1 robust contrast-adaptive sharpening  scratch -> proxy
+//   PASS 0  EASU      FSR1 edge-adaptive upscale (RCAS off)     source  -> proxy
+//   PASS 1  EASU+RCAS FSR1's upscale and its robust contrast-adaptive sharpening in one pass: a
+//                     group upscales its 32x32 tile and a 1-pixel apron into groupshared memory (as
+//                     a float16 texture would hold it), and sharpens that      source  -> proxy
 //   PASS 2  BILINEAR  plain bilinear upscale (A/B baseline)     source  -> proxy
 //   PASS 3  OUTER     outside the area: Catmull-Rom (or bilinear) from the source -> proxy
 //                     (OSHARP: and RCAS over that in the sharpening area)
@@ -66,6 +68,7 @@ cbuffer Params : register(b0)
     uint4 Marks[2];    // per dispatched slice: gaze ring x, y | calibration cross x, y (output px; ~0 = none)
     uint4 Span;        // what the passes over the picture cover (output px): x, y, w, h
     uint4 Sharp[2];    // per dispatched slice: the sharpening area, x, y, w, h (output px; holds Region)
+    uint4 RcasCon;     // PASS 1: RCAS's constants (Con0..3 are EASU's)
 };
 
 #define FLAG_FINAL     4u   // this pass writes the proxy: apply the output transform
@@ -230,20 +233,23 @@ float4 Spatial(uint2 g)
   AF4 FsrEasuBF(AF2 p) { return InXform4(Src.GatherBlue (LinearClamp, float3(p, gSlice))); }
   #define FSR_EASU_F 1
 #elif PASS == 1
-  static bool gRcasSpatial = false;   // RCAS over the spatial upscale (computed here) instead of the scratch
+  AF4 FsrEasuRF(AF2 p) { return InXform4(Src.GatherRed  (LinearClamp, float3(p, gSlice))); }
+  AF4 FsrEasuGF(AF2 p) { return InXform4(Src.GatherGreen(LinearClamp, float3(p, gSlice))); }
+  AF4 FsrEasuBF(AF2 p) { return InXform4(Src.GatherBlue (LinearClamp, float3(p, gSlice))); }
+  #define FSR_EASU_F 1
+  #define CT 32                        // output pixels per group, each way
+  #define HT (CT + 2)                  // ... with the apron RCAS reads
+  groupshared uint2 sE[HT * HT];       // EASU's output (rgb as half floats), from the apron's corner
+  static int2 gELo, gEHi;              // what EASU covers (inclusive): the area, or the span
+  static int2 gEOrg;                   // the output pixel at sE[0]
+  static bool gRcasSpatial = false;   // RCAS over the spatial upscale (computed here) instead of EASU's
   AF4 FsrRcasLoadF(ASU2 p)
   {
       if (gRcasSpatial)
           return Spatial(uint2(clamp(p, ASU2(Content.xy), ASU2(Content.zw) - ASU2(1, 1))));
-      // foveated: the scratch holds EASU's output in the area only
-      ASU2 lo = ASU2(Span.xy), hi = ASU2(Span.xy + Span.zw) - ASU2(1, 1);
-      if (Fov.y & FOV_ON) {
-          const uint4 r = RegionZ();
-          lo = ASU2(r.xy);
-          hi = ASU2(r.xy + r.zw) - ASU2(1, 1);
-      }
-      p = clamp(p, lo, hi);
-      return Src.Load(int4(p, (int)gSlice, 0));
+      const int2 t = int2(clamp(p, gELo, gEHi)) - gEOrg;
+      const uint2 h = sE[t.y * HT + t.x];
+      return AF4(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y), 0.0);
   }
   void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
   #define FSR_RCAS_F 1
@@ -276,7 +282,7 @@ void EmitArea(uint2 pos, float3 c, float a)
             if (ws > 0.0) {
                 AF3 s3;
                 gRcasSpatial = true;
-                FsrRcasF(s3.r, s3.g, s3.b, pos, Con0);
+                FsrRcasF(s3.r, s3.g, s3.b, pos, RcasCon);
                 gRcasSpatial = false;
                 sp.rgb = lerp(sp.rgb, s3, ws);
             }
@@ -291,7 +297,7 @@ void EmitArea(uint2 pos, float3 c, float a)
 void Process(uint2 pos)
 {
     bool inArea = false;
-#if PASS == 0 || PASS == 1
+#if PASS == 0
     if (Fov.y & FOV_ON) {   // dispatched over the area: pos counts from its corner
         const uint4 r = RegionZ();
         if (any(pos >= r.zw)) return;
@@ -311,11 +317,6 @@ void Process(uint2 pos)
     FsrEasuF(c, pos, Con0, Con1, Con2, Con3);
     float2 uv = (float2(pos) + 0.5) / float2(OutSize);
     float a = Src.SampleLevel(LinearClamp, float3(uv, gSlice), 0).a;
-    EmitArea(pos, c, a);
-#elif PASS == 1
-    AF3 c;
-    FsrRcasF(c.r, c.g, c.b, pos, Con0);
-    float a = Src.Load(int4(int2(min(pos, InSize - 1)), (int)gSlice, 0)).a;
     EmitArea(pos, c, a);
 #elif PASS == 3
     const uint4 r = RegionZ();
@@ -357,7 +358,42 @@ void OuterSharp(uint2 pos, bool tile)
 }
 #endif
 
-#if PASS == 4
+#if PASS == 1
+// EASU over the group's tile and its apron (within the area, or the span), held as a float16
+// texture would hold it (rounded toward zero: D3D's rule for a conversion to another float format),
+// then RCAS over that: what EASU into a float16 scratch texture and RCAS from it would write, without
+// the scratch texture's write and read.
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    gSlice = (float)(gid.z + FirstSlice);
+    gZ = gid.z;
+    const uint4 e = (Fov.y & FOV_ON) ? RegionZ() : Span;
+    gELo = int2(e.xy);
+    gEHi = int2(e.xy + e.zw) - 1;
+    const int2 c0 = gELo + int2(gid.xy) * CT;   // the group's first pixel
+    gEOrg = c0 - 1;
+    for (uint k = gi; k < HT * HT; k += 256) {
+        const int2 p = gEOrg + int2(k % HT, k / HT);
+        if (all(p >= gELo) && all(p <= gEHi) && all(p < int2(OutSize))) {
+            AF3 c;
+            FsrEasuF(c, uint2(p), Con0, Con1, Con2, Con3);
+            const float3 t = asfloat(asuint(c) & 0xffffe000u);
+            sE[k] = uint2(f32tof16(t.r) | (f32tof16(t.g) << 16), f32tof16(t.b));
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    [loop] for (uint j = 0; j < 4; ++j) {
+        const int2 pos = c0 + int2(gt.xy) + int2(j & 1, j >> 1) * 16;
+        if (any(pos > gEHi) || any(pos >= int2(OutSize))) continue;
+        AF3 c;
+        FsrRcasF(c.r, c.g, c.b, uint2(pos), RcasCon);
+        const float2 uv = (float2(pos) + 0.5) / float2(OutSize);   // (EASU's alpha, as the float16 would hold it)
+        const float a = asfloat(asuint(Src.SampleLevel(LinearClamp, float3(uv, gSlice), 0).a) & 0xffffe000u);
+        EmitArea(uint2(pos), c, a);
+    }
+}
+#elif PASS == 4
 float3 FxColor(int2 p) { return saturate(InXform3(Src.Load(int4(p, gZ + FirstSlice, 0)).rgb)); }
 #include "fxaa.hlsli"
 

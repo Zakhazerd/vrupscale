@@ -59,8 +59,9 @@ struct Params {
     uint32_t marks[2][4];   // per dispatched slice: gaze ring x, y | calibration cross x, y (~0u = none)
     uint32_t span[4];       // what the passes over the picture cover: x, y, w, h (SpatialSpan)
     uint32_t sharp[2][4];   // per dispatched slice: the sharpening area x, y, w, h (holds the area)
+    uint32_t rcasCon[4];    // EASU+RCAS: RCAS's constants (con0..3 are EASU's)
 };
-static_assert(sizeof(Params) == 240, "cbuffer layout must match upscale.hlsl");
+static_assert(sizeof(Params) == 256, "cbuffer layout must match upscale.hlsl");
 constexpr uint32_t FOV_ON = 1, FOV_BILINEAR = 2, FOV_SHARP = 4;
 
 struct RejectRecord { LONG cfgGen; LONG markGen; int token; int unticked; };   // token: row in the app's texture list
@@ -981,51 +982,6 @@ bool WriteParams(ID3D11DeviceContext *ctx, DevState *ds, const Params &p)
     return true;
 }
 
-bool EnsureScratch(DevState *ds, UINT w, UINT h, UINT slices)
-{
-    if (ds->scratch && ds->sw >= w && ds->sh >= h && ds->ss >= slices) return true;
-    UINT nw = std::max(w, ds->sw), nh = std::max(h, ds->sh), ns = std::max(slices, ds->ss);
-    DeferRelease(ds->scratchUAV.Detach());
-    DeferRelease(ds->scratchSRV.Detach());
-    DeferRelease(ds->scratch.Detach());
-    ds->sw = ds->sh = ds->ss = 0;
-    D3D11_TEXTURE2D_DESC d = {};
-    d.Width = nw;
-    d.Height = nh;
-    d.MipLevels = 1;
-    d.ArraySize = ns;
-    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-    HRESULT hr = ds->dev->CreateTexture2D(&d, nullptr, ds->scratch.Put());
-    if (SUCCEEDED(hr)) {
-        UINT32 ours = 1;
-        ds->scratch->SetPrivateData(kGuidOurs, sizeof(ours), &ours);
-        D3D11_SHADER_RESOURCE_VIEW_DESC s = {};
-        s.Format = d.Format;
-        s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-        s.Texture2DArray.MipLevels = 1;
-        s.Texture2DArray.ArraySize = ns;
-        hr = ds->dev->CreateShaderResourceView(ds->scratch.Get(), &s, ds->scratchSRV.Put());
-    }
-    if (SUCCEEDED(hr)) {
-        D3D11_UNORDERED_ACCESS_VIEW_DESC u = {};
-        u.Format = d.Format;
-        u.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
-        u.Texture2DArray.ArraySize = ns;
-        hr = ds->dev->CreateUnorderedAccessView(ds->scratch.Get(), &u, ds->scratchUAV.Put());
-    }
-    if (FAILED(hr)) {
-        LOGE("scratch %ux%u x%u allocation failed (0x%08lx)", nw, nh, ns, (unsigned long)hr);
-        ds->scratch.Reset(); ds->scratchSRV.Reset(); ds->scratchUAV.Reset();
-        return false;
-    }
-    ds->sw = nw; ds->sh = nh; ds->ss = ns;
-    LOGV("scratch resized to %ux%u x%u", nw, nh, ns);
-    return true;
-}
-
 } // namespace
 
 void PollQueries(DevState *ds, ID3D11DeviceContext *ctx, bool wait)
@@ -1106,9 +1062,11 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     // FSR 1 in the area only (as Temporal: centred, or around the gaze), a cheap upscale outside
     SpatialArea area;
     const bool fov = fsr && PlaceSpatialArea(ts, first, count, job.side, area);
-    const UINT ax = fov ? (area.region[0][2] + 15) / 16 : gx, ay = fov ? (area.region[0][3] + 15) / 16 : gy;
-    bool rcas = fsr && sharp > 0.0f;
-    if (rcas && !EnsureScratch(ds, ow, oh, slices)) rcas = false;
+    const bool rcas = fsr && sharp > 0.0f;
+    // EASU (or bilinear) over the area when foveated, else the span: in 16x16 tiles, or with RCAS in the
+    // same pass in 32x32 ones
+    const UINT tile = rcas ? 32 : 16, ew = fov ? area.region[0][2] : span[2], eh = fov ? area.region[0][3] : span[3];
+    const UINT ax = (ew + tile - 1) / tile, ay = (eh + tile - 1) / tile;
     // RCAS beyond the area too (the Sharpness area): OUTER sharpens its upscale there, and the area's
     // band blends into that
     const bool sharpOut = rcas && fov && area.sharpBeyond;
@@ -1145,8 +1103,8 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
                            fgy))
             gateArgs = ds->gateArgs.Get();
     }
-    // entries 0 and 1: EASU and RCAS (over the area when foveated, else the span), 2: OUTER (the span),
-    // 3: FXAA (the texture before the upscale, the span after it)
+    // entry 0: EASU (with RCAS), over the area when foveated, else the span (1 is unused), 2: OUTER
+    // (the span), 3: FXAA (the texture before the upscale, the span after it)
     auto Run = [&](UINT argOffset) {
         if (gateArgs) ctx->DispatchIndirect(gateArgs, argOffset);
         else if (argOffset == 36) ctx->Dispatch(fgx, fgy, count);
@@ -1169,34 +1127,19 @@ void SpatialUpscale(ID3D11DeviceContext *ctx, DevState *ds, const SJob &job, LON
     p.outSize[0] = ow; p.outSize[1] = oh;
     p.inSize[0] = w; p.inSize[1] = h;
     p.pad[0] = first;
+    p.flags = finalFlags;
     Common(p);
     if (fsr) {
         FsrEasuCon(p.con0, p.con1, p.con2, p.con3, (AF1)w, (AF1)h, (AF1)w, (AF1)h, (AF1)ow, (AF1)oh);
-        p.flags = rcas ? 0u : finalFlags;
+        memcpy(p.rcasCon, rcasCon, sizeof(p.rcasCon));
         if (!WriteParams(ctx, ds, p)) return;
-        SetCS(ctx, ds->cs[SH_FSR_EASU_X0 + x].Get());
+        SetCS(ctx, ds->cs[(rcas ? SH_FSR_EASURCAS_X0 : SH_FSR_EASU_X0) + x].Get());
     } else {
-        p.flags = finalFlags;
         if (!WriteParams(ctx, ds, p)) return;
         SetCS(ctx, ds->cs[SH_FSR_BILIN_X0 + x].Get());
     }
-    BindCS(ctx, { srcIn, srcIn }, { rcas ? ds->scratchUAV.Get() : outUAV });
+    BindCS(ctx, { srcIn, srcIn }, { outUAV });
     Run(0);
-
-    if (rcas) {
-        Params r = {};
-        memcpy(r.con0, rcasCon, sizeof(r.con0));
-        r.outSize[0] = ow; r.outSize[1] = oh;
-        r.inSize[0] = ow; r.inSize[1] = oh;
-        r.flags = finalFlags;   // scratch already holds perceptual values; only the output transform applies
-        r.pad[0] = first;
-        Common(r);
-        if (WriteParams(ctx, ds, r)) {
-            SetCS(ctx, ds->cs[SH_FSR_RCAS_X0 + x].Get());
-            BindCS(ctx, { ds->scratchSRV.Get(), srcIn }, { outUAV });
-            Run(12);
-        }
-    }
 
     if (fov) {   // outside the area: this frame alone, Catmull-Rom (or bilinear), sharpened in the sharpening area
         Params o = {};
@@ -1362,7 +1305,7 @@ PFN_GetAsyncKeyState g_getKey = nullptr;
 bool g_keyWasDown[9] = {};
 volatile LONG g_testHotkey = -1;   // a shortcut the self-test asks for (VrUpscaleDebugHotkey)
 SRWLOCK g_tickLock = SRWLOCK_INIT;
-LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0;
+LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0, g_lastFullTick = 0;
 
 // Ctrl+F1..F9. Goes through ApplyConfig like any other change, so a new factor re-plans the
 // textures; the app mirrors the result and saves it.
@@ -1587,10 +1530,15 @@ void RenderTick(ID3D11DeviceContext *ctx)
     g_lastTickQpc = t.QuadPart;
     TemporalSweep();
     DrainDeferred();
+    // The rest at most every half millisecond: SteamVR binds textures dozens of times a frame, and
+    // none of it needs to run that often (a reload, a shortcut from a test or a settings file read
+    // still go at once).
+    const LONGLONG f = g_qpf.QuadPart;
+    if (t.QuadPart - g_lastFullTick < f / 2000 && !g_reloadRequested && g_testHotkey < 0 && !g_pendingReady) return;
     if (!TryAcquireSRWLockExclusive(&g_tickLock)) return;
+    g_lastFullTick = t.QuadPart;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    const LONGLONG f = g_qpf.QuadPart;
     if (g_cfg.hotkeys && now.QuadPart - g_lastHotkey > f / 20) {
         g_lastHotkey = now.QuadPart;
         PollHotkeys();

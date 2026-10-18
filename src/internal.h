@@ -225,10 +225,6 @@ struct DevState {
     bool recFailed = false;        // not available on this device: passes issued call by call
     uint32_t batchSeq = 0;         // batches of work on the immediate context (a sample is timed)
     Ref<ID3D11SamplerState> samp;  // linear clamp
-    Ref<ID3D11Texture2D> scratch;
-    Ref<ID3D11ShaderResourceView> scratchSRV;
-    Ref<ID3D11UnorderedAccessView> scratchUAV;
-    UINT sw = 0, sh = 0, ss = 0;
     QuerySet q[8];
     double gpuMsSum = 0, gpuMsMax = 0;
     int gpuSamples = 0;

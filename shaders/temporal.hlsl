@@ -88,6 +88,12 @@
 #ifndef FXSTAGE      // FXAA: 0 = before the upscale (the source), 1 = after it (the proxy)
 #define FXSTAGE 0
 #endif
+#ifndef LKTILE       // LK: 1 = each level's packs through groupshared memory (cell step 1: the local search is on)
+#define LKTILE 0
+#endif
+#ifndef SHARPHIST    // ACCUM: 1 = Lanczos-3 history resampling ([temporal] sharpHistory), 0 = Catmull-Rom (its own
+#define SHARPHIST 0  // variant: the other's registers would cost the default occupancy)
+#endif
 
 #define A_GPU 1
 #define A_HLSL 1
@@ -104,7 +110,7 @@ cbuffer TParams : register(b0)
     float4 Tune1;      // minNewWeight, lkEps, searchLambda, clipReject
     uint4  Misc;       // first source slice, flags, slice count, blend band (output px, 0 = none)
     float4 DebugFlow;  // test hook: (dx, dy, enable, 0) forces a uniform flow
-    float4 Tune2;      // localTrust, localGate, localRatio, sharpHistory (1 = Lanczos-3)
+    float4 Tune2;      // localTrust, localGate, localRatio, sharpHistory (1 = Lanczos-3: the SHARPHIST variant of ACCUM)
     uint4  Region;     // output pixels with history: x0, y0, w, h (the rest is spatial)
     uint4  LkCells;    // L3 grid (8 px) cells with a Lucas-Kanade estimate: first x, y, count x, y
     uint4  RefCells;   // L2 grid (4 px) cells the refinement covers: first x, y, count x, y
@@ -381,11 +387,11 @@ void Decide(uint2 fp)
 }
 #else
 // ---- SDECIDE (spatial path): upscale only if this texture range's content changed since its proxy
-// was written (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the passes over the
-// area (EASU, RCAS: entries 0 and 1), Size23.xy those of the pass outside it (OUTER: entry 2),
-// Size4Out.xy those of FXAA before or after the upscale (entry 3; 0: no FXAA).
+// was written (or a setting changed: TF_FORCE). Strides.xyz = the group counts of the pass over the
+// area (EASU, with RCAS: entry 0; entry 1 is unused), Size23.xy those of the pass outside it (OUTER:
+// entry 2), Size4Out.xy those of FXAA before or after the upscale (entry 3; 0: no FXAA).
 RWByteAddressBuffer Gate : register(u3);   // 0: fingerprint the proxy shows (x, y), 8: valid, 12: updates, 16: checks
-RWByteAddressBuffer Args : register(u4);   // three indirect-dispatch entries
+RWByteAddressBuffer Args : register(u4);   // the indirect-dispatch entries
 
 void Decide(uint2 fp)
 {
@@ -393,7 +399,6 @@ void Decide(uint2 fp)
     bool isNew = (Misc.y & TF_FORCE) != 0 || Gate.Load(8) == 0 || shown.x != fp.x || shown.y != fp.y;
     uint3 g = isNew ? Strides.xyz : uint3(0, 0, 0);
     Args.Store3(0, g);
-    Args.Store3(12, g);
     Args.Store3(24, isNew ? uint3(Size23.xy, Strides.z) : uint3(0, 0, 0));
     Args.Store3(36, isNew ? uint3(Size4Out.xy, Strides.z) : uint3(0, 0, 0));
     Gate.Store2(0, fp);
@@ -468,7 +473,8 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
             ProbeBox.InterlockedMin(12, gsBox[3], dummy);
         }
         // The group that counts itself done last finds every group's share in Fp (each added its
-        // share before counting itself): it decides.
+        // share before counting itself): it decides, and leaves Fp at zero for the next run (no
+        // other group touches it after counting itself), so that needs no clear.
         DeviceMemoryBarrier();
         uint done;
         Fp.InterlockedAdd(8, 1u, done);
@@ -479,6 +485,7 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
             Fp.InterlockedAdd(0, 0u, fx);
             Fp.InterlockedAdd(4, 0u, fy);
             Decide(uint2(fx, fy));
+            Fp.Store3(0, uint3(0, 0, 0));
         }
     }
 }
@@ -618,6 +625,39 @@ RWTexture2DArray<float4> FlowLoc : register(u0);   // local flow (L0 px), textur
 
 #define LKR 3                          // 7x7 window
 
+#if LKTILE
+// The group's 8x8 cells are neighbours (LK cell step 1, with the local search): the windows of a
+// level overlap, so each level's packs (I, dI/dx, dI/dy) for all of them are loaded once into
+// groupshared memory, as half floats (which is how they are stored), instead of once per window
+// tap, iteration and cell.
+#define LKT 35                         // the widest tile, L1's: windows 4 px apart, 7 wide
+groupshared uint2 sPk[LKT * LKT];
+static int2 gTOrg;                     // the level's pixel at sPk[0]
+static int gTW;                        // the tile's width
+
+void LoadTile(Texture2DArray<float4> pack, int2 sz, int2 org, int w, uint z, uint gi)
+{
+    GroupMemoryBarrierWithGroupSync();   // (the previous level's reads are done)
+    gTOrg = org;
+    gTW = w;
+    for (uint k = gi; k < uint(w * w); k += 64) {
+        const float3 v = pack.Load(int4(clamp(org + int2(k % w, k / w), 0, sz - 1), z, 0)).xyz;
+        sPk[k] = uint2(f32tof16(v.x) | (f32tof16(v.y) << 16), f32tof16(v.z));
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+// the pack at x (= tap, clamped to the level)
+float3 PackAt(Texture2DArray<float4> pack, int2 x, int2 tap, uint z)
+{
+    const int2 t = tap - gTOrg;
+    const uint2 h = sPk[t.y * gTW + t.x];
+    return float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y));
+}
+#else
+float3 PackAt(Texture2DArray<float4> pack, int2 x, int2 tap, uint z) { return pack.Load(int4(x, z, 0)).xyz; }
+#endif
+
 // Inverse-compositional Lucas-Kanade at one level: find d with Prev(x + d) ~= Cur(x).
 // G returns the structure tensor (xx, xy, yy) of the window.
 float2 LkLevel(Texture2DArray<float4> pack, Texture2DArray<float> prev, int2 sz, float2 c, float2 d, uint z,
@@ -632,7 +672,7 @@ float2 LkLevel(Texture2DArray<float4> pack, Texture2DArray<float> prev, int2 sz,
         [loop] for (int oy = -LKR; oy <= LKR; ++oy)
             [unroll] for (int ox = -LKR; ox <= LKR; ++ox) {
                 int2 x = clamp(ctr + int2(ox, oy), 0, sz - 1);
-                float3 pk = pack.Load(int4(x, z, 0)).xyz;
+                float3 pk = PackAt(pack, x, ctr + int2(ox, oy), z);
                 float P = prev.SampleLevel(LinearClamp, float3((float2(x) + d + 0.5) * inv, z), 0);
                 float e = pk.x - P;
                 G += float3(pk.y * pk.y, pk.y * pk.z, pk.z * pk.z);
@@ -650,26 +690,52 @@ float2 LkLevel(Texture2DArray<float4> pack, Texture2DArray<float> prev, int2 sz,
 }
 
 [numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
+void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
+#if LKTILE
+    // (every thread loads its share of each level's tile, so none may leave early)
+    uint2 cell = LkCells.xy + id.xy;
+    const bool inRange = all(id.xy < LkCells.zw) && all(cell < Size23.zw);
+    const bool first = Ctrl.Load(0) != 0;
+    const bool active = inRange && !first;
+    const int2 cb = int2(LkCells.xy + gid.xy * 8u);               // the group's first cell
+#else
     if (any(id.xy >= LkCells.zw)) return;
     // Cells inside the region only, and when nothing but the global fit reads them, only every
     // Strides.x-th: thousands of samples already pin six affine parameters down.
     uint2 cell = LkCells.xy + id.xy * Strides.x;
     if (any(cell >= Size23.zw)) return;
+    const bool active = Ctrl.Load(0) == 0;
+#endif
     uint3 o = uint3(cell, id.z);
-    if (Ctrl.Load(0) != 0) { FlowLoc[o] = 0; return; }
 
     // One estimate per 8x8 input pixels: the 7x7 L1 windows (14 px) still overlap, and the global
     // fit and the per-cell refinement need no denser sampling.
     float2 c0 = (float2(cell) + 0.5) * 8.0 - 0.5;                // L0 coords of this grid point
-    float2 c4 = (c0 + 0.5) * (1.0 / 16.0) - 0.5;
-    int2 p4 = clamp(int2(floor(c4 + 0.5)), 0, int2(Size4Out.xy) - 1);
-    float2 d = Flow4.Load(int4(p4, id.z, 0)) * 2.0;               // L4 px -> L3 px
-    float3 G;
-    d = LkLevel(Pack3, Prev3, int2(Size23.zw), (c0 + 0.5) * 0.125 - 0.5, d, id.z, 2, G);
-    d = LkLevel(Pack2, Prev2, int2(Size23.xy), (c0 + 0.5) * 0.25 - 0.5, d * 2.0, id.z, 2, G);
-    d = LkLevel(Pack1, Prev1, int2(Size01.zw), (c0 + 0.5) * 0.5 - 0.5, d * 2.0, id.z, 3, G);
+    float2 d = 0;
+    float3 G = 0;
+    if (active) {
+        float2 c4 = (c0 + 0.5) * (1.0 / 16.0) - 0.5;
+        int2 p4 = clamp(int2(floor(c4 + 0.5)), 0, int2(Size4Out.xy) - 1);
+        d = Flow4.Load(int4(p4, id.z, 0)) * 2.0;                  // L4 px -> L3 px
+    }
+    // window centres: L3 the cell, L2 2 * cell + 1, L1 4 * cell + 2 (the tiles: the group's, +-3)
+#if LKTILE
+    LoadTile(Pack3, int2(Size23.zw), cb - 3, 14, id.z, gi);
+#endif
+    if (active) d = LkLevel(Pack3, Prev3, int2(Size23.zw), (c0 + 0.5) * 0.125 - 0.5, d, id.z, 2, G);
+#if LKTILE
+    LoadTile(Pack2, int2(Size23.xy), 2 * cb - 2, 21, id.z, gi);
+#endif
+    if (active) d = LkLevel(Pack2, Prev2, int2(Size23.xy), (c0 + 0.5) * 0.25 - 0.5, d * 2.0, id.z, 2, G);
+#if LKTILE
+    LoadTile(Pack1, int2(Size01.zw), 4 * cb - 1, 35, id.z, gi);
+#endif
+    if (active) d = LkLevel(Pack1, Prev1, int2(Size01.zw), (c0 + 0.5) * 0.5 - 0.5, d * 2.0, id.z, 3, G);
+#if LKTILE
+    if (!inRange) return;
+#endif
+    if (!active) { FlowLoc[o] = 0; return; }   // (the first frame: no previous one)
     // How well this window constrains motion: the smaller eigenvalue of the structure tensor,
     // as a mean squared gradient (luma / L1 px) over the window.
     float tr = 0.5 * (G.x + G.z), dd = 0.5 * (G.x - G.z);
@@ -717,32 +783,48 @@ void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
     prevHi += float(Strides.w) - 48.0;
     if (gi < 6) gm[gi] = 0.0;
     GroupMemoryBarrierWithGroupSync();
+    // cell i = gi + j * GT of the list is (i % cellsX, i / cellsX): stepped from gi's by GT's, without dividing
+    const uint2 cStart = cellsX ? uint2(gi % cellsX, gi / cellsX) : uint2(0, 0);
+    const uint2 cStep = cellsX ? uint2(GT % cellsX, GT / cellsX) : uint2(0, 0);
 
     [loop] for (uint it = 0; it < 4; ++it) {
         // sums kept in plain registers (an indexed array would spill to local memory)
         float4 accA = 0, accB = 0, accC = 0;
         float accN = 0;
         float a0 = gm[0], a1 = gm[1], a2 = gm[2], a3 = gm[3], a4 = gm[4], a5 = gm[5];
-        [loop] for (uint j = 0; j < perThread; ++j) {
-            uint i = gi + j * GT;
-            uint2 cxy = LkCells.xy + uint2(i % cellsX, i / cellsX) * stride;
-            float4 f = FlowLoc.Load(int4(cxy, z, 0));
-            float2 c0 = (float2(cxy) + 0.5) * 8.0 - 0.5;
-            float X = (c0.x - half0.x) / half0.x, Y = (c0.y - half0.y) / half0.y;
-            bool inside = i < total && all(cxy < Size23.zw) && all(c0 >= 12.0) && all(c0 <= float2(Size01.xy) - 13.0) &&
-                          all(c0 >= prevLo) && all(c0 <= prevHi);
-            float w = inside ? saturate(f.z * (1.0 / 2e-4)) : 0.0;     // texture weight (mean sq. gradient)
-            if (it > 0) {
-                float2 r = f.xy - float2(a0 + a1 * X + a2 * Y, a3 + a4 * X + a5 * Y);
-                float clipC = it == 1 ? 2.0 : (it == 2 ? 1.0 : 0.6);
-                float u = length(r) / clipC;
-                float t = saturate(1.0 - u * u);
-                w *= t * t;                                            // Tukey biweight
+        // eight cells at a time, their loads in flight together: this pass is one group per eye, which
+        // the GPU waits for (cells past the last one are not read, and count nothing, as before)
+        uint2 ce = cStart;
+        [loop] for (uint j0 = 0; j0 < perThread; j0 += 8) {
+            float4 fv[8];
+            uint2 cv[8];
+            [unroll] for (uint k8 = 0; k8 < 8; ++k8) {
+                cv[k8] = LkCells.xy + ce * stride;
+                fv[k8] = gi + (j0 + k8) * GT < total ? FlowLoc.Load(int4(cv[k8], z, 0)) : 0.0;
+                ce += cStep;
+                if (ce.x >= cellsX) { ce.x -= cellsX; ce.y += 1u; }
             }
-            accA += w * float4(1.0, X, Y, X * X);
-            accB += w * float4(X * Y, Y * Y, f.x, X * f.x);
-            accC += w * float4(Y * f.x, f.y, X * f.y, Y * f.y);
-            accN += inside ? 1.0 : 0.0;
+            [unroll] for (uint m8 = 0; m8 < 8; ++m8) {
+                uint i = gi + (j0 + m8) * GT;
+                uint2 cxy = cv[m8];
+                float4 f = fv[m8];
+                float2 c0 = (float2(cxy) + 0.5) * 8.0 - 0.5;
+                float X = (c0.x - half0.x) / half0.x, Y = (c0.y - half0.y) / half0.y;
+                bool inside = i < total && all(cxy < Size23.zw) && all(c0 >= 12.0) && all(c0 <= float2(Size01.xy) - 13.0) &&
+                              all(c0 >= prevLo) && all(c0 <= prevHi);
+                float w = inside ? saturate(f.z * (1.0 / 2e-4)) : 0.0;     // texture weight (mean sq. gradient)
+                if (it > 0) {
+                    float2 r = f.xy - float2(a0 + a1 * X + a2 * Y, a3 + a4 * X + a5 * Y);
+                    float clipC = it == 1 ? 2.0 : (it == 2 ? 1.0 : 0.6);
+                    float u = length(r) / clipC;
+                    float t = saturate(1.0 - u * u);
+                    w *= t * t;                                            // Tukey biweight
+                }
+                accA += w * float4(1.0, X, Y, X * X);
+                accB += w * float4(X * Y, Y * Y, f.x, X * f.x);
+                accC += w * float4(Y * f.x, f.y, X * f.y, Y * f.y);
+                accN += inside ? 1.0 : 0.0;
+            }
         }
         gs[0][gi] = accA.x; gs[1][gi] = accA.y; gs[2][gi] = accA.z; gs[3][gi] = accA.w;
         gs[4][gi] = accB.x; gs[5][gi] = accB.y; gs[6][gi] = accB.z; gs[7][gi] = accB.w;
@@ -805,13 +887,27 @@ static int2 gCtr;
 static uint gZ;
 static float2 gInv;
 
+// The windows of a group's 8x8 cells (L1 centres 2 px apart) overlap: their packs (I, dI/dx, dI/dy)
+// come from one groupshared tile, loaded once, as half floats (which is how they are stored).
+#define RTW (2 * 7 + 1 + 2 * RR)                     // 19: the centres' span and the window
+groupshared uint2 sR[RTW * RTW];
+static int2 gROrg;                                   // the L1 pixel at sR[0]
+
+// the pack at L1 pixel gCtr + o (clamped to the level)
+float3 Pk(int2 o)
+{
+    const int2 t = gCtr + o - gROrg;
+    const uint2 h = sR[t.y * RTW + t.x];
+    return float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y));
+}
+
 float Cost(float2 dL1)
 {
     float r = 0;
     [unroll] for (int oy = -RR; oy <= RR; ++oy)
         [unroll] for (int ox = -RR; ox <= RR; ++ox) {
             int2 x = clamp(gCtr + int2(ox, oy), 0, int2(Size01.zw) - 1);
-            float T = Pack1.Load(int4(x, gZ, 0)).x;
+            float T = Pk(int2(ox, oy)).x;
             float P = Prev1.SampleLevel(LinearClamp, float3((float2(x) + dL1 + 0.5) * gInv, gZ), 0);
             r += abs(T - P);
         }
@@ -826,7 +922,7 @@ float2 Lk(float2 d, uint iters)
         [unroll] for (int oy = -RR; oy <= RR; ++oy)
             [unroll] for (int ox = -RR; ox <= RR; ++ox) {
                 int2 x = clamp(gCtr + int2(ox, oy), 0, int2(Size01.zw) - 1);
-                float3 pk = Pack1.Load(int4(x, gZ, 0)).xyz;
+                float3 pk = Pk(int2(ox, oy));
                 float P = Prev1.SampleLevel(LinearClamp, float3((float2(x) + d + 0.5) * gInv, gZ), 0);
                 G += float3(pk.y * pk.y, pk.y * pk.z, pk.z * pk.z);
                 b += pk.yz * (pk.x - P);
@@ -842,8 +938,15 @@ float2 Lk(float2 d, uint iters)
 }
 
 [numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID)
+void main(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
+    // the group's packs (L1 centres 2 * cell + 1), loaded by every thread before any leaves
+    gROrg = 2 * int2(RefCells.xy + gid.xy * 8u) + 1 - RR;
+    for (uint k = gi; k < RTW * RTW; k += 64) {
+        const float3 v = Pack1.Load(int4(clamp(gROrg + int2(k % RTW, k / RTW), 0, int2(Size01.zw) - 1), tid.z, 0)).xyz;
+        sR[k] = uint2(f32tof16(v.x) | (f32tof16(v.y) << 16), f32tof16(v.z));
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (any(tid.xy >= RefCells.zw)) return;
     uint3 id = uint3(RefCells.xy + tid.xy, tid.z);                 // L2 cell (only the region's)
     if (any(id.xy >= Size23.xy)) return;
@@ -868,7 +971,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float s1 = 0, s2 = 0;
     [unroll] for (int oy = -RR; oy <= RR; ++oy)
         [unroll] for (int ox = -RR; ox <= RR; ++ox) {
-            float T = Pack1.Load(int4(clamp(gCtr + int2(ox, oy), 0, int2(Size01.zw) - 1), gZ, 0)).x;
+            float T = Pk(int2(ox, oy)).x;
             s1 += T; s2 += T * T;
         }
     float n = (2 * RR + 1) * (2 * RR + 1);
@@ -917,7 +1020,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 float3 G = 0;
                 [unroll] for (int oy = -RR; oy <= RR; ++oy)
                     [unroll] for (int ox = -RR; ox <= RR; ++ox) {
-                        float2 gr = Pack1.Load(int4(clamp(gCtr + int2(ox, oy), 0, int2(Size01.zw) - 1), gZ, 0)).yz;
+                        float2 gr = Pk(int2(ox, oy)).yz;
                         G += float3(gr.x * gr.x, gr.x * gr.y, gr.y * gr.y);
                     }
                 float tr = G.x + G.z, disc = sqrt(max(tr * tr - 4.0 * (G.x * G.z - G.y * G.y), 0.0));
@@ -1046,8 +1149,11 @@ float4 SampleHistoryL3(float2 pos, uint z)
 
 float4 SampleHistory(float2 pos, uint z)
 {
-    if (Tune2.w > 0.5) return SampleHistoryL3(pos, z);
+#if SHARPHIST
+    return SampleHistoryL3(pos, z);
+#else
     return SampleHistoryCR(pos, z);
+#endif
 }
 
 void Accumulate(int2 q, int2 i0, uint z, bool first, int2 org, int2 prevOrg)

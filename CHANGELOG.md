@@ -5,6 +5,8 @@ What changed in each version of vrupscale, newest first.
 ## 0.6.7
 
 - **FXAA** in the Upscaling panel (Ctrl+F9 in VR): off, before the upscale or after it, in every mode. Off by default: in testing it softened Temporal either way.
+- Less GPU time per frame in Temporal and FSR 1 mode, with the same picture: Temporal's motion estimation reads and waits less, and the picture outside the Temporal area can be drawn while it runs. FSR 1 sharpens in the same pass that upscales, which also saves about 200 MB of video memory at high resolutions.
+- Less CPU time on SteamVR's thread: vrupscale's own upkeep runs at most every half millisecond, not on every texture SteamVR binds.
 
 ## 0.6.6
 

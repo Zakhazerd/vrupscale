@@ -8,9 +8,9 @@
     X(FSR_EASU_X0,     "upscale.hlsl",  "PASS=0;XFORM=0")                     \
     X(FSR_EASU_X1,     "upscale.hlsl",  "PASS=0;XFORM=1")                     \
     X(FSR_EASU_X2,     "upscale.hlsl",  "PASS=0;XFORM=2")                     \
-    X(FSR_RCAS_X0,     "upscale.hlsl",  "PASS=1;XFORM=0")                     \
-    X(FSR_RCAS_X1,     "upscale.hlsl",  "PASS=1;XFORM=1")                     \
-    X(FSR_RCAS_X2,     "upscale.hlsl",  "PASS=1;XFORM=2")                     \
+    X(FSR_EASURCAS_X0, "upscale.hlsl",  "PASS=1;XFORM=0")                     \
+    X(FSR_EASURCAS_X1, "upscale.hlsl",  "PASS=1;XFORM=1")                     \
+    X(FSR_EASURCAS_X2, "upscale.hlsl",  "PASS=1;XFORM=2")                     \
     X(FSR_BILIN_X0,    "upscale.hlsl",  "PASS=2;XFORM=0")                     \
     X(FSR_BILIN_X1,    "upscale.hlsl",  "PASS=2;XFORM=1")                     \
     X(FSR_BILIN_X2,    "upscale.hlsl",  "PASS=2;XFORM=2")                     \
@@ -32,9 +32,13 @@
     X(T_DOWN_L4,       "temporal.hlsl", "TPASS=2;LEVEL=4")                    \
     X(T_SEARCH,        "temporal.hlsl", "TPASS=3")                            \
     X(T_LK,            "temporal.hlsl", "TPASS=4")                            \
+    X(T_LK_T,          "temporal.hlsl", "TPASS=4;LKTILE=1")                   \
     X(T_ACCUM_X0,      "temporal.hlsl", "TPASS=5;XFORM=0")                    \
     X(T_ACCUM_X1,      "temporal.hlsl", "TPASS=5;XFORM=1")                    \
     X(T_ACCUM_X2,      "temporal.hlsl", "TPASS=5;XFORM=2")                    \
+    X(T_ACCUML3_X0,    "temporal.hlsl", "TPASS=5;XFORM=0;SHARPHIST=1")        \
+    X(T_ACCUML3_X1,    "temporal.hlsl", "TPASS=5;XFORM=1;SHARPHIST=1")        \
+    X(T_ACCUML3_X2,    "temporal.hlsl", "TPASS=5;XFORM=2;SHARPHIST=1")        \
     X(T_OUTCOPY_X0,    "temporal.hlsl", "TPASS=6;XFORM=0;SHARPEN=0")          \
     X(T_OUTCOPY_X1,    "temporal.hlsl", "TPASS=6;XFORM=1;SHARPEN=0")          \
     X(T_OUTCOPY_X2,    "temporal.hlsl", "TPASS=6;XFORM=2;SHARPEN=0")          \

@@ -917,6 +917,55 @@ static void RunCommandListTest(Gfx &g, const Sequence &mov, const char *iniBase,
     tgt.Release();
 }
 
+// A repaint of a frame accumulated already (after a settings change, say) writes the proxy again,
+// from the history: it must show exactly what the new frame's update wrote, or the picture would
+// change when nothing did.
+static void RunRepaintTest(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
+{
+    printf("[the proxy: written by a new frame's update = repainted from the history]\n");
+    EyeTarget tgt;
+    EnsureEyeTarget(g, tgt, mov.ow, mov.oh);
+    std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
+    ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
+    ID3D11ShaderResourceView *views[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+                                           MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
+    char ini[2048];
+    const char *kinds[2] = { "RCAS", "no sharpening" };
+    size_t diff[2] = {}, total[2] = {};
+    float worst[2] = {};
+    for (int v = 0; v < 2; ++v) {
+        snprintf(ini, sizeof(ini), "%srequireShared=%s\n[upscale]\nmode=temporal\nupscaleFactor=%.2f\nsharpness=%s\n[temporal]\n"
+                 "temporalArea=0.6\n", iniBase, reqShared, F, v == 0 ? "0.8" : "0");
+        WriteIni(ini);
+        Pump(g);
+        Image fresh[2];
+        for (int f = 0; f < 6; ++f) {
+            UploadSlices(g, app, mov.in[0][f], mov.in[1][f]);
+            fresh[1] = DrawEye(g, tgt, views[1], 1);
+            fresh[0] = DrawEye(g, tgt, views[0], 0);
+            Sleep(4);
+        }
+        WriteIni(ini);   // the same settings again: the proxies are repainted, the frame is not new
+        Pump(g);
+        for (int e = 1; e >= 0; --e) {
+            const Image again = DrawEye(g, tgt, views[e], e);
+            for (size_t k = 0; k < again.px.size() && k < fresh[e].px.size(); ++k) {
+                const float d = fabsf(again.px[k] - fresh[e].px[k]);
+                if (d > 0) ++diff[v];
+                worst[v] = std::max(worst[v], d);
+                ++total[v];
+            }
+        }
+    }
+    CHECK(total[0] > 0 && total[1] > 0 && diff[0] == 0 && diff[1] == 0,
+          "a repaint shows exactly what the new frame's update wrote (%s: %zu of %zu values differ, worst %.4f; %s: %zu, "
+          "worst %.4f)", kinds[0], diff[0], total[0], worst[0], kinds[1], diff[1], worst[1]);
+    ClearAll(g);
+    SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
+    tgt.Release();
+    Settle(g);
+}
+
 static void RunSwapchainPoolTest(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
 {
     printf("[swapchain drawn every frame, like SteamVR: 3 textures per eye, each app frame shown twice]\n");
@@ -2121,6 +2170,10 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunCommandListTest(g, mov, tIniBase, reqShared, F, misc);
         return;
     }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "repaint") == 0) {
+        RunRepaintTest(g, mov, tIniBase, reqShared, F, misc);
+        return;
+    }
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "fxaa") == 0) {
         EyeTarget t1;
         EnsureEyeTarget(g, t1, OW, OH);
@@ -2227,6 +2280,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
         RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
         RunFxaaTest(g, tgt, mov, tIniBase, reqShared, F, misc);
+        RunRepaintTest(g, mov, tIniBase, reqShared, F, misc);
         RunSwapchainPoolTest(g, mov, tIniBase, reqShared, F, misc);
         RunResizedPoolTest(g, world, tIniBase, reqShared, F, misc);
         RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
@@ -2271,6 +2325,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     RunFoveatedFsrTest(g, tgt, mov, tIniBase, reqShared, F, misc, kFovArea, rf, outDir);
     RunSharpnessAreaTest(g, tgt, mov, tIniBase, reqShared, F, misc, outDir);
     RunFxaaTest(g, tgt, mov, tIniBase, reqShared, F, misc);
+    RunRepaintTest(g, mov, tIniBase, reqShared, F, misc);
 
     // ---- still scene: no extra information, must not be worse than FSR 1 by much
     printf("[temporal: still scene]\n");
