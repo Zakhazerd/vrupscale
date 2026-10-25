@@ -98,11 +98,15 @@ PassQueries *AcquirePassQueries(DevState *ds, ID3D11DeviceContext *ctx)
 }
 
 enum { A_DOWN2, A_DOWN3, A_DOWN4, A_SEARCH, A_LK, A_ACC01, A_ACC10, A_OUT1, A_OUT0, A_COPY, A_GLOBAL, A_REFINE, A_OUTER,
-       A_LUMA, A_MARGIN, A_FXPRE, A_FXPOST, A_COUNT };
+       A_LUMA, A_MARGIN, A_FXPRE, A_FXPOST,
+       // [temporal] opticalFlow=fsr3: levels 5..7, then per level FSR 3's search, filter and upscale to the next
+       A_DOWN5, A_DOWN6, A_DOWN7, A_OFS1, A_OFF1 = A_OFS1 + 7, A_OFU2 = A_OFF1 + 7, A_COUNT = A_OFU2 + 6 };
+static_assert(A_DOWN5 == 17 && A_OFS1 == 20 && A_OFF1 == 27 && A_OFU2 == 34, "must match DECIDE in temporal.hlsl");
 // StreamRun::shape: the xform (low bits), and which passes and shader variants a run issues
 constexpr uint32_t SHAPE_XFORM = 3, SHAPE_RCAS = 4, SHAPE_SHARPOUT = 8, SHAPE_OUTER = 16, SHAPE_MARGIN = 32, SHAPE_LOCAL = 64,
                    SHAPE_FXPRE = 128, SHAPE_FXPOST = 256,   // FXAA before / after the upscale
-                   SHAPE_SHARPHIST = 512;                    // Lanczos-3 history resampling
+                   SHAPE_SHARPHIST = 512,                    // Lanczos-3 history resampling
+                   SHAPE_FSRFLOW = 1024;                     // FSR 3's optical flow in place of SEARCH
 constexpr UINT TF_TINT = 1, TF_FORCE = 2, TF_RESET = 4, TF_PROBE = 8, TF_PRIME = 16, TF_BILINEAR = 32, TF_MARGIN = 64,
                TF_SHARPOUT = 128;
 constexpr UINT kStateBytes = 64;
@@ -152,7 +156,7 @@ public:
     UINT w = 0, h = 0, slices = 0, outW = 0, outH = 0;   // the picture (content rectangle) and its output size
     double scaleX = 1, scaleY = 1;
     int xform = kRaw;
-    UINT lw[5] = {}, lh[5] = {};
+    UINT lw[8] = {}, lh[8] = {};   // the pyramid: L0 (the input) .. L4, and L5..L7 for FSR 3's flow
     // Foveation: the output region with history (the rest is upscaled spatially) and the band
     // inside its edge over which the two are blended. Its size is fixed for the stream's life; its
     // position is centred, or follows the gaze (the GPU keeps track of where the history it holds
@@ -161,7 +165,9 @@ public:
     bool foveated = false;
     int side = -1;                 // which eye it shows (StreamSide), as of its last run
     OutSig sig;
-    Tex cur[5], prev[5], pack[4], flow4, flowLoc, flow2, flowPrev, hist[2];   // cur/prev [0] unused
+    Tex cur[8], prev[8], pack[4], flow4, flowLoc, flow2, flowPrev, hist[2];   // cur/prev [0] unused
+    Tex ofT1[7], ofT2[7];   // FSR 3's flow, level 1..7's vectors (8x8-pixel blocks): the prediction, then the
+                            // filtered result | the search's result
     Buf fp, state, ctrl, args, model;
     Ref<ID3D11Buffer> staging, debugStaging;
     bool stagingPending = false;
@@ -184,6 +190,8 @@ protected:
         for (auto &t : cur) t.Drop();
         for (auto &t : prev) t.Drop();
         for (auto &t : pack) t.Drop();
+        for (auto &t : ofT1) t.Drop();
+        for (auto &t : ofT2) t.Drop();
         flow4.Drop();
         flowLoc.Drop();
         flow2.Drop();
@@ -370,15 +378,18 @@ Stream *CreateStream(DevState *ds, const TexState *ts, UINT count, const OutSig 
     PlanRegion(s, RegionArea(g_cfg));
     s->lw[0] = s->w;
     s->lh[0] = s->h;
-    for (int l = 1; l < 5; ++l) {
+    for (int l = 1; l < 8; ++l) {
         s->lw[l] = (s->lw[l - 1] + 1) / 2;
         s->lh[l] = (s->lh[l - 1] + 1) / 2;
     }
     size_t &b = s->bytes;
     bool ok = true;
-    for (int l = 1; l < 5 && ok; ++l)   // no full-resolution level: LUMA writes L1 directly
+    for (int l = 1; l < 8 && ok; ++l)   // no full-resolution level: LUMA writes L1 directly
         ok = CreateTex(dev, s->cur[l], s->lw[l], s->lh[l], count, DXGI_FORMAT_R16_UNORM, 2, b) &&
              CreateTex(dev, s->prev[l], s->lw[l], s->lh[l], count, DXGI_FORMAT_R16_UNORM, 2, b);
+    for (int l = 1; l < 8 && ok; ++l)   // (a few MB: kept whichever flow runs, so that switching needs no new stream)
+        ok = CreateTex(dev, s->ofT1[l - 1], (s->lw[l] + 7) / 8, (s->lh[l] + 7) / 8, count, DXGI_FORMAT_R16G16_SINT, 4, b) &&
+             CreateTex(dev, s->ofT2[l - 1], (s->lw[l] + 7) / 8, (s->lh[l] + 7) / 8, count, DXGI_FORMAT_R16G16_SINT, 4, b);
     for (int l = 1; l <= 3 && ok; ++l)
         ok = CreateTex(dev, s->pack[l], s->lw[l], s->lh[l], count, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, b);
     ok = ok && CreateTex(dev, s->flow4, s->lw[4], s->lh[4], count, DXGI_FORMAT_R16G16_FLOAT, 4, b) &&
@@ -1144,7 +1155,8 @@ void PrepareStream(DevState *ds, StreamLink *link, ViewEntry *ve, LONGLONG now, 
     r.n = n;
     r.shape = (uint32_t)x | (sharp > 0.0f ? SHAPE_RCAS : 0u) | (sharpOut ? SHAPE_SHARPOUT : 0u) |
               ((s->foveated || !geo.full) ? SHAPE_OUTER : 0u) | (!geo.full ? SHAPE_MARGIN : 0u) |
-              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (g_cfg.sharpHistory ? SHAPE_SHARPHIST : 0u);
+              (g_cfg.localTrust > 0.0f ? SHAPE_LOCAL : 0u) | (g_cfg.sharpHistory ? SHAPE_SHARPHIST : 0u) |
+              (g_cfg.fsrFlow ? SHAPE_FSRFLOW : 0u);
     const int fx = EnsureFxaa(ds, ts, g_cfg.fxaa);
     if (fx == kFxaaBefore) r.shape |= SHAPE_FXPRE;
     if (fx == kFxaaAfter) r.shape |= SHAPE_FXPOST;
@@ -1200,11 +1212,31 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
     Indirect(SH_T_DOWN_L3, A_DOWN3);
     BindCS(ctx, { s->cur[3].srv.Get() }, { s->cur[4].uav.Get(), s->pack[3].uav.Get() });
     Indirect(SH_T_DOWN_L4, A_DOWN4);
+    const bool fsrFlow = (r.shape & SHAPE_FSRFLOW) != 0;
+    if (fsrFlow)
+        for (int l = 5; l <= 7; ++l) {
+            BindCS(ctx, { s->cur[l - 1].srv.Get() }, { s->cur[l].uav.Get() });
+            Indirect(SH_T_DOWN_L5 + l - 5, A_DOWN5 + l - 5);
+        }
     Mark();
 
     // 4. motion: coarse search, pyramidal Lucas-Kanade, robust global model, per-cell refinement
-    BindCS(ctx, { s->cur[4].srv.Get(), s->prev[4].srv.Get(), s->flowPrev.srv.Get(), s->ctrl.srv.Get() }, { s->flow4.uav.Get() });
-    Indirect(SH_T_SEARCH, A_SEARCH);
+    if (fsrFlow) {   // FSR 3's: from the top level down, search, filter, and (above L1) upscale to the next level
+        for (int l = 7; l >= 1; --l) {
+            BindCS(ctx, { s->cur[l].srv.Get(), s->prev[l].srv.Get(), l < 7 ? s->ofT1[l - 1].srv.Get() : nullptr },
+                   { s->ofT2[l - 1].uav.Get() });
+            Indirect(SH_T_OFSEARCH_L1 + l - 1, A_OFS1 + l - 1);
+            BindCS(ctx, { s->ofT2[l - 1].srv.Get() }, { l == 1 ? s->flow4.uav.Get() : s->ofT1[l - 1].uav.Get() });
+            Indirect(SH_T_OFFILTER_L1 + l - 1, A_OFF1 + l - 1);
+            if (l > 1) {
+                BindCS(ctx, { s->ofT1[l - 1].srv.Get(), s->cur[l].srv.Get(), s->prev[l].srv.Get() }, { s->ofT1[l - 2].uav.Get() });
+                Indirect(SH_T_OFSCALE_L2 + l - 2, A_OFU2 + l - 2);
+            }
+        }
+    } else {
+        BindCS(ctx, { s->cur[4].srv.Get(), s->prev[4].srv.Get(), s->flowPrev.srv.Get(), s->ctrl.srv.Get() }, { s->flow4.uav.Get() });
+        Indirect(SH_T_SEARCH, A_SEARCH);
+    }
     Mark();
     BindCS(ctx, { s->pack[1].srv.Get(), s->pack[2].srv.Get(), s->pack[3].srv.Get(), s->prev[1].srv.Get(),
                   s->prev[2].srv.Get(), s->prev[3].srv.Get(), s->flow4.srv.Get(), s->ctrl.srv.Get() },
@@ -1224,6 +1256,14 @@ void IssueStream(ID3D11DeviceContext *ctx, DevState *ds, const StreamRun &r, Pas
         Indirect(((r.shape & SHAPE_SHARPOUT) ? SH_T_OUTERSH_X0 : SH_T_OUTER_X0) + x, A_OUTER);
     };
     auto CopyPyramid = [&]() {   // this frame's pyramid becomes next frame's reference
+        if (fsrFlow) {
+            BindCS(ctx, { s->cur[1].srv.Get(), s->cur[2].srv.Get(), s->cur[3].srv.Get(), s->cur[4].srv.Get(), s->flow2.srv.Get(),
+                          s->cur[5].srv.Get(), s->cur[6].srv.Get(), s->cur[7].srv.Get() },
+                   { s->prev[1].uav.Get(), s->prev[2].uav.Get(), s->prev[3].uav.Get(), s->prev[4].uav.Get(), s->flowPrev.uav.Get(),
+                     s->prev[5].uav.Get(), s->prev[6].uav.Get(), s->prev[7].uav.Get() });
+            Indirect(SH_T_COPY_OF, A_COPY);
+            return;
+        }
         BindCS(ctx, { s->cur[1].srv.Get(), s->cur[2].srv.Get(), s->cur[3].srv.Get(), s->cur[4].srv.Get(), s->flow2.srv.Get() },
                { s->prev[1].uav.Get(), s->prev[2].uav.Get(), s->prev[3].uav.Get(), s->prev[4].uav.Get(), s->flowPrev.uav.Get() });
         Indirect(SH_T_COPY, A_COPY);

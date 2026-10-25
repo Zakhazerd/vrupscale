@@ -1302,12 +1302,12 @@ void RunJobs(CtxState *cs, SJob *spatial, int ns, TJob *tj, int nt, LONGLONG now
 
 typedef SHORT (WINAPI *PFN_GetAsyncKeyState)(int);
 PFN_GetAsyncKeyState g_getKey = nullptr;
-bool g_keyWasDown[9] = {};
+bool g_keyWasDown[10] = {};
 volatile LONG g_testHotkey = -1;   // a shortcut the self-test asks for (VrUpscaleDebugHotkey)
 SRWLOCK g_tickLock = SRWLOCK_INIT;
 LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0, g_lastFullTick = 0;
 
-// Ctrl+F1..F9. Goes through ApplyConfig like any other change, so a new factor re-plans the
+// Ctrl+F1..F10. Goes through ApplyConfig like any other change, so a new factor re-plans the
 // textures; the app mirrors the result and saves it.
 void ApplyHotkey(int idx)
 {
@@ -1354,6 +1354,10 @@ void ApplyHotkey(int idx)
         nc.fxaa = nc.fxaa == kFxaaOff ? kFxaaBefore : (nc.fxaa == kFxaaBefore ? kFxaaAfter : kFxaaOff);
         LOGI("hotkey: FXAA %s", nc.fxaa == kFxaaOff ? "off" : (nc.fxaa == kFxaaBefore ? "before the upscale" : "after the upscale"));
         break;
+    case 9:   // (an experiment: [temporal] opticalFlow)
+        nc.fsrFlow = !nc.fsrFlow;
+        LOGI("hotkey: optical flow %s", nc.fsrFlow ? "FSR 3's" : "default");
+        break;
     default: return;
     }
     ApplyConfig(nc, "a shortcut");
@@ -1368,7 +1372,7 @@ void PollHotkeys()
         if (!g_getKey) return;
     }
     bool ctrl = (g_getKey(VK_CONTROL) & 0x8000) != 0;
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 10; ++i) {
         bool down = (g_getKey(VK_F1 + i) & 0x8000) != 0;
         if (ctrl && down && !g_keyWasDown[i]) ApplyHotkey(i);
         g_keyWasDown[i] = down;
@@ -1378,6 +1382,8 @@ void PollHotkeys()
 // The settings file as read (path), applied. merge: the file changed on its own (the app saved it, or
 // an edit by hand), so it is taken field by field against what is running (ControlMergeFile);
 // otherwise (asked to, or another file) as it is.
+bool g_fileFsrFlow = false;   // [temporal] opticalFlow as last read from the file (the app does not save it)
+
 void ApplyFileConfig(Config &nc, bool found, bool merge, const std::wstring &path)
 {
     LOGI("config: settings file %ls%s", path.c_str(), found ? "" : " (missing: defaults)");
@@ -1390,7 +1396,9 @@ void ApplyFileConfig(Config &nc, bool found, bool merge, const std::wstring &pat
         char kept[192];
         if (ControlMergeFile(nc, cur, kept, sizeof(kept)) > 0)
             LOGI("config: the file holds an earlier value of %s (saved after it changed again): keeping the current one", kept);
+        if (nc.fsrFlow == g_fileFsrFlow) nc.fsrFlow = cur.fsrFlow;   // not changed in the file: Ctrl+F10's stays
     }
+    g_fileFsrFlow = fromFile.fsrFlow;
     ControlFileRead(fromFile);
     ApplyConfig(nc, "the settings file");
     PrintConfig(nc);
@@ -1623,18 +1631,19 @@ void ApplyConfig(const Config &nc, const char *source)
     ControlNoteState(nc);   // (so that the app saving this state later is recognised: ReloadConfig)
     if (nc.enabled && !old.enabled) TemporalResetAll("re-enabled");
     else if (nc.mode == Mode::Temporal && old.mode != Mode::Temporal) TemporalResetAll("mode switch");
+    else if (nc.fsrFlow != old.fsrFlow) TemporalResetAll("optical flow switch");   // (FSR 3's needs levels 5..7 of the last frame)
     char excl[160] = "";
     size_t len = 0;
     for (auto &e : nc.excludeSizes)
         if (len < sizeof(excl) - 16) len += snprintf(excl + len, sizeof(excl) - len, " %dx%d", e.w, e.h);
     LOGI("settings from %s: %s, mode=%s, factor=%.2f, sharpness=%.2f in %.2f (following the gaze %.2f), tint=%d, area=%.2f "
          "(following the gaze %.2f), history=%.2f, moving=%.2f, tolerance=%.2f, %s history, %s edges, gaze %s%s (offset %.3f, "
-         "%.3f), excluded:%s%s",
+         "%.3f), excluded:%s%s%s",
          source, nc.enabled ? "on" : "OFF", ModeName(nc.mode), nc.upscaleFactor, nc.sharpness, std::max(nc.sharpArea, nc.temporalArea),
          std::max(nc.gazeSharpArea, nc.gazeArea), nc.tint, nc.temporalArea, nc.gazeArea, nc.maxWeight, nc.localTrust, nc.residualTol, nc.sharpHistory ? "sharp" : "fast",
          nc.bilinearEdges ? "bilinear" : "Catmull-Rom", nc.gazeFollow ? "followed" : "not followed",
          nc.gazeShow ? ", ring shown" : "", nc.gazeOffset[0], nc.gazeOffset[1], len ? excl : " none",
-         replan ? " (re-planning textures)" : "");
+         nc.fsrFlow ? ", FSR 3's optical flow" : "", replan ? " (re-planning textures)" : "");
 }
 
 float GpuMsRecent()

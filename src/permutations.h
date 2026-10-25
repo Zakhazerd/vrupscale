@@ -70,7 +70,32 @@
     X(T_FXPRE_X1,      "temporal.hlsl", "TPASS=14;FXSTAGE=0;XFORM=1")         \
     X(T_FXPRE_X2,      "temporal.hlsl", "TPASS=14;FXSTAGE=0;XFORM=2")         \
     X(T_FXPOST_X0,     "temporal.hlsl", "TPASS=14;FXSTAGE=1;XFORM=0")         \
-    X(T_FXPOST_X2,     "temporal.hlsl", "TPASS=14;FXSTAGE=1;XFORM=2")
+    X(T_FXPOST_X2,     "temporal.hlsl", "TPASS=14;FXSTAGE=1;XFORM=2")         \
+    /* [temporal] opticalFlow=fsr3: FSR 3's optical flow (levels 5..7 of the pyramid, then per level) */ \
+    X(T_DOWN_L5,       "temporal.hlsl", "TPASS=2;LEVEL=5")                    \
+    X(T_DOWN_L6,       "temporal.hlsl", "TPASS=2;LEVEL=6")                    \
+    X(T_DOWN_L7,       "temporal.hlsl", "TPASS=2;LEVEL=7")                    \
+    X(T_OFSEARCH_L1,   "temporal.hlsl", "TPASS=15;LEVEL=1")                   \
+    X(T_OFSEARCH_L2,   "temporal.hlsl", "TPASS=15;LEVEL=2")                   \
+    X(T_OFSEARCH_L3,   "temporal.hlsl", "TPASS=15;LEVEL=3")                   \
+    X(T_OFSEARCH_L4,   "temporal.hlsl", "TPASS=15;LEVEL=4")                   \
+    X(T_OFSEARCH_L5,   "temporal.hlsl", "TPASS=15;LEVEL=5")                   \
+    X(T_OFSEARCH_L6,   "temporal.hlsl", "TPASS=15;LEVEL=6")                   \
+    X(T_OFSEARCH_L7,   "temporal.hlsl", "TPASS=15;LEVEL=7")                   \
+    X(T_OFFILTER_L1,   "temporal.hlsl", "TPASS=16;LEVEL=1")                   \
+    X(T_OFFILTER_L2,   "temporal.hlsl", "TPASS=16;LEVEL=2")                   \
+    X(T_OFFILTER_L3,   "temporal.hlsl", "TPASS=16;LEVEL=3")                   \
+    X(T_OFFILTER_L4,   "temporal.hlsl", "TPASS=16;LEVEL=4")                   \
+    X(T_OFFILTER_L5,   "temporal.hlsl", "TPASS=16;LEVEL=5")                   \
+    X(T_OFFILTER_L6,   "temporal.hlsl", "TPASS=16;LEVEL=6")                   \
+    X(T_OFFILTER_L7,   "temporal.hlsl", "TPASS=16;LEVEL=7")                   \
+    X(T_OFSCALE_L2,    "temporal.hlsl", "TPASS=17;LEVEL=2")                   \
+    X(T_OFSCALE_L3,    "temporal.hlsl", "TPASS=17;LEVEL=3")                   \
+    X(T_OFSCALE_L4,    "temporal.hlsl", "TPASS=17;LEVEL=4")                   \
+    X(T_OFSCALE_L5,    "temporal.hlsl", "TPASS=17;LEVEL=5")                   \
+    X(T_OFSCALE_L6,    "temporal.hlsl", "TPASS=17;LEVEL=6")                   \
+    X(T_OFSCALE_L7,    "temporal.hlsl", "TPASS=17;LEVEL=7")                   \
+    X(T_COPY_OF,       "temporal.hlsl", "TPASS=7;OFCOPY=1")
 
 #ifdef __cplusplus
 namespace vu {

@@ -117,6 +117,8 @@ struct Config {
                                      // on SteamVR's thread); off: issue them call by call
     bool sharpHistory = false;       // resample the history with Lanczos-3 (else Catmull-Rom: cheaper, a little softer)
     bool bilinearEdges = false;      // outside temporalArea: bilinear instead of Catmull-Rom (cheaper, softer)
+    bool fsrFlow = false;            // opticalFlow=fsr3 (an experiment): FSR 3's block-matching flow in place of the
+                                     // coarse search (where Lucas-Kanade starts from)
 
     // [eyes] eye tracking (Bigscreen Beyond 2e)
     bool gazeFollow = false;         // the temporal area follows the gaze

@@ -66,6 +66,9 @@
 #define TP_FP     11
 #define TP_MARGIN 13
 #define TP_FXAA   14
+#define TP_OFSEARCH 15   // [temporal] opticalFlow=fsr3: FSR 3's block search at one level (OF* below)
+#define TP_OFFILTER 16
+#define TP_OFSCALE  17
 
 #ifndef TPASS
 #define TPASS TP_LUMA
@@ -73,8 +76,11 @@
 #ifndef XFORM        // 0 raw (already encoded), 1 linear from an sRGB view, 2 linear HDR float
 #define XFORM 0
 #endif
-#ifndef LEVEL        // DOWN: destination pyramid level 2..4 (LUMA writes L1)
-#define LEVEL 2
+#ifndef LEVEL        // DOWN: destination pyramid level 2..7 (LUMA writes L1; 5..7 for FSR 3's flow only);
+#define LEVEL 2      // OF*: the pyramid level searched (1..7)
+#endif
+#ifndef OFCOPY       // COPY: 1 = levels 5..7 too (FSR 3's flow)
+#define OFCOPY 0
 #endif
 #ifndef SHARPEN      // OUT: 1 = RCAS, 0 = plain copy; OUTER: 1 = RCAS inside the sharpening area
 #define SHARPEN 1
@@ -154,12 +160,19 @@ uint2 LevelSize(uint l)
     if (l == 1) return Size01.zw;
     if (l == 2) return Size23.xy;
     if (l == 3) return Size23.zw;
-    return Size4Out.xy;
+    if (l == 4) return Size4Out.xy;
+    uint2 s = Size4Out.xy;   // L5..L7 (FSR 3's optical flow): each half the one before, rounded up
+    [unroll] for (uint i = 5; i <= 7; ++i)
+        if (i <= l) s = (s + 1u) >> 1;
+    return s;
 }
 
-// The part of pyramid level l (1..4) that is built: [WorkLo, WorkHi)
-uint2 WorkLo(uint l) { return Work.xy << (4u - l); }
-uint2 WorkHi(uint l) { return min(Work.zw << (4u - l), LevelSize(l)); }
+// The part of pyramid level l (1..7) that is built: [WorkLo, WorkHi)
+uint2 WorkLo(uint l) { return l <= 4u ? Work.xy << (4u - l) : Work.xy >> (l - 4u); }
+uint2 WorkHi(uint l) { return min(l <= 4u ? Work.zw << (4u - l) : (Work.zw + (1u << (l - 4u)) - 1u) >> (l - 4u), LevelSize(l)); }
+// [temporal] opticalFlow=fsr3: the 8x8-pixel blocks of level l that the work area covers, [lo, hi)
+int2 OfCellLo(uint l) { return int2(WorkLo(l) >> 3); }
+int2 OfCellHi(uint l) { return int2((WorkHi(l) + 7u) >> 3); }
 
 // OUTER covers the content's output rectangle grown by the band (Strides.z) on every side, in
 // 16x16 tiles, except the tiles wholly inside the region (OUT writes those): a list of tiles
@@ -314,6 +327,10 @@ RWByteAddressBuffer Link : register(u6);   // this texture's proxy: fingerprint 
 #define A_MARGIN 14
 #define A_FXPRE  15
 #define A_FXPOST 16
+#define A_DOWN5  17   // .. A_DOWN7 19 (FSR 3's flow, as the rest below)
+#define A_OFS1   20   // OFSEARCH at level 1 .. 7 (26)
+#define A_OFF1   27   // OFFILTER at level 1 .. 7 (33)
+#define A_OFU2   34   // OFSCALE from level 2 .. 7 (39)
 
 void SetArgs(uint e, uint3 g) { Args.Store3(e * 12, g); }
 uint3 G8(uint2 s)  { return uint3((s + 7) / 8, Misc.z); }
@@ -374,6 +391,19 @@ void Decide(uint2 fp)
     // FXAA (when the run binds it): whenever the proxy is written, over the whole texture
     SetArgs(A_FXPRE,  writeOut ? G8(SrcRect.zw) : z0);
     SetArgs(A_FXPOST, writeOut ? G8(DstRect.zw) : z0);
+    // FSR 3's flow (when the run issues it): the levels above L4, and per level the search (16x16
+    // pixels a group), the filter (16x4 blocks) and the upscale to the level below (4x4 of its blocks)
+    [unroll] for (uint l = 1; l <= 7; ++l) {
+        const uint2 lo = WorkLo(l), hi = WorkHi(l);
+        const int2 clo = OfCellLo(l), chi = OfCellHi(l);
+        if (l >= 5) SetArgs(A_DOWN5 + l - 5, isNew ? G8(hi - lo) : z0);
+        SetArgs(A_OFS1 + l - 1, isNew ? uint3(((hi + 15u) >> 4) - (lo >> 4), Misc.z) : z0);
+        SetArgs(A_OFF1 + l - 1, isNew ? uint3((uint(chi.x - clo.x) + 15u) / 16u, (uint(chi.y - clo.y) + 3u) / 4u, Misc.z) : z0);
+        if (l >= 2) {
+            const uint2 nlo = uint2(OfCellLo(l - 1)) & ~3u, nhi = uint2(OfCellHi(l - 1));
+            SetArgs(A_OFU2 + l - 2, isNew ? uint3((nhi - nlo + 3u) / 4u, Misc.z) : z0);
+        }
+    }
 
     State.Store(0, ncur);
     State.Store(4, isNew ? 1u : valid);
@@ -495,7 +525,7 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_Grou
 
 Texture2DArray<float>    Fine : register(t0);
 RWTexture2DArray<float>  Coarse : register(u0);
-#if LEVEL >= 2
+#if LEVEL >= 2 && LEVEL <= 4
 RWTexture2DArray<float4> Pack : register(u1);   // (I, dI/dx, dI/dy) of the fine level
 #endif
 
@@ -508,9 +538,14 @@ void main(uint3 id : SV_DispatchThreadID)
     if (any(id.xy >= cs)) return;
     int2 b = int2(id.xy) * 2;
     float v[4][4];
+#if LEVEL >= 5   // (FSR 3's flow: the fine level exists only over its work area)
+    const int2 flo = int2(WorkLo(LEVEL - 1)), fhi = int2(WorkHi(LEVEL - 1)) - 1;
+#else
+    const int2 flo = 0, fhi = fs - 1;
+#endif
     [unroll] for (int y = 0; y < 4; ++y)
         [unroll] for (int x = 0; x < 4; ++x)
-            v[y][x] = Fine.Load(int4(clamp(b + int2(x - 1, y - 1), 0, fs - 1), id.z, 0));
+            v[y][x] = Fine.Load(int4(clamp(b + int2(x - 1, y - 1), flo, fhi), id.z, 0));
     // 4x4 binomial ([1 3 3 1] / 8 per axis): far less aliasing than a 2x2 box, so the coarse
     // levels stay faithful to the motion of fine texture.
     const float k[4] = { 0.125, 0.375, 0.375, 0.125 };
@@ -518,7 +553,7 @@ void main(uint3 id : SV_DispatchThreadID)
     [unroll] for (int y2 = 0; y2 < 4; ++y2)
         [unroll] for (int x2 = 0; x2 < 4; ++x2) acc += k[y2] * k[x2] * v[y2][x2];
     Coarse[id] = acc;
-#if LEVEL >= 2
+#if LEVEL >= 2 && LEVEL <= 4
     [unroll] for (int py = 1; py <= 2; ++py)
         [unroll] for (int px = 1; px <= 2; ++px) {
             int2 p = b + int2(px - 1, py - 1);
@@ -1564,6 +1599,219 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 
 // =============================================================================================
+#elif TPASS == TP_OFSEARCH || TPASS == TP_OFFILTER || TPASS == TP_OFSCALE
+
+// [temporal] opticalFlow=fsr3 (an experiment): FSR 3's optical flow in place of SEARCH. Ported from
+// AMD's FidelityFX SDK (framegeneration/fsr3, ffx_opticalflow_*; MIT, see
+// third_party/ffx/LICENSE-opticalflow.txt) to cs_5_0: wave intrinsics become groupshared atomics, and
+// the vectors live in two textures per level, as typed UAV loads of R16G16_SINT need more than SM5.
+// It runs on our own luma pyramid: its level 0 is our L1 and its 7 levels our L1..L7, each limited
+// to the work area (outside it, reads clamp to its edge). Per level, from the coarsest: a block search
+// (8x8-pixel blocks, +-8 pixels around the vector from the level above, 8-bit luma SAD), a filter
+// (each vector replaced by the one of its 3x3 neighbourhood closest to all the others), and the
+// guided upscale to the next level (of the 4 nearest coarse vectors, doubled, the one whose SAD is
+// lowest). Its finest vectors (whole L1 pixels, on 8x8 L1 pixels = the L4 grid) go to Flow4, where
+// LK starts from them. FSR 3's scene change detection is left out (the history has its own rejection).
+
+#define OF_TOP 7
+
+// pixels p.x .. p.x+3 of a level as 8-bit luma, packed in a word as FSR 3 packs them; clamped to [lo, hi)
+uint OfPacked(Texture2DArray<float> t, int2 p, uint z, int2 lo, int2 hi)
+{
+    const int y = clamp(p.y, lo.y, hi.y - 1);
+    uint r = 0;
+    [unroll] for (int i = 0; i < 4; ++i) {
+        const int x = clamp(p.x + i, lo.x, hi.x - 1);
+        r |= min(uint(t.Load(int4(x, y, z, 0)) * 255.0), 255u) << (8 * i);
+    }
+    return r;
+}
+
+uint OfSad(uint a, uint b)
+{
+    return uint(abs(int((a >> 0) & 0xffu) - int((b >> 0) & 0xffu)) + abs(int((a >> 8) & 0xffu) - int((b >> 8) & 0xffu)) +
+                abs(int((a >> 16) & 0xffu) - int((b >> 16) & 0xffu)) + abs(int((a >> 24) & 0xffu) - int((b >> 24) & 0xffu)));
+}
+
+#if TPASS == TP_OFSEARCH
+Texture2DArray<float>  OfCur : register(t0);    // this level of this frame's pyramid
+Texture2DArray<float>  OfPrev : register(t1);   // ... and of the last frame's
+Texture2DArray<int2>   OfPred : register(t2);   // the level above's vectors, upscaled (not at the top level)
+RWTexture2DArray<int2> OfRaw : register(u0);    // this level's vectors, before the filter
+
+#define OF_CMP 8                                 // CompareSize: the block
+#define OF_SR 8                                  // search radius
+#define OF_SBX ((OF_CMP + OF_SR * 2) / 4)        // the search area, in packed words
+#define OF_SBY (OF_CMP + OF_SR * 2)
+groupshared uint ofPixels[OF_CMP][OF_CMP / 4];
+groupshared uint ofSearch[OF_SBY * OF_SBX];
+groupshared uint ofSadMap[4][OF_SR * 2][(OF_SR * 2) / 4 + 1];   // (+1: FSR 3's bank breaker)
+groupshared uint ofMin[2];
+groupshared uint ofBlockSad[4];
+
+// 4 SADs: b against a0:a1 shifted by 0..3 pixels (FSR 3's QSad without msad4)
+uint4 OfQSad(uint a0, uint a1, uint b)
+{
+    uint4 sad;
+    sad.x = OfSad(a0, b);
+    a0 = (a0 >> 8) | ((a1 & 0xffu) << 24);
+    a1 >>= 8;
+    sad.y = OfSad(a0, b);
+    a0 = (a0 >> 8) | ((a1 & 0xffu) << 24);
+    a1 >>= 8;
+    sad.z = OfSad(a0, b);
+    a0 = (a0 >> 8) | ((a1 & 0xffu) << 24);
+    sad.w = OfSad(a0, b);
+    return sad;
+}
+
+// FFX_OPTICALFLOW_FIX_TOP_LEFT_BIAS: equal SADs go to the offset nearest the prediction
+uint OfEncode(int2 c)
+{
+    const uint2 a = uint2(abs(c - OF_SR));
+    return (a.y << 12) | (a.x << 8) | (uint(c.y) << 4) | uint(c.x);
+}
+int2 OfDecode(uint b) { return int2(int(b & 0xfu) - OF_SR, int((b >> 4) & 0xfu) - OF_SR); }
+
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    const uint z = gid.z;
+    const int2 lo = int2(WorkLo(LEVEL)), hi = int2(WorkHi(LEVEL));
+    const int2 grp = (lo >> 4) + int2(gid.xy);                  // 16x16 pixels: 2x2 blocks
+    // FSR 3's lanes: 4 x 16, each 4 pixels of one row; which block each lane's pixels are in
+    const int2 sid = int2(gi & 3u, (gi >> 2) & 15u);
+    const uint laneBlock = ((gi >> 1) & 1u) | (((gi >> 5) & 1u) << 1);
+    const int2 px = grp * 16 + sid * int2(4, 1);
+    const uint packed = OfPacked(OfCur, px, z, lo, hi);
+    if (gi < 4) ofBlockSad[gi] = 0;
+    if (gi < 2) ofMin[gi] = 0xffffffffu;
+    GroupMemoryBarrierWithGroupSync();
+#if LEVEL == 1   // FFX_LOCAL_SEARCH_FALLBACK: at the finest level, no motion if it matches as well as the best
+    InterlockedAdd(ofBlockSad[laneBlock], OfSad(packed, OfPacked(OfPrev, px, z, lo, hi)));
+#endif
+    const int2 clo = OfCellLo(LEVEL), chi = OfCellHi(LEVEL);
+    [loop] for (uint b = 0; b < 4; ++b) {
+        const int2 cell = grp * 2 + int2(b & 1u, b >> 1);
+#if LEVEL == OF_TOP
+        const int2 pred = 0;
+#else
+        const int2 pred = OfPred.Load(int4(clamp(cell, clo, chi - 1), z, 0));
+#endif
+        if (laneBlock == b) ofPixels[sid.y & 7][sid.x & 1] = packed;
+        // the last frame's pixels around the block, moved by the prediction
+        const int2 base = cell * 8 + pred - OF_SR;
+        for (uint k = gi; k < OF_SBX * OF_SBY; k += 64)
+            ofSearch[k] = OfPacked(OfPrev, base + int2((k % OF_SBX) * 4, k / OF_SBX), z, lo, hi);
+        GroupMemoryBarrierWithGroupSync();
+        // this lane's 4 offsets: x sid.x * 4 + 0..3, y sid.y
+        uint4 sad = 0;
+        [unroll] for (int dy = 0; dy < OF_CMP; ++dy) {
+            const int row = (sid.y + dy) * OF_SBX;
+            const uint a0 = ofSearch[row + sid.x], a1 = ofSearch[row + sid.x + 1], a2 = ofSearch[row + sid.x + 2];
+            sad += OfQSad(a0, a1, ofPixels[dy][0]);
+            sad += OfQSad(a1, a2, ofPixels[dy][1]);
+        }
+        ofSadMap[0][sid.y][sid.x] = (sad.x << 16) | OfEncode(int2(sid.x * 4 + 0, sid.y));
+        ofSadMap[1][sid.y][sid.x] = (sad.y << 16) | OfEncode(int2(sid.x * 4 + 1, sid.y));
+        ofSadMap[2][sid.y][sid.x] = (sad.z << 16) | OfEncode(int2(sid.x * 4 + 2, sid.y));
+        ofSadMap[3][sid.y][sid.x] = (sad.w << 16) | OfEncode(int2(sid.x * 4 + 3, sid.y));
+        GroupMemoryBarrierWithGroupSync();
+        // the group's minimum (FSR 3: a wave minimum)
+        const uint m = min(min(ofSadMap[0][sid.y][sid.x], ofSadMap[1][sid.y][sid.x]), min(ofSadMap[2][sid.y][sid.x], ofSadMap[3][sid.y][sid.x]));
+        uint dummy;
+        InterlockedMin(ofMin[b & 1u], m, dummy);
+        GroupMemoryBarrierWithGroupSync();
+        const uint best = ofMin[b & 1u];
+        if (gi == 0) ofMin[(b + 1u) & 1u] = 0xffffffffu;   // (every lane read that one a block ago)
+        int2 v = pred + OfDecode(best);
+#if LEVEL == 1
+        if (ofBlockSad[b] <= (best >> 16)) v = int2(0, 0);
+#endif
+        if (gi == 0) OfRaw[uint3(cell, z)] = v;
+    }
+}
+
+#elif TPASS == TP_OFFILTER
+Texture2DArray<int2>     OfRaw : register(t0);
+#if LEVEL == 1
+RWTexture2DArray<float2> Flow4Out : register(u0);   // the finest level: SEARCH's output in L4 px, where LK starts
+#else
+RWTexture2DArray<int2>   OfOut : register(u0);
+#endif
+
+[numthreads(16, 4, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    const int2 clo = OfCellLo(LEVEL), chi = OfCellHi(LEVEL);
+    const int2 c = clo + int2(tid.xy);
+    if (any(c >= chi)) return;
+    int2 mv[9];
+    [unroll] for (int xx = -1; xx < 2; ++xx)
+        [unroll] for (int yy = -1; yy < 2; ++yy)
+            mv[(xx + 1) * 3 + yy + 1] = OfRaw.Load(int4(clamp(c + int2(xx, yy), clo, chi - 1), tid.z, 0));
+    uint ret = 0xffffffffu;
+    [unroll] for (int i = 0; i < 9; ++i) {
+        uint t = 0;
+        [unroll] for (int j = 0; j < 9; ++j) {
+            const int2 d = mv[i] - mv[j];
+            t = uint(d.x * d.x) + (uint(d.y * d.y) + t);
+        }
+        ret = min((t << 4) | uint(i), ret);
+    }
+    int2 v = mv[0];
+    [unroll] for (int k = 1; k < 9; ++k)
+        if (uint(k) == (ret & 15u)) v = mv[k];
+#if LEVEL == 1
+    Flow4Out[uint3(c, tid.z)] = float2(v) * 0.125;   // L1 px -> L4 px
+#else
+    OfOut[uint3(c, tid.z)] = v;
+#endif
+}
+
+#else   // TP_OFSCALE: this level's vectors -> the next finer level's prediction
+Texture2DArray<int2>   OfIn : register(t0);     // this level's vectors (filtered)
+Texture2DArray<float>  OfCur : register(t1);    // this level of the pyramids
+Texture2DArray<float>  OfPrev : register(t2);
+RWTexture2DArray<int2> OfPredOut : register(u0);
+
+groupshared int2 ofNear[4][4][4];
+groupshared uint ofLocal[4][4][4];
+groupshared uint ofSads[4][4][4];
+
+[numthreads(4, 4, 4)]
+void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID)
+{
+    const uint z = gid.z;
+    const int2 nlo = OfCellLo(LEVEL - 1), nhi = OfCellHi(LEVEL - 1);   // the finer level's blocks
+    const int2 g = int2(uint2(nlo) & ~3u) + int2(gid.xy) * 4 + int2(gt.xy);
+    const int2 clo = OfCellLo(LEVEL), chi = OfCellHi(LEVEL);
+    const int2 plo = int2(WorkLo(LEVEL)), phi = int2(WorkHi(LEVEL));
+    // candidate gt.z: one of the 4 coarse blocks nearest g
+    const int xo = int(gt.z % 2u) - 1 + (g.x & 1), yo = int(gt.z / 2u) - 1 + (g.y & 1);
+    const int2 nv = OfIn.Load(int4(clamp((g >> 1) + int2(xo, yo), clo, chi - 1), z, 0));   // (g >= 0)
+    ofNear[gt.z][gt.y][gt.x] = nv * 2;
+    // g's 8x8 pixels are 4x4 of this level: row gt.z of them
+    ofLocal[gt.z][gt.y][gt.x] = OfPacked(OfCur, int2(g.x * 4, g.y * 4 + int(gt.z)), z, plo, phi);
+    GroupMemoryBarrierWithGroupSync();
+    uint sad = 0;
+    [unroll] for (int n = 0; n < 4; ++n)
+        sad += OfSad(ofLocal[n][gt.y][gt.x], OfPacked(OfPrev, int2(g.x * 4, g.y * 4 + n) + nv, z, plo, phi));
+    ofSads[gt.z][gt.y][gt.x] = sad;
+    GroupMemoryBarrierWithGroupSync();
+    if (gt.z == 0 && all(g >= nlo) && all(g < nhi)) {
+        uint bestSad = 0xffffffffu, best = 0;
+        [unroll] for (uint c2 = 0; c2 < 4; ++c2)
+            if (ofSads[c2][gt.y][gt.x] < bestSad) { bestSad = ofSads[c2][gt.y][gt.x]; best = c2; }
+        int2 o = ofNear[0][gt.y][gt.x];
+        [unroll] for (uint m2 = 1; m2 < 4; ++m2)
+            if (m2 == best) o = ofNear[m2][gt.y][gt.x];
+        OfPredOut[uint3(g, z)] = o;
+    }
+}
+#endif
+
+// =============================================================================================
 #elif TPASS == TP_COPY
 
 // The motion passes only ever read L1..L4 of the previous frame, and only around the region.
@@ -1577,6 +1825,14 @@ RWTexture2DArray<float> P2 : register(u1);
 RWTexture2DArray<float> P3 : register(u2);
 RWTexture2DArray<float> P4 : register(u3);
 RWTexture2DArray<float4> FlowPrevOut : register(u4);
+#if OFCOPY   // FSR 3's flow: its levels 5..7 too
+Texture2DArray<float>   C5 : register(t5);
+Texture2DArray<float>   C6 : register(t6);
+Texture2DArray<float>   C7 : register(t7);
+RWTexture2DArray<float> P5 : register(u5);
+RWTexture2DArray<float> P6 : register(u6);
+RWTexture2DArray<float> P7 : register(u7);
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -1589,6 +1845,12 @@ void main(uint3 id : SV_DispatchThreadID)
     if (all(i2.xy < WorkHi(2))) P2[i2] = C2.Load(int4(i2, 0));
     if (all(i3.xy < WorkHi(3))) P3[i3] = C3.Load(int4(i3, 0));
     if (all(i4.xy < WorkHi(4))) P4[i4] = C4.Load(int4(i4, 0));
+#if OFCOPY
+    uint3 i5 = uint3(WorkLo(5) + id.xy, id.z), i6 = uint3(WorkLo(6) + id.xy, id.z), i7 = uint3(WorkLo(7) + id.xy, id.z);
+    if (all(i5.xy < WorkHi(5))) P5[i5] = C5.Load(int4(i5, 0));
+    if (all(i6.xy < WorkHi(6))) P6[i6] = C6.Load(int4(i6, 0));
+    if (all(i7.xy < WorkHi(7))) P7[i7] = C7.Load(int4(i7, 0));
+#endif
 }
 
 #endif
