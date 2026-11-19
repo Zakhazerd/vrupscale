@@ -13,6 +13,7 @@ namespace vu {
 namespace {
 
 HANDLE g_map = nullptr;
+HANDLE g_captureEvent = nullptr;   // set for every capture published (the app waits on it)
 VuShared *g_sh = nullptr;
 int32_t g_lastSettingsSeq = 0;
 int32_t g_lastCmdSeq = 0;
@@ -98,6 +99,7 @@ void ConfigToSettings(const Config &c, VuSettings &s)
     s.sharpArea = c.sharpArea;
     s.gazeSharpArea = c.gazeSharpArea;
     s.fxaa = c.fxaa;
+    s.translate = c.translate;
     s.requireShared = c.requireShared;
     s.minWidth = c.minWidth;
     s.minHeight = c.minHeight;
@@ -134,6 +136,7 @@ void SettingsToConfig(const VuSettings &s, Config &c)
     if (s.sharpArea > 0.0f) c.sharpArea = s.sharpArea;   // (0: an app from before 0.6.4)
     if (s.gazeSharpArea > 0.0f) c.gazeSharpArea = s.gazeSharpArea;
     c.fxaa = (s.fxaa == kFxaaBefore || s.fxaa == kFxaaAfter) ? s.fxaa : kFxaaOff;
+    c.translate = s.translate != 0;
     c.requireShared = s.requireShared != 0;
     c.minWidth = s.minWidth;
     c.minHeight = s.minHeight;
@@ -242,12 +245,28 @@ void ControlInit(bool realCompositor)
     // settings file holds the current ones.
     g_lastSettingsSeq = g_sh->settingsSeq;
     g_lastCmdSeq = g_sh->commandSeq;
+    {   // (a capture left by an earlier session names a texture that is gone)
+        const VuCapture none = {};
+        SeqWrite(&g_sh->captureSeq, (void *)&g_sh->capture, &none, sizeof(none));
+    }
+    g_captureEvent = CreateEventW(nullptr, FALSE, FALSE, (name + VU_CAPTURE_EVENT_SUFFIX).c_str());
     g_sh->size = sizeof(VuShared);
     g_sh->layout = kVuLayout;
     MemoryBarrier();
     g_sh->magic = kVuMagic;
     LOGI("control: channel for the vrupscale app ready%s", existed ? " (the app is already running)" : "");
 }
+
+// A capture for the app (capture.cpp); caller holds g_workLock.
+void ControlPublishCapture(const VuCapture &c)
+{
+    if (!g_sh) return;
+    SeqWrite(&g_sh->captureSeq, (void *)&g_sh->capture, &c, sizeof(c));
+    if (g_captureEvent) SetEvent(g_captureEvent);
+}
+
+// The last capture the app took (0: none, or no app).
+uint32_t ControlCaptureAck() { return g_sh ? g_sh->captureAck : 0; }
 
 void ControlNoteCommandLists() { InterlockedExchange(&g_commandListsSeen, 1); }
 int ControlCommandLists() { return (int)g_commandListsSeen; }
@@ -359,6 +378,7 @@ const FileField kFileFields[] = {
     VU_FIELD(gazeShow, 0.0f, "showGaze"), VU_FIELD(gazeOffset, 0.0002f, "offset"), VU_FIELD(eyeProj, 0.0002f, "projection"),
     VU_FIELD(gazeArea, 0.006f, "gazeArea"), VU_FIELD(sharpArea, 0.006f, "sharpnessArea"),
     VU_FIELD(gazeSharpArea, 0.006f, "gazeSharpnessArea"), VU_FIELD(fxaa, 0.0f, "fxaa"),
+    VU_FIELD(translate, 0.0f, "translate"),
 };
 #undef VU_FIELD
 static_assert(offsetof(VuSettings, exclude) == offsetof(VuSettings, excludeCount) + 4, "excludeCount, then exclude");

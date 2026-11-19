@@ -1302,12 +1302,12 @@ void RunJobs(CtxState *cs, SJob *spatial, int ns, TJob *tj, int nt, LONGLONG now
 
 typedef SHORT (WINAPI *PFN_GetAsyncKeyState)(int);
 PFN_GetAsyncKeyState g_getKey = nullptr;
-bool g_keyWasDown[10] = {};
+bool g_keyWasDown[11] = {};
 volatile LONG g_testHotkey = -1;   // a shortcut the self-test asks for (VrUpscaleDebugHotkey)
 SRWLOCK g_tickLock = SRWLOCK_INIT;
 LONGLONG g_lastHotkey = 0, g_lastStats = 0, g_lastCounters = 0, g_lastProbePoll = 0, g_lastFullTick = 0;
 
-// Ctrl+F1..F10. Goes through ApplyConfig like any other change, so a new factor re-plans the
+// Ctrl+F1..F11. Goes through ApplyConfig like any other change, so a new factor re-plans the
 // textures; the app mirrors the result and saves it.
 void ApplyHotkey(int idx)
 {
@@ -1358,6 +1358,10 @@ void ApplyHotkey(int idx)
         nc.fsrFlow = !nc.fsrFlow;
         LOGI("hotkey: optical flow %s", nc.fsrFlow ? "FSR 3's" : "default");
         break;
+    case 10:   // the app's translation of text in view (it follows this setting)
+        nc.translate = !nc.translate;
+        LOGI("hotkey: translation %s", nc.translate ? "ON" : "OFF");
+        break;
     default: return;
     }
     ApplyConfig(nc, "a shortcut");
@@ -1372,7 +1376,7 @@ void PollHotkeys()
         if (!g_getKey) return;
     }
     bool ctrl = (g_getKey(VK_CONTROL) & 0x8000) != 0;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 11; ++i) {
         bool down = (g_getKey(VK_F1 + i) & 0x8000) != 0;
         if (ctrl && down && !g_keyWasDown[i]) ApplyHotkey(i);
         g_keyWasDown[i] = down;
@@ -1555,6 +1559,7 @@ void RenderTick(ID3D11DeviceContext *ctx)
     if (testKey >= 0) ApplyHotkey((int)testKey);
     GazeTick();
     ConfigTick();
+    CaptureTick(now.QuadPart);
     if (now.QuadPart - g_lastProbePoll > f / 20) {   // content rectangles (render size)
         g_lastProbePoll = now.QuadPart;
         Ref<ID3D11Device> dev;
@@ -1906,6 +1911,19 @@ void OnBeforeDraw(ID3D11DeviceContext *ctx)
     QJob cand[16];
     const int nc = CollectJobs(cs, ctx, now.QuadPart, cand, 16);
     if (nc == 0) return;
+    // [translate]: a picture of what this draw shows for the app, taken when this function is done
+    // (the draw's upscale work issued, or queued to run before this command list does)
+    struct CaptureAfter {
+        ID3D11DeviceContext *ctx;
+        const QJob *cand;
+        int n;
+        LONGLONG now;
+        ~CaptureAfter()
+        {
+            if (!g_cfg.translate) return;
+            for (int i = 0; i < n; ++i) CaptureAtDraw(ctx, cand[i].ve->tex.Get(), cand[i].side, now);
+        }
+    } captureAfter = { ctx, cand, nc, now.QuadPart };
     if (cs->immediate) {
         SelectAndRun(cs, ctx, cand, nc, now.QuadPart);
         return;

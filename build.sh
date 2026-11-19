@@ -18,7 +18,7 @@ done
 $CC $CFLAGS $INC -c src/vtables.c -o $OUT/obj/vtables.o
 $CC -c src/exports.S -o $OUT/obj/exports.o
 $CC -c src/shader_pack.S -o $OUT/obj/shader_pack.o   # the compiled shaders (src/gen/shaders.bin)
-for f in dllmain log config proxy hooks shaders upscaler temporal control gaze; do
+for f in dllmain log config proxy hooks shaders upscaler temporal control gaze capture; do
   $CXX $CFLAGS -std=c++17 -fno-exceptions -fno-rtti -Wno-unused-function $INC -c src/$f.cpp -o $OUT/obj/$f.o
 done
 

@@ -9,8 +9,10 @@
 #include <stdint.h>
 
 #define VU_CONTROL_NAME L"Local\\vrupscale.control.v1"
+// Appended to the channel's name: an auto-reset event the DLL sets for every new capture (VuCapture).
+#define VU_CAPTURE_EVENT_SUFFIX L".capture"
 
-enum : uint32_t { kVuMagic = 0x31505556u /* "VUP1" */, kVuLayout = 4, kVuMaxTex = 16, kVuMaxStreams = 6,
+enum : uint32_t { kVuMagic = 0x31505556u /* "VUP1" */, kVuLayout = 5, kVuMaxTex = 16, kVuMaxStreams = 6,
                   kVuMaxExclude = 16, kVuEvents = 8 };
 
 enum : int32_t { kVuModeTemporal = 0, kVuModeFsr = 1, kVuModeBilinear = 2 };
@@ -97,7 +99,9 @@ typedef struct VuSettings {
     float gazeSharpArea;          // ... and while Follow gaze is on
     int32_t fxaa;                 // [upscale] FXAA: 0 off, 1 before the upscale, 2 after it (since 0.6.7; 0 from an
                                   // older app = off)
-    int32_t reserved[12];
+    int32_t translate;            // [translate] 1 = the DLL hands the app pictures of where the user looks (VuCapture),
+                                  // which the app reads text from and translates (layout 5)
+    int32_t reserved[11];
 } VuSettings;
 
 typedef struct VuTexInfo {
@@ -152,6 +156,34 @@ typedef struct VuStatus {
     VuGazeInfo gaze;
 } VuStatus;
 
+// What the user sees, for the app's translation (Translate on): a few times a second the DLL copies a
+// part of each eye's picture, as the compositor is about to show it (after the upscale), into a
+// texture of its own that the app opens by its shared handle (ID3D11Device::OpenSharedResource on the
+// same adapter) and reads. A GPU copy only: the DLL never reads pixels back. The part is centred on
+// the gaze while eye tracking is live, else on straight ahead. The copy is queued when the capture is
+// published and runs with the compositor's frame, so a reader waits a frame or two (kVuCaptureSettleMs)
+// before it copies the texture, and checks afterwards that `round` is still the same.
+enum : uint32_t { kVuCaptureSettleMs = 30 };
+typedef struct VuCaptureEye {
+    uint64_t handle;                  // the shared texture; 0 = none
+    uint32_t w, h;                    // its size: the part copied
+    uint32_t format;                  // its DXGI_FORMAT (the bytes are as the compositor reads them: 8- and
+                                      // 10-bit formats display-encoded, float formats linear)
+    uint32_t cropX, cropY;            // where that part is in the texture the compositor shows
+    uint32_t picX, picY, picW, picH;  // the eye's whole picture in that texture
+    int32_t side;                     // 0 left eye, 1 right, -1 not known
+    uint32_t reserved;
+} VuCaptureEye;
+
+typedef struct VuCapture {
+    uint32_t round;                   // counts captures (0: none yet)
+    uint32_t eyes;                    // bit i: eye[i] was taken in this round (both, from the same frame, or one)
+    int64_t qpc;                      // QueryPerformanceCounter when it was taken
+    int32_t gazeLive;                 // centred on the gaze (else straight ahead)
+    int32_t reserved;
+    VuCaptureEye eye[2];              // [0] the left eye (or the only one known), [1] the right
+} VuCapture;
+
 typedef struct VuShared {
     uint32_t magic, layout, size, reserved0;
     volatile int32_t statusSeq;
@@ -160,6 +192,10 @@ typedef struct VuShared {
     VuSettings settings;
     volatile int32_t commandSeq;
     uint32_t command;
+    volatile int32_t captureSeq;
+    VuCapture capture;
+    volatile uint32_t captureAck;     // written by the app: the last round it took. While the app takes none,
+                                      // the DLL captures only now and then.
 } VuShared;
 
 #pragma pack(pop)

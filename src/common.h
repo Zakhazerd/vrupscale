@@ -135,6 +135,11 @@ struct Config {
     float linkGapMs = 2.0f;          // never link textures bound closer together than this
     int probeWindowMs = 500;         // content (render size) detection: length of one observation window
     bool detectContent = true;       // find the part of each eye texture the game renders into
+
+    // [translate] the app reads text in what the user sees and shows its translation (capture.cpp)
+    bool translate = false;          // hand the app pictures of where the user looks (Ctrl+F11)
+    float captureHz = 3.0f;          // how many a second
+    int captureSize = 1536;          // their width and height per eye, in output pixels (at most the eye's picture)
 };
 
 // The area that gets the full treatment (history in Temporal mode, FSR 1 in FSR mode): its own

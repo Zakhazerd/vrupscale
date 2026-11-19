@@ -2208,6 +2208,8 @@ static void RunAbDump(Gfx &g, const Sequence &mov, const char *iniBase, const ch
     tgt.Release();
 }
 
+#include "capture_test.inc"
+
 static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, bool sharedOk, bool qualityOnly)
 {
     LoadDebugExports();
@@ -2256,6 +2258,10 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     Sequence still = MakeSequence(world, W, H, OW, OH, 4, false, 1);
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "gaze") == 0) {
         RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
+        return;
+    }
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "capture") == 0) {
+        RunCaptureTest(g, mov, tIniBase, reqShared, F, misc);
         return;
     }
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "cl") == 0) {
@@ -2381,6 +2387,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
         SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
         tgt.Release();
         RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
+        RunCaptureTest(g, mov, tIniBase, reqShared, F, misc);
         RunNativeTest(g, world, tIniBase, reqShared, misc);
         return;
     }
@@ -2624,6 +2631,7 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     RunSpatialCornerTest(g, world, tIniBase, reqShared, F, misc);
     RunResolutionSwitchTest(g, world, tIniBase, reqShared, F, misc);
     RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
+    RunCaptureTest(g, mov, tIniBase, reqShared, F, misc);
     RunNativeTest(g, world, tIniBase, reqShared, misc);
     CHECK(Stats().liveStreams == 0, "temporal streams released with their textures (%ld left)", (long)Stats().liveStreams);
     tgt.Release();

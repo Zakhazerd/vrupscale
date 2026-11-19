@@ -165,6 +165,10 @@ bool LoadConfig(Config &c, std::wstring *pathOut)
     c.detectContent = ReadBool(ini, L"temporal", L"detectContent", d.detectContent);
     c.probeWindowMs = ReadInt(ini, L"temporal", L"probeWindowMs", d.probeWindowMs);
 
+    c.translate = ReadBool(ini, L"translate", L"enabled", d.translate);
+    c.captureHz = ReadFloat(ini, L"translate", L"captureHz", d.captureHz);
+    c.captureSize = ReadInt(ini, L"translate", L"captureSize", d.captureSize);
+
     c.minWidth = ReadInt(ini, L"match", L"minWidth", d.minWidth);
     c.minHeight = ReadInt(ini, L"match", L"minHeight", d.minHeight);
     c.minAspect = ReadFloat(ini, L"match", L"minAspect", d.minAspect);
@@ -192,6 +196,9 @@ void SanitizeConfig(Config &c)
     fin(c.clipReject, d.clipReject); fin(c.localTrust, d.localTrust); fin(c.localGate, d.localGate);
     fin(c.localRatio, d.localRatio); fin(c.temporalArea, d.temporalArea); fin(c.gazeArea, d.gazeArea);
     fin(c.sharpArea, d.sharpArea); fin(c.gazeSharpArea, d.gazeSharpArea); fin(c.linkGapMs, d.linkGapMs);
+    fin(c.captureHz, d.captureHz);
+    c.captureHz = c.captureHz < 0.2f ? 0.2f : (c.captureHz > 15.0f ? 15.0f : c.captureHz);
+    c.captureSize = c.captureSize < 256 ? 256 : (c.captureSize > 4096 ? 4096 : c.captureSize);
     c.upscaleFactor = roundf(c.upscaleFactor * 100.0f) / 100.0f;
     c.temporalArea = roundf(c.temporalArea * 100.0f) / 100.0f;
     c.gazeArea = roundf(c.gazeArea * 100.0f) / 100.0f;
@@ -254,6 +261,7 @@ void PrintConfig(const Config &c)
          c.onlySizes.size(), c.excludeSizes.size());
     for (auto &s : c.onlySizes) LOGI("config:   onlySize %dx%d", s.w, s.h);
     for (auto &s : c.excludeSizes) LOGI("config:   excludeSize %dx%d", s.w, s.h);
+    LOGI("config: translate=%d captureHz=%.1f captureSize=%d", c.translate, c.captureHz, c.captureSize);
     LOGI("config: logLevel=%d statsIntervalSec=%d hotkeys=%d gpuTiming=%d", c.logLevel, c.statsIntervalSec, c.hotkeys, c.gpuTiming);
 }
 

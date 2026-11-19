@@ -7,6 +7,7 @@
 #include <initializer_list>
 
 struct VuGazeInfo;   // control_shared.h
+struct VuCapture;
 
 namespace vu {
 
@@ -439,7 +440,16 @@ float GpuMsRecent();                 // recent GPU ms per batch of upscale work,
 extern volatile LONG g_jobBatches;   // batches of upscale work issued on an immediate context (timed ones)
 void ControlTickFromWorker();        // the app channel when the render thread is not ticking
 
+// ---- capture.cpp (pictures of what the user sees, for the app's translation) ----------------
+// Called for every draw that samples an upscaled eye texture, after that draw's upscale work has
+// been issued or queued, on the context the draw is on (a copy on a deferred context runs when its
+// command list does). side: QJob::side. Caller holds g_workLock.
+void CaptureAtDraw(ID3D11DeviceContext *ctx, TexState *ts, int side, LONGLONG now);
+void CaptureTick(LONGLONG now);      // render tick: a capture that got one eye only goes out; cleanup when off
+
 // ---- control.cpp (channel to the vrupscale app) -------------------------------------------
+void ControlPublishCapture(const VuCapture &c);
+uint32_t ControlCaptureAck();
 void ControlInit(bool realCompositor);
 void ControlTick();                  // caller holds g_workLock
 void ControlNoteCommandLists();
