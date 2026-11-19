@@ -2,7 +2,7 @@
 
 vrupscale upscales VR eye images inside SteamVR's compositor. It has two parts:
 - **`dxgi.dll`:** a proxy DLL that sits next to `vrcompositor.exe` in `SteamVR\bin\win64`. It hooks D3D11 and replaces each eye texture the compositor samples with an upscaled "proxy". There are three modes: Temporal (TAAU with motion estimated from colour alone; the game supplies no motion vectors), FSR 1 and bilinear.
-- **`vrupscale.exe`:** the control app. It installs the DLL, changes settings live over shared memory, sets VRChat's SteamVR resolution and updates itself from GitHub releases.
+- **`vrupscale.exe`:** the control app. It installs the DLL, changes settings live over shared memory, sets VRChat's SteamVR resolution and updates itself from GitHub releases. It also translates text in view (see "Open: Translation"), from pictures the DLL hands it.
 
 The README covers user-facing behaviour, every setting and the build. This file holds what the README doesn't: the working rules, the build on Windows, the code map, and the work in progress.
 
@@ -24,6 +24,7 @@ The `u1` variant in `tools/ab/run.sh` uses these settings.
   - Patching SteamVR's own shaders or compositor internals beyond the D3D11 hooks we have. That was ruled out.
   - Anything loaded into VRChat's process. EAC protects it; vrupscale only ever touches `vrcompositor.exe`.
 - **Licences.** Ported code keeps its licence: `third_party/ffx/LICENSE*.txt`, shipped in `LICENSES/` by `tools/package.sh`. Most of AMD's FidelityFX SDK 2.x is under a binary-only licence. Its `Kits/FidelityFX/docs/license.md` lists the files that are MIT, so check that list before porting anything else from it.
+- **Translation's network use.** Zak chose DeepL with his own key (2026-11-18). The recognised texts go there and nothing else goes anywhere: no pictures, no other service, no telemetry. Ask him before adding a provider or sending anything more. Never put a real key in a test, a log or a commit; tests use `test/fake_deepl.py` on 127.0.0.1.
 - **Working with Zak.** No flattery. Don't ask him for what you can work out or look up. Report when something is done rather than sending progress updates. Give a plain account of what was measured and what wasn't.
 
 ## Building
@@ -77,11 +78,12 @@ sh tools/shaders.sh           # after shader edits (runs Microsoft's compiler un
 
 | Script | What it does |
 |---|---|
-| `selftest.sh <dll> <dir> [deferred]` | The full self-test, the same as the release's `selftest\selftest.cmd`: 193 checks drawing directly, 195 with `deferred` (command lists, like SteamVR). Expect `0 failed`. Its performance section gives real GPU times only on Windows. |
+| `selftest.sh <dll> <dir> [deferred]` | The full self-test, the same as the release's `selftest\selftest.cmd`: 214 checks drawing directly, 216 with `deferred` (command lists, like SteamVR). Expect `0 failed`. Its performance section gives real GPU times only on Windows. `VRUPSCALE_TEST_ONLY=capture` (or `gaze`, `switch`, …) in the environment runs one test. |
 | `build-at.sh <commit> <out.dll>` | Builds `dxgi.dll` at any commit in a temporary worktree: the "before" side of an A/B. |
 | `run.sh <dll> <dir>` | The A/B variants (v1–v14 scaled, u1–u3 at 1×, w1/w3/w8/x1 with `opticalFlow=fsr3`). Writes every frame of both eyes as raw RGBA. Options: `VARIANTS="v1 v3 v8 u1"`, `NOTIME=1`, `STATS=1` (per-pass GPU ms), `TOGA=n TOGB=n` (Ctrl+F10 before frame n), `W H FACTOR FRAMES MOTION`. |
 | `cmp.py <dirA>[:tag] <dirB>[:tag] [-v]` | Compares two runs per variant: IDENTICAL, or the differing values and PSNR. Exits 0 only if everything is identical. On Windows run it as `python tools/ab/cmp.py`. |
 | `quality.sh <dll> <dir> ["extra settings"]` | The quality table: FSR 1 vs temporal against ground truth per region (background, grating, trail, object, whole, steadiness), plus flow error against the true motion. `MOTION=40` is fast and `100` very fast and jerky. `W=1000 H=1100 FACTOR=1.0 FRAMES=16` is closer to a headset. `FULL=1` adds all the quality checks. |
+| `translate.sh <dll> <dir>` | Translation end to end, Windows only (it needs Windows' English OCR): the harness shows signs with text in stereo, `build/vrupscale.exe` reads them against the OpenVR stub and `test/fake_deepl.py`, and `translate_check.py` checks what was sent, drawn and placed: 26 checks. Options: `FACTOR=1.3`, `HEAD="x y z yaw"`, `VRUPSCALE_TEST_DEFERRED=1`. Needs `CC` for the stub and `python3`. Put `<dir>` on C: (the scratchpad): on F: the logs' writes stall for up to 1.5 s now and then, which fails its timing checks. |
 
 **Standard check for a change meant to leave the picture alone** (refactors, speed-ups):
 
@@ -95,7 +97,7 @@ python3 tools/ab/cmp.py /tmp/ab_before /tmp/ab_after     # every variant: IDENTI
 Add variants that cover the code touched (v7/v10–v14 for FSR 1 mode, v9 for no command lists, v5/v6/v12/v14 for FXAA). Then run `selftest.sh` both ways.
 
 **On Zak's PC (real GPU):**
-- **Eye tracker:** Bigscreen's real `VRCFTMemmapData` gaze mapping exists whenever its eye tracking client runs. On Zak's PC that is always, since `BeyondHID.exe` (the Beyond driver) runs in the background. The gaze test then skips its 15 checks (178 and 180 instead of 193 and 195, with a note on the RESULT line), because its stand-in would write fake samples into the real data. Those checks only run with no Bigscreen client running, as under Wine. Before this fix, "no eye tracker" failed there and the test wrote into the real mapping.
+- **Eye tracker:** Bigscreen's real `VRCFTMemmapData` gaze mapping exists whenever its eye tracking client runs. On Zak's PC that is always, since `BeyondHID.exe` (the Beyond driver) runs in the background. The gaze test then skips its 15 checks (199 and 201 instead of 214 and 216, with a note on the RESULT line), because its stand-in would write fake samples into the real data. Those checks only run with no Bigscreen client running, as under Wine. Before this fix, "no eye tracker" failed there and the test wrote into the real mapping.
 - **GPU times:** `run.sh STATS=1` gives no usable times. The same pass varied up to 17× between identical runs, probably because its sparse frames let the GPU clock down. Use the sustained-load performance section instead: `VRUPSCALE_TEST_PERF_ONLY=1 sh tools/ab/selftest.sh build/dxgi.dll <dir>`, adding `VRUPSCALE_TEST_EXTRA=opticalFlow=fsr3` (or any other `[temporal]` lines) to time other settings. Its small passes repeat within about 0.005 ms. Accumulate and output still vary 2–4× between runs at 2756², so its "cheaper than" timing checks can fail from noise (one did, in one of six runs).
 
 The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests.inc`. It acts like the compositor and draws a procedural scene with ground truth (sub-pixel head motion, a moving object, a grating above Nyquist). The `VRUPSCALE_TEST_*` environment variables are listed in the README's "Building from source" section; `VRUPSCALE_TEST_ONLY=abdump` is the `run.sh` mode.
@@ -111,7 +113,8 @@ The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests
 - `upscaler.cpp`:
   - Classifies the views the compositor binds, makes the proxies, and runs jobs before draws that sample them.
   - The spatial path (FSR 1, bilinear) and command-list handling.
-  - Hotkeys: `ApplyHotkey`. Ctrl+F1–F10 are on/off, mode, debug tint, sharpness, preset, sharp history, bilinear edges, calibrate, FXAA, and the optical-flow experiment.
+  - Hotkeys: `ApplyHotkey`. Ctrl+F1–F11 are on/off, mode, debug tint, sharpness, preset, sharp history, bilinear edges, calibrate, FXAA, the optical-flow experiment, and Translation.
+  - `OnBeforeDraw` calls `CaptureAtDraw` (capture.cpp) for every draw that samples an upscaled eye texture, once that draw's upscale work is issued or queued.
   - Config apply and reload (`ApplyConfig`, `ApplyFileConfig`), stats, and the debug exports the harness uses (`VrUpscaleDebug*`).
 - `temporal.cpp`:
   - Per-eye streams (history, pyramid, flow) and the eye pools: one history per eye across its swapchain textures and size changes.
@@ -120,6 +123,7 @@ The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests
 - `internal.h`: types shared by the two paths. `common.h`: `Config` and version. `config.cpp`: ini parsing.
 - `control.cpp`, `control_shared.h`: the app channel. Plain C layout; bump `kVuLayout` on any change.
 - `gaze.cpp`: Beyond 2e gaze from Bigscreen's `VRCFTMemmapData` shared memory. `log.cpp`: the log.
+- `capture.cpp`: Translation's pictures. While `[translate] enabled`, `captureHz` times a second, one `CopySubresourceRegion` per eye from the proxy into a shared texture of ours (`captureSize` px around the gaze, or straight ahead), published as `VuCapture` with an event. A capture starts with the eye the compositor draws first, so both eyes are of one frame. Nothing is read back. With no app acknowledging (`captureAck`), one capture every two seconds.
 - `permutations.h`: every compiled shader variant. `shaders.cpp` and `shader_pack.S` embed `gen/shaders.bin`.
 
 `shaders/`:
@@ -133,11 +137,18 @@ The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests
 - `update.cpp`: GitHub release updater. It reads a stored, uncompressed zip with no decompressor and checks the SHA-256.
 - `gameres.cpp`: sets VRChat's SteamVR resolution. `vrlink.cpp`: the OpenVR connection and the startup entry. `changelog.cpp`: shows CHANGELOG.md.
 - `vroverlay.cpp`: the page as a SteamVR dashboard overlay (IVROverlay_028 by function-table slot, a D3D11 texture on the headset's adapter). `main.cpp` draws it apart from the window at 96 dpi (1120×900, under the DLL's 1000 px eye-texture minimum, so the compositor never upscales it) and feeds the laser into the same pointer handlers as the mouse.
+- Translation (see "Open: Translation" for how it works):
+  - `translate.cpp`: the worker thread (captures → OCR → blocks → distances → labels → overlays) and the DeepL thread. Its overlays are plain IVROverlay_028 overlays in the standing space, one per label (`zakhazerd.vrupscale.label.N`, at most 24), by function-table slot like `vroverlay.cpp`. It reads the shared textures on a D3D11 device of its own, on whichever adapter opens them.
+  - `ocr.cpp`: Windows.Media.Ocr by vtable slot (MinGW-w64 has no header for it; the IDs and method orders come from Windows' metadata). One language per engine. An `Ocr` belongs to its thread.
+  - `trcore.cpp`: the plain computation, all covered by `--test-translate`: words into blocks, what is worth translating, pixel ↔ ray, distance from the two eyes (`StereoDepth`), a label's place and colours, its picture (GDI+).
+  - `deepl.cpp`: DeepL's `/v2/translate` and `/v2/usage` over WinHTTP. `VRUPSCALE_DEEPL_URL` replaces the server, with one on 127.0.0.1 or localhost only.
+  - `main.cpp`: the Translation card (`IDC_TRANSLATE`, `IDC_TRKEY`, `IDC_TRCOPY`), `SyncTranslate` (the switch from the page, Ctrl+F11 mirrored from the DLL, Restore defaults), and `g_linkTr`, which keeps the lasting connection open while it is on.
 - Testing it without SteamVR: build `test/stub/openvr_stub.c` (its header has the command), then run `vrupscale.exe --settings <test ini> --channel <name> --from-steamvr` with `VRUPSCALE_TEST_OPENVR` (the stub), `VRUPSCALE_TEST_STEAMVR_FLAG` (an existing file), `STUB_LOG`, `STUB_OVERLAY_EVENTS` (a laser script) and `STUB_DUMP_DIR` (the pictures sent) set. `Save()` rewrites the ini key by key on the window's thread: with a test ini on F: that took about 1.1 s, during which the page doesn't respond.
 
 `test/`:
 - `fake_compositor.cpp` and `temporal_tests.inc`: the harness.
-- `stub/openvr_stub.c`: stands in for `openvr_api.dll`. `stub/fakegaze.c`: stands in for Bigscreen's eye tracking client.
+- `stub/openvr_stub.c`: stands in for `openvr_api.dll`, including Translation's label overlays, the eyes (64 mm apart) and a head pose (`STUB_HEAD`). `stub/fakegaze.c`: stands in for Bigscreen's eye tracking client.
+- `capture_test.inc`: the DLL's captures (21 checks, in the self-test). `text_scene.inc`: signs with text in stereo for `translate.sh` (`VRUPSCALE_TEST_SERVE_TEXT=1`). `fake_deepl.py`: DeepL's stand-in.
 
 `tools/`:
 - `shaders.sh` and `compile_shaders.cpp`: build `shaders.bin`. `package.sh`: the release zip. `release_notes.py`: the release notes. `fonts.py`, `icon.py`: app assets.
@@ -215,6 +226,41 @@ What happens next depends on his answer:
 - **If rejected:** revert 696357c, which takes its README lines and licence file with it.
 
 Not tried yet: a temporal predictor for the top level, and robustness to extreme motion.
+
+## Open: Translation (`dev`, not released, not tried in a headset)
+
+Zak asked for it on 2026-11-18 and chose, of the options put to him: frames as a part around the gaze 3 times a second; Windows' own OCR; DeepL with his own key; Japanese to English; the translation over the text in the world. The README's Translation section is the user's view. How it works:
+
+1. **DLL** (`capture.cpp`): a part of each eye's proxy into a shared texture, `VuCapture` (control layout 5) and an event.
+2. **App worker** (`translate.cpp`), per capture:
+   - The head pose from `IVRSystem::GetDeviceToAbsoluteTrackingPose` (standing), asked for half a game frame back (`poseMs`), as soon as the event wakes it.
+   - It waits `kVuCaptureSettleMs` (30) for the compositor's frame to run the copy, reads both textures, and drops the capture if `round` changed meanwhile.
+   - OCR on the left eye's part, words into blocks (`GroupText`), blocks not worth translating dropped (`WorthTranslating`: for Japanese, at least two kana or kanji of which one is more than strokes).
+   - Each block's distance: its patch matched along the line it can lie on in the right eye's part (`StereoDepth`, zero-mean correlation at whole pixels, then between pixels by a parabola). No match: the median of the others, else `distance`.
+   - Labels: a block is a label's text again if it reads alike (similarity 0.7) and sits about where the label is in the picture. A label moves only when the new reading is off by more than the reading's jitter. A text that is no label's replaces a label that was not read again and that it sits inside. Not found twice while it should be in the picture: gone. Out of the picture: kept 10 s, or until the head has moved 35 cm.
+3. **DeepL thread**: texts of at least 6 characters at once, shorter ones after a second sighting; up to 16 per request; `charsPerMinute`; results in a map until the app closes. A failure backs off 3 s doubling to 30 s; 403 and 456 stop it until the key or the switch changes.
+4. **Overlays**: one per label, `SetOverlayTransformAbsolute` in the standing space, parallel to the eye's picture at the block's distance, the picture from `DrawLabel` (under 1000 px a side, so the DLL never takes it for an eye texture).
+
+Measured on Zak's PC (RTX 3090, 2026-11-18; `translate.sh` with its folder on C:):
+- Self-test both ways with the final DLL: 199 and 201 passed, 0 failed (gaze checks skipped). A/B against `dev` 4383602 with Translation off (v1 v3 v7 v8 v9 u1): all IDENTICAL.
+- `translate.sh`: 26 of 26 at factor 1.0, at 1.3 with the head at -0.4 1.2 0.5 turned -40°, with the head at 0.3 1.5 -0.2 turned 25°, and through command lists. Signs at 2 m and 4 m came out at 2.03–2.04 m and 3.98–4.03 m. A capture was in memory 38 ms after it was taken (30 of that is the wait), read in 9–10 ms (1024², English), distances in 1–2 ms.
+- OCR alone: 15–16 ms for a 1536² picture of English text. Japanese: not measured (no pack on this PC).
+- The DLL's cost on the compositor's thread (its stats line, the text scene at 64 fps): 1.9–2.0 ms per second in hooks with Translation on, 1.85–1.9 off; the longest call 0.04–0.18 ms either way, and 0.2 ms in the second it is switched on (the two textures are made then). GPU time per batch of upscale work: the same within its noise (1.2–1.7 ms). The copies' own GPU time was not isolated.
+- `--test-translate`: 25 checks, all pass, including turned text (Windows reports the angle clockwise, and its boxes are in the upright picture).
+
+Not verified, in the order it matters:
+- **Anything in the headset.** Whether the labels sit on the text, hold still, and are readable. Whether SteamVR 2.19.3 treats 24 small overlays fine.
+- **Japanese OCR** (Zak has to install the pack: `Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"`, as administrator), real DeepL, and how well text in VRChat worlds is read at all.
+- **The head pose's timing.** A captured frame was drawn for a pose somewhat before it is shown; the app asks for the pose half a game frame back (from the status's new-frames rate), which assumes SteamVR extrapolates backwards for a negative time. If labels trail or lead while the head turns, try `[translate] poseMs`. `IVRCompositor::GetFrameTiming`'s `m_HmdPose` would give the exact pose (slot 10 of IVRCompositor_029) but its time base and tracking space would need checking in SteamVR.
+- **SteamVR's projection convention.** `trcore.cpp` takes raw "bottom" (the positive value) as the tangent at the picture's top edge, as SteamVR's own projection matrix does. Evidence on Zak's Beyond 2e: its raw values are -1.317 and 0.958, and his gaze calibration offset is -0.4755, about what the opposite reading in `gaze.cpp` has to be corrected by (predicted -0.36 to -0.42). If labels sit a constant 10°+ too high or low, this is the place.
+- **Wine:** `capture_test.inc` skips its pixel checks if the shared texture can't be opened from a second device (4 fewer checks). Not run under Wine.
+
+Follow-ups noticed, not done:
+- `gaze.cpp`'s `Proj()` reads SteamVR's raw top and bottom the other way round (see above). The calibration hides it; without calibration the area and the calibration cross sit about 20° low on a Beyond 2e, at different heights per eye. Fixing it changes what existing calibrations mean, so it needs Zak's OK.
+- A label is flat and faces the viewer; a text on a wall seen at an angle could get the wall's slant from the distances of its two ends.
+- If Windows' OCR reads too little in real worlds, the next step Zak was told about is a neural scene-text model (PaddleOCR on ONNX Runtime): a much bigger job.
+- Translations are kept in memory only. A file would save DeepL characters across runs, and would be a record of what was read (other people's chat boxes too): ask first.
+- No CHANGELOG entry yet: it goes in when this is released.
 
 ## History worth knowing
 
