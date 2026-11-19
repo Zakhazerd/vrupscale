@@ -2650,8 +2650,13 @@ static void RunPerfTest(Gfx &g, const char *reqShared, bool sharedOk, int frames
 static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int frames, int W, int H, int OW, int OH)
 {
     const double warmupMs = 1500.0;
+    // VRUPSCALE_TEST_EXTRA: more [temporal] settings for every mode, e.g. "opticalFlow=fsr3" (copied:
+    // EnvStr's buffer is reused by the next call)
+    std::string extra = EnvStr("VRUPSCALE_TEST_EXTRA");
+    if (!extra.empty() && extra.back() != '\n') extra += '\n';
     printf("[performance: %dx%d x2 -> %dx%d, sustained load, %d frames per mode after %.1f s warm-up]\n", W, H, OW, OH,
            frames, warmupMs / 1000.0);
+    if (!extra.empty()) printf("         (extra [temporal] settings: %.*s)\n", int(extra.size()) - 1, extra.c_str());
     World world = MakeWorld(2200, 2000);
     Rng rng(5);
     const int distinct = 4;
@@ -2761,8 +2766,8 @@ static void RunPerfTestAt(Gfx &g, const char *reqShared, bool sharedOk, int fram
         const bool perPass = m == kPerPass;
         snprintf(ini, sizeof(ini),
                  "[general]\nlogLevel=1\nstatsIntervalSec=0\nhotkeys=0\ngpuTiming=%d\n[match]\nrequireShared=%s\n"
-                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n%s[temporal]\ntemporalArea=%s\n", (perPass || m == kTemporalFovTimed) ? 1 : 0,
-                 reqShared, modeIni[m], (double)OH / (double)H, sharpIni[m], areaIni[m]);
+                 "[upscale]\n%supscaleFactor=%.4f\nsharpness=0.5\n%s[temporal]\ntemporalArea=%s\n%s", (perPass || m == kTemporalFovTimed) ? 1 : 0,
+                 reqShared, modeIni[m], (double)OH / (double)H, sharpIni[m], areaIni[m], extra.c_str());
         WriteIni(ini);
         Pump(g);
         if (perPass) g_passTimes(nullptr, nullptr, 0, 1);   // discard anything older
