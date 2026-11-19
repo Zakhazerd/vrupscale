@@ -178,7 +178,7 @@ DWORD WINAPI HttpThread(LPVOID)
         }
         if (batch.empty()) continue;
         const DeepLResult r = DeepLTranslate(cfg.key, batch, cfg.source, cfg.target);
-        LogLine(L"deepl: %zu texts, %d characters: %ls after %lu ms", batch.size(), chars, r.ok ? L"translated" : r.error.c_str(),
+        LogLine(L"deepl: %d texts, %d characters: %ls after %lu ms", (int)batch.size(), chars, r.ok ? L"translated" : r.error.c_str(),
                 (unsigned long)(GetTickCount() - now));
         {
             Lock l;
@@ -774,8 +774,8 @@ struct Worker {
         const DWORD now = GetTickCount();
         bool seen[kMaxLabels] = {};
         QueryPerformanceCounter(&t0);
-        LogLine(L"capture %u: %d x %d, %s, read in %.0f ms: %zu lines, %zu blocks, %zu worth translating (distances in %.0f ms)", c.round,
-                L.gray.w, L.gray.h, R ? L"both eyes" : L"one eye", ocrMs, page.lines.size(), blocks.size(), found.size(),
+        LogLine(L"capture %u: %d x %d, %s, read in %.0f ms: %d lines, %d blocks, %d worth translating (distances in %.0f ms)", c.round,
+                L.gray.w, L.gray.h, R ? L"both eyes" : L"one eye", ocrMs, (int)page.lines.size(), (int)blocks.size(), (int)found.size(),
                 (double)(t0.QuadPart - t1.QuadPart) * 1000.0 / (double)f.QuadPart);
 
         // Where each label is in this picture (its centre; its size is the box it was made for).
@@ -1283,7 +1283,7 @@ int TranslateSelfTest(std::wstring &report)
             }
             check(read && a && b && fabsf(a->cx - 520) < 8 && fabsf(a->cy - 300) < 8 && fabsf(b->cx - 1000) < 8 && fabsf(b->cy - 700) < 10 && b->lines == 2 &&
                       a->lineH > 24 && a->lineH < 52,
-                  Fmt(L"ocr: text drawn here is read and grouped, where it is (%zu blocks)", blocks.size()));
+                  Fmt(L"ocr: text drawn here is read and grouped, where it is (%d blocks)", (int)blocks.size()));
             if (a) {
                 uint32_t bg = 0, ink = 0;
                 TextColours(px.data(), W, H, W, a->cx, a->cy, a->w, a->h, &bg, &ink);
