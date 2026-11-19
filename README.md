@@ -171,7 +171,7 @@ This test content is deliberately hard: heavily aliased, with sub-pixel detail e
 
 ## Self-test (optional, no SteamVR involved)
 
-`selftest\selftest.cmd` runs the full test harness against your real GPU and D3D11, including real cross-process shared textures. It runs twice, the second time recording into command lists like SteamVR, and takes a few minutes. Expect `0 failed` for both parts (193 and 195 checks). The results (GPU name, quality tables, timings, pass/fail) are saved to `selftest\selftest_results.txt`; that is the file to send back.
+`selftest\selftest.cmd` runs the full test harness against your real GPU and D3D11, including real cross-process shared textures. It runs twice, the second time recording into command lists like SteamVR, and takes a few minutes. Expect `0 failed` for both parts (193 and 195 checks). While Bigscreen's eye tracking is running, the 15 eye-tracking checks are skipped so its gaze data is left alone (178 and 180 checks). The results (GPU name, quality tables, timings, pass/fail) are saved to `selftest\selftest_results.txt`; that is the file to send back.
 
 The performance section measures the GPU cost at two sizes (Index-like, 1561×1735 ×2 → 2014×2238, and a high-resolution headset, 2756×2756 ×2 → 3555×3555) while a stand-in for the game keeps the GPU busy. It reports what bilinear, FSR 1 (whole image, at the 60% area, and that with the Sharpness area at all) and temporal (whole image, at the 60% area, with Bilinear edges, with the Sharpness area at all, and with vrupscale's own GPU timing on, as in use) add per frame for both eyes, with a per-pass breakdown of temporal at the 60% area. Compare the added cost with your frame budget (11.1 ms at 90 Hz).
 

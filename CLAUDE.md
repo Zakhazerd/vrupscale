@@ -49,7 +49,7 @@ CI builds with Ubuntu's MinGW-w64 (GCC 13, win32 threads, msvcrt). On Windows:
 **Verified on Zak's PC (2026-11-18, `dev` 18edcca, MSYS2 GCC 16.2.0, no script changes needed):**
 - All four builds succeed without warnings. `dxgi.dll` imports only `KERNEL32.dll` and `msvcrt.dll`.
 - `tools/shaders.sh` with System32's `d3dcompiler_47.dll` reproduced `shaders.bin` byte for byte (FXC still prints its X4000 warnings for `upscale.hlsl` line 208).
-- `selftest.sh` both ways on the RTX 3090: everything passed except the eye-tracker check (see Testing).
+- `selftest.sh` both ways on the RTX 3090: 0 failed, with the eye-tracking checks skipped (see Testing).
 - The standard A/B check below (`build-at.sh`, `run.sh`, `cmp.py`) ran as written: all IDENTICAL. The worktree build of the same commit gave a byte-identical `dxgi.dll`.
 - Not verified: whether this GCC 16 build behaves like CI's GCC 13 build (no A/B against a CI-built DLL), and nothing has run in SteamVR.
 
@@ -95,7 +95,7 @@ python3 tools/ab/cmp.py /tmp/ab_before /tmp/ab_after     # every variant: IDENTI
 Add variants that cover the code touched (v7/v10–v14 for FSR 1 mode, v9 for no command lists, v5/v6/v12/v14 for FXAA). Then run `selftest.sh` both ways.
 
 **On Zak's PC (real GPU):**
-- **Eye tracker:** Bigscreen's `BeyondHID.exe` (the Beyond driver) keeps Bigscreen's real `VRCFTMemmapData` gaze mapping open. While it runs, "no eye tracker: the area stays centred" fails, and the gaze test writes its fake gaze into that real mapping. Don't run the self-test during a VR session.
+- **Eye tracker:** Bigscreen's real `VRCFTMemmapData` gaze mapping exists whenever its eye tracking client runs. On Zak's PC that is always, since `BeyondHID.exe` (the Beyond driver) runs in the background. The gaze test then skips its 15 checks (178 and 180 instead of 193 and 195, with a note on the RESULT line), because its stand-in would write fake samples into the real data. Those checks only run with no Bigscreen client running, as under Wine. Before this fix, "no eye tracker" failed there and the test wrote into the real mapping.
 - **GPU times:** `run.sh STATS=1` gives no usable times. The same pass varied up to 17× between identical runs, probably because its sparse frames let the GPU clock down. Use the sustained-load performance section instead: `VRUPSCALE_TEST_PERF_ONLY=1 sh tools/ab/selftest.sh build/dxgi.dll <dir>`, adding `VRUPSCALE_TEST_EXTRA=opticalFlow=fsr3` (or any other `[temporal]` lines) to time other settings. Its small passes repeat within about 0.005 ms. Accumulate and output still vary 2–4× between runs at 2756², so its "cheaper than" timing checks can fail from noise (one did, in one of six runs).
 
 The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests.inc`. It acts like the compositor and draws a procedural scene with ground truth (sub-pixel head motion, a moving object, a grating above Nyquist). The `VRUPSCALE_TEST_*` environment variables are listed in the README's "Building from source" section; `VRUPSCALE_TEST_ONLY=abdump` is the `run.sh` mode.

@@ -1780,6 +1780,14 @@ static Image HoldGaze(Gfx &g, EyeTarget &tgt, ID3D11ShaderResourceView *view, in
 static void RunGazeTest(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, float F, UINT misc)
 {
     printf("[eye tracking: the temporal area follows the gaze]\n");
+    // With Bigscreen's eye tracking client running, its shared gaze data is real: a stand-in by that
+    // name would write fake samples into it, and "no eye tracker" can't be tested. Leave it alone.
+    if (HANDLE real = OpenFileMappingW(FILE_MAP_READ, FALSE, L"VRCFTMemmapData")) {
+        CloseHandle(real);
+        g_gazeSkipped = true;
+        printf("  skip Bigscreen's eye tracking is running (its shared gaze data exists): close it to run these checks\n");
+        return;
+    }
     const int OW = mov.ow, OH = mov.oh;
     std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
     ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
@@ -1825,7 +1833,8 @@ static void RunGazeTest(Gfx &g, const Sequence &mov, const char *iniBase, const 
 
     // 2. the eye tracking client starts publishing
     HANDLE gm = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FakeGaze), L"VRCFTMemmapData");
-    g_fakeGaze = gm ? (volatile FakeGaze *)MapViewOfFile(gm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FakeGaze)) : nullptr;
+    const bool realAppeared = gm && GetLastError() == ERROR_ALREADY_EXISTS;   // the real one, started meanwhile
+    g_fakeGaze = gm && !realAppeared ? (volatile FakeGaze *)MapViewOfFile(gm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FakeGaze)) : nullptr;
     CHECK(g_fakeGaze != nullptr, "test: Bigscreen's shared gaze data stand-in created");
     if (!g_fakeGaze) return;
     g_gazeTx = 0; g_gazeTy = 0;

@@ -27,6 +27,7 @@ typedef void (*PFN_Reload)();
 static PFN_GetStats g_getStats;
 static PFN_Reload g_reload;
 static int g_fail = 0, g_pass = 0;
+static bool g_gazeSkipped = false;   // Bigscreen's eye tracking was running (RunGazeTest)
 static std::string g_iniPath;
 
 #define CHECK(cond, ...) do { if (cond) { g_pass++; printf("  ok   "); } else { g_fail++; printf("  FAIL "); } printf(__VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
@@ -1190,6 +1191,7 @@ int main(int argc, char **argv)
 
     printf("\nstats: ps=%ld subs=%ld upscales=%ld rejects=%ld copiesMarked=%ld\n", (long)st.psHookCalls,
            (long)st.substitutions, (long)st.upscales, (long)st.rejects, (long)st.copiesMarked);
-    printf("RESULT: %d passed, %d failed%s\n", g_pass, g_fail, sharedOk ? "" : " (shared-texture checks skipped)");
+    printf("RESULT: %d passed, %d failed%s%s\n", g_pass, g_fail, sharedOk ? "" : " (shared-texture checks skipped)",
+           g_gazeSkipped ? " (eye tracking checks skipped: Bigscreen's eye tracking is running)" : "");
     return g_fail ? 1 : 0;
 }
