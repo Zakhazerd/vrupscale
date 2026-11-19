@@ -313,7 +313,14 @@ static void DumpBmp(ID3D11Texture2D *tex, const char *path)
                 ih.biBitCount = 32;
                 fwrite(&fh, sizeof(fh), 1, f);
                 fwrite(&ih, sizeof(ih), 1, f);
-                for (UINT y = 0; y < d.Height; ++y) fwrite((char *)m.pData + y * m.RowPitch, 4, d.Width, f);
+                for (UINT y = 0; y < d.Height; ++y) {
+                    uint32_t *row = (uint32_t *)((char *)m.pData + y * m.RowPitch);
+                    for (UINT x = 0; x < d.Width; ++x) {   // the BMP is BGRA
+                        uint32_t p = row[x];
+                        if (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM) p = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+                        fwrite(&p, 4, 1, f);
+                    }
+                }
                 fclose(f);
             }
             ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)st, 0);

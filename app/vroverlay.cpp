@@ -99,7 +99,7 @@ bool EnsureDevice(VrLinkUse &link)
 }
 
 // A texture of w x h holding pixels (made or remade as needed).
-bool Upload(ID3D11Texture2D *&tex, int &tw, int &th, const uint32_t *px, int w, int h)
+bool Upload(ID3D11Texture2D *&tex, int &tw, int &th, const uint32_t *px, int w, int h, DXGI_FORMAT format)
 {
     if (tex && (tw != w || th != h)) {
         tex->Release();
@@ -111,7 +111,7 @@ bool Upload(ID3D11Texture2D *&tex, int &tw, int &th, const uint32_t *px, int w, 
         d.Height = (UINT)h;
         d.MipLevels = 1;
         d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.Format = format;
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -149,7 +149,8 @@ std::wstring Create(VrLinkUse &link, int pageW, int pageH)
     Vec2 scale = { { (float)pageW, (float)pageH } };
     ((PFN_SetMouseScale)ov[kSetMouseScale])(m, &scale);
     ((PFN_SetFlag)ov[kSetFlag])(m, kFlagDiscreteScroll, true);
-    if (th && !g_thumb.empty() && EnsureDevice(link) && Upload(g_thumbTex, g_thumbTexW, g_thumbTexH, g_thumb.data(), g_thumbW, g_thumbH))
+    if (th && !g_thumb.empty() && EnsureDevice(link) &&
+        Upload(g_thumbTex, g_thumbTexW, g_thumbTexH, g_thumb.data(), g_thumbW, g_thumbH, DXGI_FORMAT_R8G8B8A8_UNORM))
         Send(th, g_thumbTex);
     return std::wstring();
 }
@@ -225,7 +226,7 @@ bool OverlaySetPage(const uint32_t *pixels, int w, int h, std::wstring &error)
         error = L"Direct3D 11 isn't available for it";
         return true;
     }
-    if (!Upload(g_pageTex, g_pageW, g_pageH, pixels, w, h)) {
+    if (!Upload(g_pageTex, g_pageW, g_pageH, pixels, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)) {
         error = L"its picture couldn't be made";
         return true;
     }
@@ -234,9 +235,15 @@ bool OverlaySetPage(const uint32_t *pixels, int w, int h, std::wstring &error)
     return true;
 }
 
+// The dashboard's bar takes the thumbnail's bytes as RGBA whatever the texture's format says (sent
+// as BGRA, the icon's blue came out orange in SteamVR 2.19), so it goes as an RGBA texture.
 void OverlaySetThumbnail(const uint32_t *pixels, int w, int h)
 {
-    g_thumb.assign(pixels, pixels + (size_t)w * h);
+    g_thumb.resize((size_t)w * h);
+    for (size_t i = 0; i < g_thumb.size(); ++i) {
+        const uint32_t p = pixels[i];   // BGRA in memory: 0xAARRGGBB
+        g_thumb[i] = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+    }
     g_thumbW = w;
     g_thumbH = h;
 }

@@ -3034,7 +3034,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     if (another && g_fromVR) return 0;   // SteamVR starting it while it is open already: nothing to show
     if (another) {
         HWND other = FindWindowW(L"vrupscale.app", nullptr);
-        if (other) {
+        if (other) {   // (hidden if SteamVR started it: shown now)
+            if (!IsWindowVisible(other)) ShowWindow(other, SW_SHOW);
             ShowWindow(other, SW_RESTORE);
             SetForegroundWindow(other);
         }
@@ -3091,7 +3092,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
             set(w, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof(text));
         }
     }
-    ShowWindow(w, g_fromVR ? SW_SHOWMINNOACTIVE : show);   // started by SteamVR: out of the way
+    // Started by SteamVR: no window at all, the page is in SteamVR's dashboard (opening vrupscale.exe
+    // shows the window). Without the dashboard page: minimized, out of the way.
+    if (!(g_fromVR && g_vrPage)) ShowWindow(w, g_fromVR ? SW_SHOWMINNOACTIVE : show);
     UpdateWindow(w);
     if (showChangeLog) OpenChangeLog();
     MSG m;
