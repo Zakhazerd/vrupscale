@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 static int Env(const char *n, int def);
 static void Log(const char *fmt, ...)   // STUB_LOG_TIME=1: each line starts with GetTickCount
@@ -129,6 +130,31 @@ static bool __stdcall PollNextEvent(void *ev, uint32_t size)
     return true;
 }
 static void __stdcall AcknowledgeQuit(void) { Log("AcknowledgeQuit_Exiting"); }
+// The eyes and the head, for the app's translation labels: the eyes 64 mm apart; the head at
+// STUB_HEAD ("x y z yaw": metres and degrees turned to the left; default 0 1.6 0 0), standing space.
+typedef struct { float m[3][4]; } Mat34;
+typedef struct { Mat34 m; float v[3], w[3]; int result; bool valid, connected; } Pose;
+static Mat34 __stdcall EyeToHead(int eye)
+{
+    Mat34 m = { { { 1, 0, 0, eye ? 0.032f : -0.032f }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } } };
+    Log("GetEyeToHeadTransform eye %d", eye);
+    return m;
+}
+static int g_poses = 0;
+static void __stdcall DevicePoses(int origin, float seconds, Pose *poses, uint32_t count)
+{
+    char b[128];
+    float x = 0, y = 1.6f, z = 0, yaw = 0;
+    if (GetEnvironmentVariableA("STUB_HEAD", b, sizeof(b))) sscanf(b, "%f %f %f %f", &x, &y, &z, &yaw);
+    if (g_poses++ < 3) Log("GetDeviceToAbsoluteTrackingPose origin %d seconds %.3f count %u", origin, seconds, count);
+    if (!count) return;
+    memset(poses, 0, sizeof(Pose) * count);
+    const float c = (float)cos(yaw * 0.01745329252), s = (float)sin(yaw * 0.01745329252);
+    Mat34 m = { { { c, 0, s, x }, { 0, 1, 0, y }, { -s, 0, c, z } } };
+    poses[0].m = m;
+    poses[0].result = 200;   // TrackingResult_Running_OK
+    poses[0].valid = poses[0].connected = true;
+}
 static void *g_system[48] = { 0, 0, (void *)ProjectionRaw };
 
 // IVRApplications_008: one application (the app's), state in STUB_APP_FILE ("installed auto binary")
@@ -257,10 +283,43 @@ static void *g_apps[40] = { (void *)AddManifest, (void *)RemoveManifest, (void *
 // from the top left ("move x y", "down x y", "up x y", "leave", "scroll dy", "wait n": n polls
 // without input), turned into OpenVR's events (y up from the bottom of the mouse scale).
 typedef uint64_t Handle;
-static const Handle kMain = 0x1001, kThumb = 0x1002;
+static const Handle kMain = 0x1001, kThumb = 0x1002, kLabel0 = 0x2000;
 static float g_mouseW = 1, g_mouseH = 1;
 static int g_pages = 0;
 static const char *__stdcall OvErrName(int e) { return e == 12 ? "VROverlayError_PermissionDenied" : "VROverlayError_Stub"; }
+// Overlays in the room (the app's translation labels, key "...label.N"): each call is logged as
+// "label N"; their pictures go to STUB_DUMP_DIR as label_N_MMM.bmp. STUB_LABEL_ERR: CreateOverlay's error.
+static int g_labelPics[64];
+static const char *Name(Handle h)
+{
+    static char b[4][24];
+    static int k = 0;
+    if (h == kMain) return "main";
+    if (h == kThumb) return "thumbnail";
+    if (h < kLabel0 || h >= kLabel0 + 64) return "?";
+    k = (k + 1) & 3;
+    snprintf(b[k], sizeof(b[k]), "label %d", (int)(h - kLabel0));
+    return b[k];
+}
+static int __stdcall CreateOverlay(const char *key, const char *name, Handle *h)
+{
+    const char *dot = strrchr(key, '.');
+    const int n = dot ? atoi(dot + 1) : -1, e = Env("STUB_LABEL_ERR", 0);
+    Log("CreateOverlay key=%s name=%s -> %d", key, name, e);
+    if (e || n < 0 || n >= 64) return e ? e : 12;
+    *h = kLabel0 + (Handle)n;
+    return 0;
+}
+static int __stdcall DestroyOverlay(Handle h) { Log("DestroyOverlay %s", Name(h)); return 0; }
+static int __stdcall ShowOverlay(Handle h) { Log("ShowOverlay %s", Name(h)); return 0; }
+static int __stdcall HideOverlay(Handle h) { Log("HideOverlay %s", Name(h)); return 0; }
+static int __stdcall SetTransformAbsolute(Handle h, int origin, Mat34 *m)
+{
+    Log("SetOverlayTransformAbsolute %s origin %d pos %.4f %.4f %.4f right %.4f %.4f %.4f up %.4f %.4f %.4f back %.4f %.4f %.4f", Name(h), origin,
+        m->m[0][3], m->m[1][3], m->m[2][3], m->m[0][0], m->m[1][0], m->m[2][0], m->m[0][1], m->m[1][1], m->m[2][1], m->m[0][2], m->m[1][2],
+        m->m[2][2]);
+    return 0;
+}
 static int __stdcall CreateDashboard(const char *key, const char *name, Handle *m, Handle *t)
 {
     int e = Env("STUB_OVERLAY_ERR", 0);
@@ -270,7 +329,12 @@ static int __stdcall CreateDashboard(const char *key, const char *name, Handle *
     *t = kThumb;
     return 0;
 }
-static int __stdcall SetWidth(Handle h, float w) { Log("SetOverlayWidthInMeters %s %.2f", h == kMain ? "main" : "?", w); return 0; }
+static int __stdcall SetWidth(Handle h, float w)
+{
+    if (h == kMain) Log("SetOverlayWidthInMeters main %.2f", w);
+    else Log("SetOverlayWidthInMeters %s %.4f", Name(h), w);
+    return 0;
+}
 static int __stdcall SetInputMethod(Handle h, int m) { Log("SetOverlayInputMethod %s %d", h == kMain ? "main" : "?", m); return 0; }
 static int __stdcall SetMouseScale(Handle h, float *v)
 {
@@ -336,11 +400,13 @@ static int __stdcall SetTexture(Handle h, void **tex)   // Texture_t: handle, ty
     int type = ((int *)tex)[2], space = ((int *)tex)[3];
     D3D11_TEXTURE2D_DESC d;
     ID3D11Texture2D_GetDesc(t, &d);
-    Log("SetOverlayTexture %s %ux%u format %d mips %u type %d colorspace %d", h == kMain ? "main" : h == kThumb ? "thumbnail" : "?",
-        d.Width, d.Height, (int)d.Format, d.MipLevels, type, space);
+    Log("SetOverlayTexture %s %ux%u format %d mips %u type %d colorspace %d", Name(h), d.Width, d.Height, (int)d.Format, d.MipLevels, type,
+        space);
     char dir[400], path[512];
     if (GetEnvironmentVariableA("STUB_DUMP_DIR", dir, sizeof(dir))) {
         if (h == kThumb) snprintf(path, sizeof(path), "%s\\thumb.bmp", dir);
+        else if (h >= kLabel0 && h < kLabel0 + 64)
+            snprintf(path, sizeof(path), "%s\\label_%d_%03d.bmp", dir, (int)(h - kLabel0), g_labelPics[h - kLabel0]++);
         else snprintf(path, sizeof(path), "%s\\page_%03d.bmp", dir, g_pages++);
         DumpBmp(t, path);
     }
@@ -398,6 +464,13 @@ static void __stdcall DXGIOutputInfo(int32_t *adapter) { *adapter = Env("STUB_AD
 
 __declspec(dllexport) uint32_t VR_InitInternal2(int *err, int type, const char *info)
 {
+    g_system[5] = (void *)EyeToHead;
+    g_system[12] = (void *)DevicePoses;
+    g_overlay[1] = (void *)CreateOverlay;
+    g_overlay[3] = (void *)DestroyOverlay;
+    g_overlay[33] = (void *)SetTransformAbsolute;
+    g_overlay[43] = (void *)ShowOverlay;
+    g_overlay[44] = (void *)HideOverlay;
     g_system[8] = (void *)DXGIOutputInfo;
     g_system[30] = (void *)PollNextEvent;
     g_system[47] = (void *)AcknowledgeQuit;

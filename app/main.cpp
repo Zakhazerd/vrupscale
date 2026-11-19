@@ -4,6 +4,7 @@
 #include "changelog.h"
 #include "core.h"
 #include "gameres.h"
+#include "translate.h"
 #include "ui.h"
 #include "update.h"
 #include "vrlink.h"
@@ -39,6 +40,7 @@ enum : int {
     IDC_DEFAULTS, IDC_SAVED, IDC_OPENLOG, IDC_OPENFOLDER, IDC_STATUS, IDC_DETAIL, IDC_TEXLIST, IDC_TEXHINT, IDC_EVENTS,
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
     IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR, IDC_SHARPAREA, IDC_SHARPAREAVAL, IDC_FXAA,
+    IDC_TRANSLATE, IDC_TRKEY, IDC_TRCOPY, IDC_TRSTATUS,
 };
 enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP, TIMER_VR };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
@@ -92,6 +94,8 @@ volatile LONG g_linkSync = 1;        // the thread brings SteamVR's startup entr
 // mouse. That needs the lasting connection too. [app] dashboard=0 turns it off.
 bool g_vrPage = true;
 volatile LONG g_linkDash = 1;        // the link thread keeps the lasting connection for it
+// Translation (translate.h): its labels are SteamVR overlays, so it needs the lasting connection as well.
+volatile LONG g_linkTr = 0;
 bool g_vrSeen = false;               // SteamVR ran during this run
 bool g_vrQuitting = false;           // SteamVR asked the app to quit; its processes are still closing
 bool g_closingWithVR = false;
@@ -142,7 +146,8 @@ const RectF kCardEye = { 24, 672, kColW, 210 };
 const RectF kCardTemp = { 386, 214, kColW, 302 };
 const RectF kCardVR = { 386, 530, kColW, 352 };   // SteamVR, and the settings file
 const RectF kCardTex = { 748, 214, kColW, 262 };
-const RectF kCardEv = { 748, 490, kColW, 392 };
+const RectF kCardEv = { 748, 490, kColW, 218 };
+const RectF kCardTr = { 748, 722, kColW, 160 };   // Translation
 const RectF kList = { kCardTex.x + 14, kCardTex.y + 52, kColW - 28, 160 };
 const RectF kLog = { kCardEv.x + 14, kCardEv.y + 52, kColW - 28, kCardEv.h - 66 };
 constexpr float kRowH = 40, kLogLineH = 15;
@@ -354,6 +359,7 @@ void ModelToUi()
     SetCheck(IDC_GAZEFOLLOW, g_s.gazeFollow != 0);
     SetCheck(IDC_GAZESHOW, g_s.gazeShow != 0);
     SetCheck(IDC_WITHVR, g_withVR);
+    SetCheck(IDC_TRANSLATE, g_s.translate != 0);
     const bool temporal = g_s.mode == kVuModeTemporal;
     for (int id : { IDC_HIST, IDC_MOVING, IDC_TOL, IDC_SHARPHIST }) Enable(id, temporal);
     Enable(IDC_AREA, g_s.mode != kVuModeBilinear);
@@ -381,6 +387,86 @@ void Push()
 {
     g_pushPending = false;
     if (g_ch.IsOpen() && g_live) g_sentSeq = g_ch.SendSettings(g_s);
+}
+
+// ---- translation (translate.h) ----------------------------------------------------------------------
+
+// The switch as the settings have it (the page's, a shortcut's in VR, Restore defaults): the worker
+// follows, and the connection to SteamVR its labels need is kept.
+void SyncTranslate()
+{
+    const bool on = g_s.translate != 0;
+    if (on && !app::TranslateWantsLink()) app::TranslateReload();   // going on: the languages and the key as the file has them now
+    app::TranslateSet(on);
+    g_linkTr = on ? 1 : 0;
+    if (g_linkWake) SetEvent(g_linkWake);
+}
+
+std::wstring g_trNote;        // what a button of the card just did (shown for a while)
+DWORD g_trNoteAt = 0;
+std::wstring g_trCommand;     // the line Copy command copies
+
+void UpdateTranslateUi()
+{
+    const app::TranslateStatus ts = app::TranslateGetStatus();
+    const bool on = g_s.translate != 0;
+    std::wstring line = ts.line;
+    if (!on)
+        line = ts.hasKey ? L"Reads text where you look in VR and shows its translation over it. Texts it reads go to DeepL with your key."
+                         : L"Reads text where you look in VR and shows its translation over it. Needs a DeepL API key (Paste key).";
+    if (!g_trNote.empty() && GetTickCount() - g_trNoteAt < 6000) line = g_trNote;
+    SetText(IDC_TRSTATUS, line);
+    g_trCommand = ts.ocrCommand;
+    const bool copy = on && ts.state == app::TranslateStatus::NoOcr;
+    if (ui::Widget *w = W(IDC_TRCOPY)) {
+        if (w->visible != copy) {
+            w->visible = copy;
+            Invalidate();
+        }
+    }
+    if (ui::Widget *w = W(IDC_TRKEY)) {
+        const wchar_t *text = ts.hasKey ? L"Change key" : L"Paste key";
+        if (w->text != text) {
+            w->text = text;
+            Invalidate();
+        }
+    }
+}
+
+std::wstring ClipboardText()
+{
+    std::wstring s;
+    if (!OpenClipboard(g_wnd)) return s;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t *p = (const wchar_t *)GlobalLock(h)) {
+            s.assign(p, wcsnlen(p, 4096));
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return s;
+}
+
+bool SetClipboardText(const std::wstring &s)
+{
+    if (!OpenClipboard(g_wnd)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t))) {
+        memcpy(GlobalLock(h), s.c_str(), (s.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(h);
+        ok = SetClipboardData(CF_UNICODETEXT, h) != nullptr;
+        if (!ok) GlobalFree(h);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+void TranslateNote(const std::wstring &note)
+{
+    g_trNote = note;
+    g_trNoteAt = GetTickCount();
+    UpdateTranslateUi();
 }
 
 // A user change: live values are sent at most ten times a second while a slider moves; anything
@@ -931,6 +1017,7 @@ void RefreshStatus()
             ModelToUi();
             SetTimer(g_wnd, TIMER_SAVE, 600, nullptr);
             SyncGameRes();   // Ctrl+F5 changes VRChat's resolution too
+            SyncTranslate();   // Ctrl+F11 switches the translation
         }
     }
     GameResTick(false);
@@ -941,6 +1028,7 @@ void RefreshStatus()
         if (t) CloseHandle(t);
     }
     UpdateGazeUi();
+    UpdateTranslateUi();
     SetText(IDC_STATUS, status);
     SetText(IDC_DETAIL, detail);
     SetStatusColor(color);
@@ -1045,7 +1133,7 @@ DWORD WINAPI LinkThread(LPVOID)
             continue;
         }
         if (quitSeen) continue;   // SteamVR is closing: nothing more until it has
-        const bool want = g_linkWant != 0, keep = want || g_linkDash != 0;
+        const bool want = g_linkWant != 0, keep = want || g_linkDash != 0 || g_linkTr != 0;
         if (keep && !app::VrLinkIsOpen() && GetTickCount() - lastOpen > 3000) {
             lastOpen = GetTickCount();
             std::wstring err;
@@ -1458,7 +1546,7 @@ void AddSlider(int id, const RectF &r, const wchar_t *label, int lo, int hi, flo
 void CreateControls()
 {
     using ui::Kind;
-    const RectF U = kCardUp, T = kCardTemp, V = kCardVR, X = kCardTex, E = kCardEv;
+    const RectF U = kCardUp, T = kCardTemp, V = kCardVR, X = kCardTex, E = kCardEv, R = kCardTr;
     AddWidget(IDC_CHANGELOG, Kind::Button, ChangeLogButtonRect(), L"Change log");
     AddWidget(IDC_UPDATE, Kind::Button, { 0, 0, 0, 0 }, L"Update", ui::BtnPrimary);   // placed by RefreshUpdateUi
     W(IDC_UPDATE)->visible = false;
@@ -1517,6 +1605,10 @@ void CreateControls()
     AddWidget(IDC_TEXLIST, Kind::Custom, kList, L"");
     AddWidget(IDC_OPENLOG, Kind::Button, { E.r() - 112, E.y + 14, 92, 30 }, L"Open log");
     AddWidget(IDC_EVENTS, Kind::Custom, kLog, L"");
+    AddWidget(IDC_TRANSLATE, Kind::Toggle, { R.r() - 64, R.y + 15, 44, 26 }, L"");
+    AddWidget(IDC_TRKEY, Kind::Button, { R.x + 20, R.y + 114, 118, 32 }, L"Paste key");
+    AddWidget(IDC_TRCOPY, Kind::Button, { R.x + 148, R.y + 114, 150, 32 }, L"Copy command", ui::BtnPrimary);
+    W(IDC_TRCOPY)->visible = false;
 }
 
 // ---- drawing ------------------------------------------------------------------------------------
@@ -1609,6 +1701,7 @@ void DrawBackground(Surface &bg, int W, int H, float scale)
     ui::DrawCard(c, kCardVR, L"SteamVR");
     ui::DrawCard(c, kCardTex, L"Textures");
     ui::DrawCard(c, kCardEv, L"Recent events");
+    ui::DrawCard(c, kCardTr, L"Translation");
     ui::DrawWell(c, kList);
     ui::DrawWell(c, kLog);
 }
@@ -1890,6 +1983,25 @@ std::wstring TipText(int id, int part, std::wstring &title)
         title = L"Tick all";
         return L"Ticks every texture size again, so whatever looks like an eye texture is upscaled. Unticked sizes stay "
                L"in the list, even when not in use, until then.";
+    case IDC_TRANSLATE:
+        title = L"Translation";
+        return L"Reads the text in the part of the view you are looking at (straight ahead without eye tracking) about "
+               L"three times a second, and shows its translation over it: a label in the text's colours at the text's "
+               L"distance, which stays in place while you move your head.\n\n"
+               L"The text is read on this PC by Windows' text recognition. What it reads goes to DeepL for translation, "
+               L"with your own API key, and that includes other people's chat boxes and names in view. Nothing is sent "
+               L"while this is off or without a key. Each text is sent once: translations are kept until the app closes.\n\n"
+               L"Needs Upscaling on. Japanese to English unless the settings file says otherwise ([translate] source and "
+               L"target). Default off. Ctrl+F11 in VR.";
+    case IDC_TRKEY:
+        title = L"DeepL key";
+        return L"Takes your DeepL API key from the clipboard: copy it at deepl.com (Account, API keys; the free plan "
+               L"translates 500,000 characters a month), then press this. It is saved in the settings file ([translate] "
+               L"deeplKey) and only ever sent to DeepL.";
+    case IDC_TRCOPY:
+        title = L"Copy command";
+        return L"Copies the PowerShell line that adds Windows' text recognition for the language to read. Paste it into a "
+               L"PowerShell opened as administrator (right-click Start, Terminal (Admin)); it downloads a small Windows feature.";
     }
     return L"";
 }
@@ -2057,6 +2169,12 @@ void DrawPage(ui::Canvas &c, const PageView &v)
 
     // Events
     DrawLog(c);
+
+    // Translation
+    const RectF R = kCardTr;
+    const ui::Widget *tr = W(IDC_TRANSLATE);
+    c.Text(ui::F_SMALL, tr && tr->on ? L"On" : L"Off", tr->r.x - 10, ui::Mid(ui::F_SMALL, tr->r.cy()), col::inkSoft, 2);
+    c.Wrap(ui::F_SMALL, TextOf(IDC_TRSTATUS), { R.x + 20, R.y + 52, R.w - 40, 54 }, 17, col::inkSoft, 3);
 
     // the page's scroll position, when the window is shorter than the page
     if (!v.vr && MaxScroll() > 0) {
@@ -2398,6 +2516,13 @@ void OnToggle(int id)
     case IDC_GAZEFOLLOW: g_s.gazeFollow = w->on; ModelToUi(); Changed(true); break;   // (the area shows its value for this state)
     case IDC_GAZESHOW: g_s.gazeShow = w->on; Changed(true); break;
     case IDC_WITHVR: OnWithVrToggle(w->on); break;
+    case IDC_TRANSLATE:
+        g_s.translate = w->on;
+        g_trNote.clear();
+        Changed(true);
+        SyncTranslate();
+        UpdateTranslateUi();
+        break;
     }
 }
 
@@ -2422,8 +2547,21 @@ void OnButton(int id)
         g_s = d;
         ModelToUi();
         Changed(true);
+        SyncTranslate();
         break;
     }
+    case IDC_TRKEY: {
+        // the key comes from the clipboard: the page has no text field, and none of it is shown
+        const std::wstring text = ClipboardText();
+        if (app::TranslateSetKey(text)) TranslateNote(L"DeepL key taken from the clipboard and saved in the settings file.");
+        else TranslateNote(text.empty() ? L"The clipboard is empty: copy your DeepL API key first (deepl.com, Account, API keys)."
+                                        : L"What is on the clipboard doesn't look like a DeepL API key: copy the key first.");
+        break;
+    }
+    case IDC_TRCOPY:
+        if (!g_trCommand.empty() && SetClipboardText(g_trCommand))
+            TranslateNote(L"Copied. Paste it into a PowerShell opened as administrator (right-click Start, Terminal (Admin)).");
+        break;
     case IDC_INSTALL: DoInstall(false); break;
     case IDC_UPDATE: StartUpdate(); break;
     case IDC_CHANGELOG: OpenChangeLog(); break;
@@ -2643,6 +2781,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetTimer(h, TIMER_PUSH, 100, nullptr);
         RefreshUpdateUi();
         StartLink();
+        app::TranslateStart();
+        SyncTranslate();
         if (g_vrPage) {
             VrMakeThumbnail();
             SetTimer(h, TIMER_VR, 33, nullptr);
@@ -2799,6 +2939,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             for (int i = 0; i < 100 && g_resWorkers > 0; ++i) Sleep(50);
         else
             RestoreGameResOnExit();
+        app::TranslateStop();   // (its labels go while the connection is still there)
         StopLink();   // (after the restore, which may use its connection)
         KillTimer(h, TIMER_SAVE);
         KillTimer(h, TIMER_REPLAN);
@@ -2913,7 +3054,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     bool doInstall = false, doUninstall = false, force = false, headless = false;
     std::wstring statusFile, steamvr, gameRes, report;
     bool gameResTest = false, updateTest = false, checkUpdate = false, changeLogTest = false, showChangeLog = false;
-    bool launchArg = false, finishDll = false, linkTest = false;
+    bool launchArg = false, finishDll = false, linkTest = false, translateTest = false;
     std::vector<std::wstring> sets;
     int waitMs = 3000;
     for (int i = 1; i < argc; ++i) {
@@ -2940,6 +3081,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         else if (a == app::kLaunchArg) launchArg = true;               // started by SteamVR (its manifest's argument)
         else if (a == L"--finish-dll-update") finishDll = headless = true;   // update SteamVR's copy once SteamVR is gone
         else if (a == L"--test-steamvr-link") linkTest = headless = true;   // self-test of the startup manifest
+        else if (a == L"--test-translate") translateTest = headless = true;   // self-test of the translation's parts (no network)
     }
     LocalFree(argv);
 
@@ -2953,6 +3095,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
             ui::Startup(inst);
             ui::MakeFonts(96);
             code = app::ChangeLogSelfTest(Widen(VU_APP_VERSION), out) ? 9 : code;
+            ui::Shutdown();
+        }
+        if (translateTest) {
+            ui::Startup(inst);   // (GDI+, for the labels' pictures)
+            code = app::TranslateSelfTest(out) ? 14 : code;
             ui::Shutdown();
         }
         if (checkUpdate) {

@@ -37,6 +37,8 @@ bool SetSettingByName(VuSettings &s, const std::wstring &key, const std::wstring
 
 std::wstring ReadAppString(const wchar_t *key);               // [app] section of the settings file
 void WriteAppString(const wchar_t *key, const std::wstring &v);
+std::wstring ReadIniString(const wchar_t *section, const wchar_t *key);   // any section of it ("" if absent)
+void WriteIniString(const wchar_t *section, const wchar_t *key, const std::wstring &v);
 
 // ---- SteamVR ----------------------------------------------------------------------------------
 

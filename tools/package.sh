@@ -6,7 +6,7 @@ VER=$(sed -n 's/^#define VU_VERSION_STR "\(.*\)"/\1/p' src/common.h)
 ./build.sh
 CXX=${CXX:-x86_64-w64-mingw32-g++-win32}
 FLAGS="-O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 -static -s -Wl,--no-insert-timestamp"
-$CXX $FLAGS test/fake_compositor.cpp -o build/selftest.exe -ld3d11 -luuid -ldxguid
+$CXX $FLAGS test/fake_compositor.cpp -o build/selftest.exe -ld3d11 -luuid -ldxguid -lgdi32
 # (a developer check of the shader sources; needs tools/shaders.sh's output, which a fresh clone lacks)
 if [ -f build/gen/shader_sources.h ]; then $CXX $FLAGS -Ibuild/gen test/compile_check.cpp -o build/compile_check.exe; fi
 

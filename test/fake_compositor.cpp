@@ -507,6 +507,7 @@ static VuShared *OpenTestChannel(HANDLE *map)
 }
 
 #include "temporal_tests.inc"
+#include "text_scene.inc"
 
 int main(int argc, char **argv)
 {
@@ -625,6 +626,10 @@ int main(int argc, char **argv)
                 WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
                 g_reload();
             }
+        }
+        if (EnvStr("VRUPSCALE_TEST_SERVE_TEXT")[0] == '1') {   // signs with text, for the app's translation (text_scene.inc)
+            ServeText(g, seconds, sharedOk);
+            return 0;
         }
         ID3D11ShaderResourceView *ev[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
                                             MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
