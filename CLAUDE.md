@@ -30,12 +30,12 @@ The `u1` variant in `tools/ab/run.sh` uses these settings.
 
 The compiled shaders are committed (`src/gen/shaders.bin`), so a plain build needs only MinGW-w64. After editing `shaders/*.hlsl`, regenerate `shaders.bin` and commit it with the change.
 
-### Windows (MSYS2): not yet tried natively
+### Windows (MSYS2)
 
-Everything so far was built with Ubuntu's MinGW-w64 (GCC 13, win32 threads, msvcrt) in CI and in Linux sessions. On Windows:
+CI builds with Ubuntu's MinGW-w64 (GCC 13, win32 threads, msvcrt). On Windows:
 
-1. Install MSYS2.
-2. In its **MINGW64** shell (not UCRT64, which links the UCRT instead of msvcrt): `pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-python git`
+1. Install MSYS2 (`winget install --id MSYS2.MSYS2`, into `C:\msys64`).
+2. In its **MINGW64** shell (not UCRT64, which links the UCRT instead of msvcrt): `pacman -Syuu` twice (the first run updates the core and closes the shell), then `pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-python git`
 3. Build:
    ```
    CC=gcc CXX=g++ WINDRES=windres sh build.sh          # build/dxgi.dll, build/vrupscale.exe
@@ -45,6 +45,17 @@ Everything so far was built with Ubuntu's MinGW-w64 (GCC 13, win32 threads, msvc
    ```
 4. Check the imports: `objdump -p build/dxgi.dll | grep "DLL Name"` must list only `KERNEL32.dll` and `msvcrt.dll`. If MSYS2's GCC pulls in more, `libwinpthread` for example, fix the link flags before shipping.
 5. Check the compiler: `tools/shaders.sh` should reproduce `src/gen/shaders.bin` byte for byte (`git status` stays clean) when no shader changed.
+
+**Verified on Zak's PC (2026-11-18, `dev` 18edcca, MSYS2 GCC 16.2.0, no script changes needed):**
+- All four builds succeed without warnings. `dxgi.dll` imports only `KERNEL32.dll` and `msvcrt.dll`.
+- `tools/shaders.sh` with System32's `d3dcompiler_47.dll` reproduced `shaders.bin` byte for byte (FXC still prints its X4000 warnings for `upscale.hlsl` line 208).
+- `selftest.sh` both ways on the RTX 3090: everything passed except the eye-tracker check (see Testing).
+- The standard A/B check below (`build-at.sh`, `run.sh`, `cmp.py`) ran as written: all IDENTICAL. The worktree build of the same commit gave a byte-identical `dxgi.dll`.
+- Not verified: whether this GCC 16 build behaves like CI's GCC 13 build (no A/B against a CI-built DLL), and nothing has run in SteamVR.
+
+**Gotchas:**
+- MSYS2's git lacks the `core.autocrlf=true` that Git for Windows sets system-wide. In a checkout made by Git for Windows it lists about 117 files as modified (line endings only). Use Git for Windows' git, or `git -c core.autocrlf=true status`.
+- From PowerShell (Claude sessions): `$env:MSYSTEM='MINGW64'; $env:CHERE_INVOKING='1'; C:\msys64\usr\bin\bash.exe -lc '...'` runs in MINGW64 in the current folder. Windows PowerShell 5.1 breaks double quotes inside that argument, so use none or put the commands in a script file.
 
 WSL2 with Ubuntu is the fallback. It builds exactly like CI (the Linux steps below), and the outputs run on Windows.
 
@@ -82,6 +93,10 @@ python3 tools/ab/cmp.py /tmp/ab_before /tmp/ab_after     # every variant: IDENTI
 ```
 
 Add variants that cover the code touched (v7/v10–v14 for FSR 1 mode, v9 for no command lists, v5/v6/v12/v14 for FXAA). Then run `selftest.sh` both ways.
+
+**On Zak's PC (real GPU):**
+- **Eye tracker:** Bigscreen's `BeyondHID.exe` (the Beyond driver) keeps Bigscreen's real `VRCFTMemmapData` gaze mapping open. While it runs, "no eye tracker: the area stays centred" fails, and the gaze test writes its fake gaze into that real mapping. Don't run the self-test during a VR session.
+- **GPU times:** `run.sh STATS=1` gives no usable times. The same pass varied up to 17× between identical runs, probably because its sparse frames let the GPU clock down. Use the sustained-load performance section instead: `VRUPSCALE_TEST_PERF_ONLY=1 sh tools/ab/selftest.sh build/dxgi.dll <dir>`, adding `VRUPSCALE_TEST_EXTRA=opticalFlow=fsr3` (or any other `[temporal]` lines) to time other settings. Its small passes repeat within about 0.005 ms. Accumulate and output still vary 2–4× between runs at 2756², so its "cheaper than" timing checks can fail from noise (one did, in one of six runs).
 
 The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests.inc`. It acts like the compositor and draws a procedural scene with ground truth (sub-pixel head motion, a moving object, a grating above Nyquist). The `VRUPSCALE_TEST_*` environment variables are listed in the README's "Building from source" section; `VRUPSCALE_TEST_ONLY=abdump` is the `run.sh` mode.
 
@@ -182,7 +197,16 @@ At motion 100, ours fails outright, so the history is dropped and the output is 
 
 **Waiting on Zak's headset A/B.** He has the test build (`vrupscale-0.6.7-fsr3flow.zip`, which is `dev` 696357c), and is checking:
 - Fast head turns and moving people: frizz, smear, ghosting.
-- The GPU cost: the log's "search" pass time with the experiment on and off. The harness can't measure real GPU cost.
+- The GPU cost: the log's "search" pass time with the experiment on and off.
+
+GPU cost in the harness (RTX 3090, self-test performance section, area 0.6, GPU ms per eye, two runs each, 2026-11-18):
+
+| Input per eye | search, default → fsr3 | pyramid, default → fsr3 |
+|---|---|---|
+| 1561×1735 | 0.010 → 0.157–0.160 | 0.018 → 0.025 |
+| 2756×2756 | 0.012 → 0.32–0.45 | 0.026 → 0.034–0.063 |
+
+LK, global fit and refine don't change. The search cost grows roughly with the pixel count, which suggests about 1 ms per eye at 4572² (not measured).
 
 What happens next depends on his answer:
 - **If kept:** decide whether it becomes the default or an app option, add a CHANGELOG entry, and consider `msad4` (FSR 3's default path; on NVIDIA it's emulated anyway).
