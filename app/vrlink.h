@@ -2,10 +2,11 @@
 // background app, which never starts SteamVR), and the app's place among SteamVR's startup apps.
 //
 // Every use of OpenVR goes through a VrSession: SteamVR's settings (gameres.cpp), the eyes'
-// projection, the startup registration. While "Start with SteamVR" is on, the app also keeps one
-// lasting connection open for as long as SteamVR runs (VrLinkOpen), so that SteamVR's request to
-// quit reaches it (VrLinkPollQuit); sessions then borrow that connection instead of opening their own
-// (openvr_api.dll holds one connection per process).
+// projection, the startup registration. While "Start with SteamVR" is on, or the app's page is in
+// SteamVR's dashboard (vroverlay.h), the app also keeps one lasting connection open for as long as
+// SteamVR runs (VrLinkOpen), so that SteamVR's request to quit reaches it (VrLinkPollQuit); sessions
+// then borrow that connection instead of opening their own (openvr_api.dll holds one connection per
+// process).
 #pragma once
 
 #include <string>
@@ -32,6 +33,24 @@ private:
 bool VrLinkOpen(std::wstring &error);
 bool VrLinkIsOpen();
 void VrLinkClose();
+
+// Uses the lasting connection without waiting (for the window's thread): ok() is false while it is
+// closed (busy() tells apart that another thread is using it right now).
+class VrLinkUse {
+public:
+    VrLinkUse();
+    ~VrLinkUse();
+    VrLinkUse(const VrLinkUse &) = delete;
+    VrLinkUse &operator=(const VrLinkUse &) = delete;
+    bool ok() const { return ok_; }
+    bool busy() const { return !locked_; }
+    unsigned generation() const { return gen_; }   // changes each time the connection is opened
+    void *Interface(const char *version);         // e.g. "FnTable:IVROverlay_028"; nullptr if not offered
+
+private:
+    bool locked_ = false, ok_ = false;
+    unsigned gen_ = 0;
+};
 // Takes SteamVR's pending events: true if SteamVR asked this process to quit (VREvent_Quit), which is
 // then acknowledged (the process is about to exit).
 bool VrLinkPollQuit();

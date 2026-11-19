@@ -132,6 +132,8 @@ The harness runs `test/fake_compositor.cpp`, which includes `test/temporal_tests
 - `ui.cpp`: hand-drawn UI in the style of Valve's hardware pages, using GDI+ and GDI.
 - `update.cpp`: GitHub release updater. It reads a stored, uncompressed zip with no decompressor and checks the SHA-256.
 - `gameres.cpp`: sets VRChat's SteamVR resolution. `vrlink.cpp`: the OpenVR connection and the startup entry. `changelog.cpp`: shows CHANGELOG.md.
+- `vroverlay.cpp`: the page as a SteamVR dashboard overlay (IVROverlay_028 by function-table slot, a D3D11 texture on the headset's adapter). `main.cpp` draws it apart from the window at 96 dpi (1120×900, under the DLL's 1000 px eye-texture minimum, so the compositor never upscales it) and feeds the laser into the same pointer handlers as the mouse.
+- Testing it without SteamVR: build `test/stub/openvr_stub.c` (its header has the command), then run `vrupscale.exe --settings <test ini> --channel <name> --from-steamvr` with `VRUPSCALE_TEST_OPENVR` (the stub), `VRUPSCALE_TEST_STEAMVR_FLAG` (an existing file), `STUB_LOG`, `STUB_OVERLAY_EVENTS` (a laser script) and `STUB_DUMP_DIR` (the pictures sent) set. `Save()` rewrites the ini key by key on the window's thread: with a test ini on F: that took about 1.1 s, during which the page doesn't respond.
 
 `test/`:
 - `fake_compositor.cpp` and `temporal_tests.inc`: the harness.

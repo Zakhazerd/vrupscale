@@ -67,6 +67,7 @@ std::string Utf8(const std::wstring &w)
 SRWLOCK g_lock = SRWLOCK_INIT;   // one use of OpenVR at a time (openvr_api.dll has one connection per process)
 bool g_linked = false;           // the lasting connection is open
 void **g_linkSystem = nullptr;   // its IVRSystem_026
+uint32_t g_linkGen = 0;          // counts the times it was opened
 
 // Loaded once and kept (OpenVR may leave threads behind); tried again while it is missing. Under g_lock.
 const Api &OpenVr()
@@ -197,6 +198,7 @@ bool VrLinkOpen(std::wstring &error)
             g_linkSystem = (void **)a.get("FnTable:IVRSystem_026", &err);
             if (g_linkSystem && err == 0) {
                 g_linked = true;
+                ++g_linkGen;
             } else {   // without events the connection would only keep SteamVR waiting when it quits
                 g_linkSystem = nullptr;
                 a.shutdown();
@@ -224,6 +226,26 @@ void VrLinkClose()
     g_linked = false;
     g_linkSystem = nullptr;
     ReleaseSRWLockExclusive(&g_lock);
+}
+
+VrLinkUse::VrLinkUse()
+{
+    locked_ = TryAcquireSRWLockExclusive(&g_lock) != 0;
+    ok_ = locked_ && g_linked;
+    gen_ = locked_ ? g_linkGen : 0;
+}
+
+VrLinkUse::~VrLinkUse()
+{
+    if (locked_) ReleaseSRWLockExclusive(&g_lock);
+}
+
+void *VrLinkUse::Interface(const char *version)
+{
+    if (!ok_) return nullptr;
+    int err = 0;
+    void *p = OpenVr().get(version, &err);
+    return err == 0 ? p : nullptr;
 }
 
 bool VrLinkPollQuit()

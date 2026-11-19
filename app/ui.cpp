@@ -16,7 +16,6 @@ namespace {
 ULONG_PTR g_gdipToken = 0;
 bool g_fontsLoaded = false;
 gp::Bitmap *g_paper = nullptr;   // kraft texture tile
-float g_scale = 1.0f;
 
 struct FontSpec { int weight; float px; };
 const FontSpec kSpec[F_COUNT] = {
@@ -40,7 +39,16 @@ struct FontData {
     std::unordered_map<wchar_t, int> adv;
     std::unordered_map<uint32_t, int> kern;
 };
-FontData g_f[F_COUNT];
+// The fonts for one dpi. Set 0 is the window's (MakeFonts); set 1 another dpi's while a FontsFor
+// lives (the SteamVR page's 96).
+struct FontSet {
+    UINT dpi = 0;
+    float scale = 1.0f;
+    FontData f[F_COUNT];
+};
+FontSet g_sets[2];
+FontData *g_f = g_sets[0].f;   // the set in use
+float g_scale = 1.0f;          // its dpi / 96
 HDC g_mdc = nullptr;   // measuring
 HGDIOBJ g_mdcFont = nullptr;
 
@@ -211,17 +219,29 @@ void Shutdown()
 {
     delete g_paper;
     g_paper = nullptr;
-    for (auto &f : g_f)
-        if (f.h) DeleteObject(f.h);
+    for (auto &set : g_sets)
+        for (auto &f : set.f)
+            if (f.h) DeleteObject(f.h);
     if (g_mdc) DeleteDC(g_mdc);
     gp::GdiplusShutdown(g_gdipToken);
 }
 
-void MakeFonts(UINT dpi)
+namespace {
+
+void UseSet(FontSet &set)
 {
-    g_scale = dpi / 96.0f;
+    g_f = set.f;
+    g_scale = set.scale;
     if (g_mdc) SelectObject(g_mdc, GetStockObject(SYSTEM_FONT));
     g_mdcFont = nullptr;
+}
+
+// (Re)makes a set's fonts and leaves it in use.
+void BuildSet(FontSet &set, UINT dpi)
+{
+    set.dpi = dpi;
+    set.scale = dpi / 96.0f;
+    UseSet(set);
     for (int i = 0; i < F_COUNT; ++i) {
         FontData &fd = g_f[i];
         if (fd.h) DeleteObject(fd.h);
@@ -253,6 +273,23 @@ void MakeFonts(UINT dpi)
                 if (k.iKernAmount) fd.kern[((uint32_t)k.wFirst << 16) | k.wSecond] = k.iKernAmount;
         }
     }
+}
+
+} // namespace
+
+void MakeFonts(UINT dpi) { BuildSet(g_sets[0], dpi); }
+
+FontsFor::FontsFor(UINT dpi)
+{
+    if (dpi == g_sets[0].dpi) return;
+    switched_ = true;
+    if (g_sets[1].dpi != dpi) BuildSet(g_sets[1], dpi);
+    else UseSet(g_sets[1]);
+}
+
+FontsFor::~FontsFor()
+{
+    if (switched_) UseSet(g_sets[0]);
 }
 
 HFONT Font(FontId f) { return g_f[f].h; }

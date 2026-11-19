@@ -1,19 +1,24 @@
-// Stand-in for openvr_api.dll (self-test of the app's VRChat-resolution and start-with-SteamVR
-// features): records the calls vrupscale.exe makes. Env: STUB_LOG (file), STUB_INIT_ERR (VR_InitInternal2's error),
+// Stand-in for openvr_api.dll (self-test of the app's VRChat-resolution, start-with-SteamVR and
+// dashboard features): records the calls vrupscale.exe makes. Env: STUB_LOG (file), STUB_INIT_ERR (VR_InitInternal2's error),
 // STUB_VALUE (the value SteamVR "has"; absent = not set), STUB_VALUE_FILE (a value changed meanwhile).
+// Build: gcc -O1 -shared -o openvr_api.dll test/stub/openvr_stub.c -static-libgcc
+#define COBJMACROS
 #include <windows.h>
+#include <d3d11.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 
-static void Log(const char *fmt, ...)
+static int Env(const char *n, int def);
+static void Log(const char *fmt, ...)   // STUB_LOG_TIME=1: each line starts with GetTickCount
 {
     char path[512];
     if (!GetEnvironmentVariableA("STUB_LOG", path, sizeof(path))) return;
     FILE *f = fopen(path, "ab");
     if (!f) return;
+    if (Env("STUB_LOG_TIME", 0)) fprintf(f, "%lu ", (unsigned long)GetTickCount());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);
@@ -246,10 +251,158 @@ static bool __stdcall GetAutoLaunch(const char *key)
 }
 static void *g_apps[40] = { (void *)AddManifest, (void *)RemoveManifest, (void *)IsInstalled };
 
+// IVROverlay_028: the app's dashboard overlay. STUB_OVERLAY_ERR: CreateDashboardOverlay's error.
+// STUB_OVERLAY_HIDDEN=1: the page isn't showing. STUB_DUMP_DIR: every picture the app sends is saved
+// there (thumb.bmp, page_NNN.bmp). STUB_OVERLAY_EVENTS: a script of the laser's input in page pixels
+// from the top left ("move x y", "down x y", "up x y", "leave", "scroll dy", "wait n": n polls
+// without input), turned into OpenVR's events (y up from the bottom of the mouse scale).
+typedef uint64_t Handle;
+static const Handle kMain = 0x1001, kThumb = 0x1002;
+static float g_mouseW = 1, g_mouseH = 1;
+static int g_pages = 0;
+static const char *__stdcall OvErrName(int e) { return e == 12 ? "VROverlayError_PermissionDenied" : "VROverlayError_Stub"; }
+static int __stdcall CreateDashboard(const char *key, const char *name, Handle *m, Handle *t)
+{
+    int e = Env("STUB_OVERLAY_ERR", 0);
+    Log("CreateDashboardOverlay key=%s name=%s -> %d", key, name, e);
+    if (e) return e;
+    *m = kMain;
+    *t = kThumb;
+    return 0;
+}
+static int __stdcall SetWidth(Handle h, float w) { Log("SetOverlayWidthInMeters %s %.2f", h == kMain ? "main" : "?", w); return 0; }
+static int __stdcall SetInputMethod(Handle h, int m) { Log("SetOverlayInputMethod %s %d", h == kMain ? "main" : "?", m); return 0; }
+static int __stdcall SetMouseScale(Handle h, float *v)
+{
+    g_mouseW = v[0];
+    g_mouseH = v[1];
+    Log("SetOverlayMouseScale %s %.0f x %.0f", h == kMain ? "main" : "?", v[0], v[1]);
+    return 0;
+}
+static int __stdcall SetFlag(Handle h, int flag, bool on) { Log("SetOverlayFlag %s %d %d", h == kMain ? "main" : "?", flag, (int)on); return 0; }
+static bool __stdcall IsVisible(Handle h) { return h == kMain && !Env("STUB_OVERLAY_HIDDEN", 0); }
+static void DumpBmp(ID3D11Texture2D *tex, const char *path)
+{
+    ID3D11Device *dev = NULL;
+    ID3D11DeviceContext *ctx = NULL;
+    ID3D11Texture2D *st = NULL;
+    D3D11_TEXTURE2D_DESC d, s;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D_GetDevice(tex, &dev);
+    ID3D11Device_GetImmediateContext(dev, &ctx);
+    ID3D11Texture2D_GetDesc(tex, &d);
+    s = d;
+    s.Usage = D3D11_USAGE_STAGING;
+    s.BindFlags = 0;
+    s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    s.MiscFlags = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &s, NULL, &st))) {
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)st, (ID3D11Resource *)tex);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                BITMAPFILEHEADER fh = { 0 };
+                BITMAPINFOHEADER ih = { 0 };
+                fh.bfType = 0x4d42;
+                fh.bfOffBits = sizeof(fh) + sizeof(ih);
+                fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
+                ih.biSize = sizeof(ih);
+                ih.biWidth = (LONG)d.Width;
+                ih.biHeight = -(LONG)d.Height;
+                ih.biPlanes = 1;
+                ih.biBitCount = 32;
+                fwrite(&fh, sizeof(fh), 1, f);
+                fwrite(&ih, sizeof(ih), 1, f);
+                for (UINT y = 0; y < d.Height; ++y) fwrite((char *)m.pData + y * m.RowPitch, 4, d.Width, f);
+                fclose(f);
+            }
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)st, 0);
+        }
+        ID3D11Texture2D_Release(st);
+    }
+    ID3D11DeviceContext_Release(ctx);
+    ID3D11Device_Release(dev);
+}
+static int __stdcall SetTexture(Handle h, void **tex)   // Texture_t: handle, type, color space
+{
+    ID3D11Texture2D *t = (ID3D11Texture2D *)tex[0];
+    int type = ((int *)tex)[2], space = ((int *)tex)[3];
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D_GetDesc(t, &d);
+    Log("SetOverlayTexture %s %ux%u format %d mips %u type %d colorspace %d", h == kMain ? "main" : h == kThumb ? "thumbnail" : "?",
+        d.Width, d.Height, (int)d.Format, d.MipLevels, type, space);
+    char dir[400], path[512];
+    if (GetEnvironmentVariableA("STUB_DUMP_DIR", dir, sizeof(dir))) {
+        if (h == kThumb) snprintf(path, sizeof(path), "%s\\thumb.bmp", dir);
+        else snprintf(path, sizeof(path), "%s\\page_%03d.bmp", dir, g_pages++);
+        DumpBmp(t, path);
+    }
+    return 0;
+}
+static FILE *g_script = NULL;
+static int g_scriptDone = 0, g_wait = 0;
+static bool __stdcall PollOverlayEvent(Handle h, void *ev, uint32_t size)
+{
+    char path[512], line[128];
+    float x = 0, y = 0;
+    if (size != 64) Log("PollNextOverlayEvent with size %u", size);
+    if (Env("STUB_LOG_POLLS", 0)) Log("poll (wait %d)", g_wait);
+    if (h != kMain || g_scriptDone) return false;
+    if (!g_script) {
+        if (!GetEnvironmentVariableA("STUB_OVERLAY_EVENTS", path, sizeof(path)) || !(g_script = fopen(path, "rb"))) {
+            g_scriptDone = 1;
+            return false;
+        }
+    }
+    if (g_wait > 0) {
+        --g_wait;
+        return false;
+    }
+    for (;;) {
+        if (!fgets(line, sizeof(line), g_script)) {
+            g_scriptDone = 1;
+            Log("events: end of script");
+            return false;
+        }
+        uint32_t type = 0, button = 0;
+        if (sscanf(line, "wait %d", &g_wait) == 1) return false;
+        if (sscanf(line, "move %f %f", &x, &y) == 2) type = 300;
+        else if (sscanf(line, "down %f %f", &x, &y) == 2) type = 301, button = 1;
+        else if (sscanf(line, "up %f %f", &x, &y) == 2) type = 302, button = 1;
+        else if (strncmp(line, "leave", 5) == 0) type = 304;
+        else if (sscanf(line, "scroll %f", &y) == 1) type = 305;
+        else continue;
+        memset(ev, 0, size);
+        memcpy(ev, &type, 4);
+        if (type == 305) {   // VREvent_Scroll_t: xdelta, ydelta
+            memcpy((char *)ev + 20, &y, 4);
+        } else {             // VREvent_Mouse_t: x, y (up from the bottom), button
+            float vy = g_mouseH - y;
+            memcpy((char *)ev + 16, &x, 4);
+            memcpy((char *)ev + 20, &vy, 4);
+            memcpy((char *)ev + 24, &button, 4);
+        }
+        Log("events: %.*s", (int)strcspn(line, "\r\n"), line);
+        return true;
+    }
+}
+static void *g_overlay[82];
+static void __stdcall DXGIOutputInfo(int32_t *adapter) { *adapter = Env("STUB_ADAPTER", 0); Log("GetDXGIOutputInfo -> %d", *adapter); }
+
 __declspec(dllexport) uint32_t VR_InitInternal2(int *err, int type, const char *info)
 {
+    g_system[8] = (void *)DXGIOutputInfo;
     g_system[30] = (void *)PollNextEvent;
     g_system[47] = (void *)AcknowledgeQuit;
+    g_overlay[8] = (void *)OvErrName;
+    g_overlay[11] = (void *)SetFlag;
+    g_overlay[22] = (void *)SetWidth;
+    g_overlay[45] = (void *)IsVisible;
+    g_overlay[48] = (void *)PollOverlayEvent;
+    g_overlay[50] = (void *)SetInputMethod;
+    g_overlay[52] = (void *)SetMouseScale;
+    g_overlay[60] = (void *)SetTexture;
+    g_overlay[67] = (void *)CreateDashboard;
     g_apps[13] = (void *)AppErrName;
     g_apps[14] = (void *)GetPropString;
     g_apps[17] = (void *)SetAutoLaunch;
@@ -270,6 +423,7 @@ __declspec(dllexport) void *VR_GetGenericInterface(const char *ver, int *err)
     if (strcmp(ver, "FnTable:IVRSettings_003") == 0) return (void *)g_table;
     if (strcmp(ver, "FnTable:IVRSystem_026") == 0) return (void *)g_system;
     if (strcmp(ver, "FnTable:IVRApplications_008") == 0) return (void *)g_apps;
+    if (strcmp(ver, "FnTable:IVROverlay_028") == 0) return (void *)g_overlay;
     if (err) *err = 105;   // VRInitError_Init_InterfaceNotFound
     return NULL;
 }

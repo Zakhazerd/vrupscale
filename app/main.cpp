@@ -7,6 +7,7 @@
 #include "ui.h"
 #include "update.h"
 #include "vrlink.h"
+#include "vroverlay.h"
 
 #include <commctrl.h>
 #include <shellapi.h>
@@ -39,7 +40,7 @@ enum : int {
     IDC_TICKALL, IDC_SHARPHIST, IDC_BILEDGES, IDC_GAMERES, IDC_GAZEFOLLOW, IDC_GAZESHOW, IDC_CALIBRATE, IDC_CALCLEAR,
     IDC_GAZESTATUS, IDC_CALSTATUS, IDC_UPDATE, IDC_CHANGELOG, IDC_WITHVR, IDC_SHARPAREA, IDC_SHARPAREAVAL, IDC_FXAA,
 };
-enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP };
+enum : UINT_PTR { TIMER_REFRESH = 1, TIMER_SAVE, TIMER_PUSH, TIMER_INSTALL, TIMER_REPLAN, TIMER_TIP, TIMER_VR };
 const UINT WM_APP_SYNCLIST = WM_APP + 1, WM_APP_GAMERES = WM_APP + 2, WM_APP_PROJ = WM_APP + 3, WM_APP_UPDCHECK = WM_APP + 4,
            WM_APP_UPDPROGRESS = WM_APP + 5, WM_APP_UPDDONE = WM_APP + 6, WM_APP_VRQUIT = WM_APP + 7, WM_APP_AUTOLAUNCH = WM_APP + 8;
 
@@ -83,9 +84,14 @@ bool g_withVR = true;
 bool g_fromVR = false;               // this run was started by SteamVR
 HANDLE g_linkThread = nullptr, g_linkWake = nullptr;
 volatile LONG g_linkStop = 0;
-volatile LONG g_linkWant = 1;        // the thread keeps the lasting connection
+volatile LONG g_linkWant = 1;        // Start with SteamVR: the thread keeps the lasting connection and the startup entry
 volatile LONG g_linkApplied = 0;     // SteamVR was last told "on"
 volatile LONG g_linkSync = 1;        // the thread brings SteamVR's startup entry in line (again)
+// SteamVR's dashboard (vroverlay.h): while SteamVR runs, the page is also an overlay in its dashboard
+// (its icon in the bottom bar), drawn apart from the window at 96 dpi and used with the laser like a
+// mouse. That needs the lasting connection too. [app] dashboard=0 turns it off.
+bool g_vrPage = true;
+volatile LONG g_linkDash = 1;        // the link thread keeps the lasting connection for it
 bool g_vrSeen = false;               // SteamVR ran during this run
 bool g_vrQuitting = false;           // SteamVR asked the app to quit; its processes are still closing
 bool g_closingWithVR = false;
@@ -154,6 +160,11 @@ int g_logScroll = 0;                  // event lines scrolled back from the newe
 int g_hoverRow = -1, g_focusRow = 0;
 bool g_mouseTracked = false;
 bool g_bgDirty = true;                // the cached background: sky, ground, cards, characters
+bool g_vrDirty = true, g_vrBgDirty = true;   // the same for the dashboard's page
+// The pointer is the laser on the dashboard's page (tips follow it there), at this page position
+// (x < 0: off the page).
+bool g_ptrVr = false;
+float g_vrPtrX = -1, g_vrPtrY = -1;
 
 float Scale() { return g_dpi / 96.0f; }
 int S(float v) { return (int)lroundf(v * Scale()); }
@@ -169,6 +180,7 @@ ui::Widget *W(int id)
 void Invalidate()
 {
     if (g_wnd) InvalidateRect(g_wnd, nullptr, FALSE);
+    g_vrDirty = true;
 }
 
 void SetText(int id, const std::wstring &t)
@@ -688,7 +700,7 @@ void SetMood(ui::Mood m)
 {
     if (m != g_mood) {
         g_mood = m;
-        g_bgDirty = true;
+        g_bgDirty = g_vrBgDirty = true;
         Invalidate();
     }
 }
@@ -1033,8 +1045,8 @@ DWORD WINAPI LinkThread(LPVOID)
             continue;
         }
         if (quitSeen) continue;   // SteamVR is closing: nothing more until it has
-        const bool want = g_linkWant != 0;
-        if (want && !app::VrLinkIsOpen() && GetTickCount() - lastOpen > 3000) {
+        const bool want = g_linkWant != 0, keep = want || g_linkDash != 0;
+        if (keep && !app::VrLinkIsOpen() && GetTickCount() - lastOpen > 3000) {
             lastOpen = GetTickCount();
             std::wstring err;
             app::VrLinkOpen(err);   // (fails while SteamVR is starting: tried again)
@@ -1044,7 +1056,7 @@ DWORD WINAPI LinkThread(LPVOID)
             if (!PostMessageW(g_wnd, WM_APP_VRQUIT, 0, 0)) app::VrLinkClose();
             continue;
         }
-        if (!want && app::VrLinkIsOpen()) app::VrLinkClose();
+        if (!keep && app::VrLinkIsOpen()) app::VrLinkClose();
         if (InterlockedExchange(&g_linkSync, 0)) synced = false;
         if (!synced && !want && !g_linkApplied) synced = true;   // off, and SteamVR was told so (or switched it off itself)
         if (!synced && GetTickCount() - lastSync > 3000) {
@@ -1075,6 +1087,7 @@ void StartLink()
         UpdateValueLabels();
     }
     g_linkWant = g_withVR ? 1 : 0;
+    g_linkDash = g_vrPage ? 1 : 0;
     g_linkApplied = applied == L"1" ? 1 : 0;
     g_linkWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_linkThread = CreateThread(nullptr, 0, LinkThread, nullptr, 0, nullptr);
@@ -1512,6 +1525,7 @@ struct Surface {
     HDC dc = nullptr;
     HBITMAP bmp = nullptr;
     HGDIOBJ old = nullptr;
+    uint32_t *bits = nullptr;   // BGRX, rows from the top
     int w = 0, h = 0;
     void Ensure(int W, int H)
     {
@@ -1526,8 +1540,9 @@ struct Surface {
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
-        void *bits = nullptr;
-        bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        void *p = nullptr;
+        bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &p, nullptr, 0);
+        bits = (uint32_t *)p;
         old = SelectObject(dc, bmp);
         ReleaseDC(nullptr, screen);
         w = W;
@@ -1542,10 +1557,12 @@ struct Surface {
         }
         dc = nullptr;
         bmp = nullptr;
+        bits = nullptr;
         w = h = 0;
     }
 };
 Surface g_back, g_bg;
+Surface g_vrBack, g_vrBg;   // the dashboard's page (96 dpi)
 
 int ClientH()
 {
@@ -1573,12 +1590,13 @@ void ScrollIntoView(const RectF &r)
 }
 
 // The parts that change rarely: sky, ground, characters, cards. Redrawn when the mood or size changes.
-void DrawBackground(int W, int H)
+// W x H device pixels at scale (with that scale's fonts in use).
+void DrawBackground(Surface &bg, int W, int H, float scale)
 {
-    g_bg.Ensure(W, H);
-    ui::Canvas c(g_bg.dc, Scale(), 0);
-    const float pw = L(W);
-    ui::DrawGround(c, pw, L(H));
+    bg.Ensure(W, H);
+    ui::Canvas c(bg.dc, scale, 0);
+    const float pw = W / scale;
+    ui::DrawGround(c, pw, H / scale);
     const float bw = c.Text(ui::F_BRAND, L"vrupscale", 36, 46, col::ink);
     const std::wstring ver = Widen(VU_APP_VERSION);
     const RectF pill = { 36 + bw + 10, 30.5f, ui::Measure(ui::F_TINY, ver) + 16, 20 };
@@ -1593,7 +1611,6 @@ void DrawBackground(int W, int H)
     ui::DrawCard(c, kCardEv, L"Recent events");
     ui::DrawWell(c, kList);
     ui::DrawWell(c, kLog);
-    g_bgDirty = false;
 }
 
 std::wstring RowDetail(const Row &r)
@@ -1935,23 +1952,41 @@ void TipForget()   // a click, a key, a scroll: no tip until the pointer moves t
     g_tipSuppress = g_tipId;
 }
 
-void DrawTip(ui::Canvas &c)
+// What a drawing of the page shows: the window's view of it (scrolled), or all of it (the dashboard's).
+struct PageView {
+    float top = 0, w = kW, h = kH;   // logical pixels
+    bool vr = false;
+};
+
+// Where the pointer is, in page coordinates: the laser on the dashboard's page, or the mouse.
+bool PointerOnPage(float &x, float &y)
+{
+    if (g_ptrVr) {
+        x = g_vrPtrX;
+        y = g_vrPtrY;
+        return x >= 0;
+    }
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g_wnd, &pt);
+    x = L(pt.x);
+    y = L(pt.y) + g_scroll;
+    return true;
+}
+
+void DrawTip(ui::Canvas &c, const PageView &v)
 {
     if (!g_tipShown || !g_tipId) return;
     int id = 0, part = -1;
     RectF a;
-    POINT pt;
-    GetCursorPos(&pt);
-    ScreenToClient(g_wnd, &pt);
-    if (!TipAt(L(pt.x), L(pt.y) + g_scroll, id, part, a) || id != g_tipId || part != g_tipPart) return;
+    float px, py;
+    if (!PointerOnPage(px, py) || !TipAt(px, py, id, part, a) || id != g_tipId || part != g_tipPart) return;
     std::wstring title;
     const std::wstring body = TipText(id, part, title);
     const float pad = 14, lineH = 17, titleH = title.empty() ? 0 : 24;
     const std::vector<std::wstring> lines = ui::WrapLines(ui::F_SMALL, body, kTipW - 2 * pad);
     const float h = pad + titleH + lines.size() * lineH + pad;
-    RECT rc;
-    GetClientRect(g_wnd, &rc);
-    const float top = g_scroll + 6, bottom = g_scroll + L(rc.bottom) - 6, right = std::min(kW, L(rc.right)) - 8;
+    const float top = v.top + 6, bottom = v.top + v.h - 6, right = std::min(kW, v.w) - 8;
     float x = std::max(8.0f, std::min(a.x, right - kTipW));
     float y = a.b() + 8;
     if (y + h > bottom) y = a.y - 8 - h;   // no room below: above
@@ -1968,7 +2003,7 @@ void DrawTip(ui::Canvas &c)
     c.Wrap(ui::F_SMALL, body, { box.x + pad, base, kTipW - 2 * pad, h }, lineH, col::ink);
 }
 
-void DrawPage(ui::Canvas &c)
+void DrawPage(ui::Canvas &c, const PageView &v)
 {
     if (g_updState == UpdNone && !g_updatedFrom.empty())
         c.Text(ui::F_SMALL, L"Updated from " + g_updatedFrom, ChangeLogButtonRect().r() + 12, ui::Mid(ui::F_SMALL, 40.5f), col::inkSoft);
@@ -2024,13 +2059,13 @@ void DrawPage(ui::Canvas &c)
     DrawLog(c);
 
     // the page's scroll position, when the window is shorter than the page
-    const float view = L(ClientH());
-    if (MaxScroll() > 0) {
+    if (!v.vr && MaxScroll() > 0) {
+        const float view = v.h;
         const float th = view - 16, h = std::max(30.0f, th * view / kH), y = g_scroll + 8 + (th - h) * g_scroll / MaxScroll();
         c.FillRound({ kW - 9, y, 5, h }, 2.5f, col::ink, 110);
     }
 
-    DrawTip(c);   // over everything
+    DrawTip(c, v);   // over everything
 }
 
 void Paint(HDC target)
@@ -2039,14 +2074,139 @@ void Paint(HDC target)
     GetClientRect(g_wnd, &rc);
     if (rc.right <= 0 || rc.bottom <= 0) return;
     const int bgW = std::max((int)rc.right, S(kW)), bgH = std::max((int)rc.bottom, S(kH));
-    if (g_bgDirty || g_bg.w != bgW || g_bg.h != bgH) DrawBackground(bgW, bgH);
+    if (g_bgDirty || g_bg.w != bgW || g_bg.h != bgH) {
+        DrawBackground(g_bg, bgW, bgH, Scale());
+        g_bgDirty = false;
+    }
     g_back.Ensure(rc.right, rc.bottom);
     BitBlt(g_back.dc, 0, 0, rc.right, rc.bottom, g_bg.dc, 0, S(g_scroll), SRCCOPY);
     {
         ui::Canvas c(g_back.dc, Scale(), g_scroll);
-        DrawPage(c);
+        PageView v;
+        v.top = g_scroll;
+        v.w = L(rc.right);
+        v.h = L(rc.bottom);
+        DrawPage(c, v);
     }
     BitBlt(target, 0, 0, rc.right, rc.bottom, g_back.dc, 0, 0, SRCCOPY);
+}
+
+// ---- the page in SteamVR's dashboard (vroverlay.h) -------------------------------------------------
+
+constexpr UINT kVrDpi = 96;   // 1120 x 900: under the size vrupscale's DLL takes for an eye texture
+std::wstring g_vrError;       // the last trouble shown
+
+void VrShowError(const std::wstring &e)
+{
+    if (e.empty() || e == g_vrError) return;
+    g_vrError = e;
+    SetText(IDC_INSTALLMSG, L"vrupscale's page couldn't go into SteamVR's dashboard: " + e + L".");
+}
+
+// Draws the whole page for the dashboard and sends it.
+void VrSendPage()
+{
+    const int W = (int)kW, H = (int)kH;
+    {
+        ui::FontsFor fonts(kVrDpi);
+        if (g_vrBgDirty || g_vrBg.w != W || g_vrBg.h != H) {
+            DrawBackground(g_vrBg, W, H, 1.0f);
+            g_vrBgDirty = false;
+        }
+        g_vrBack.Ensure(W, H);
+        if (!g_vrBack.bits || !g_vrBg.dc) return;
+        BitBlt(g_vrBack.dc, 0, 0, W, H, g_vrBg.dc, 0, 0, SRCCOPY);
+        ui::Canvas c(g_vrBack.dc, 1.0f, 0);
+        PageView v;
+        v.vr = true;
+        DrawPage(c, v);
+    }
+    GdiFlush();
+    for (int i = 0; i < W * H; ++i) g_vrBack.bits[i] |= 0xff000000u;   // opaque (GDI leaves alpha at 0)
+    std::wstring err;
+    if (!app::OverlaySetPage(g_vrBack.bits, W, H, err)) return;   // not now: next tick
+    g_vrDirty = false;
+    VrShowError(err);
+}
+
+// The app's icon for the dashboard's bar: the largest the icon resource gives, straight alpha.
+void VrMakeThumbnail()
+{
+    const int N = 256;
+    HICON icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, N, N, LR_DEFAULTCOLOR);
+    if (!icon) return;
+    ICONINFO ii = {};
+    if (GetIconInfo(icon, &ii)) {
+        std::vector<uint32_t> px((size_t)N * N), mask((size_t)N * N);
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = N;
+        bi.bmiHeader.biHeight = -N;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        HDC dc = GetDC(nullptr);
+        const bool color = ii.hbmColor && GetDIBits(dc, ii.hbmColor, 0, N, px.data(), &bi, DIB_RGB_COLORS) == N;
+        const bool masked = ii.hbmMask && GetDIBits(dc, ii.hbmMask, 0, N, mask.data(), &bi, DIB_RGB_COLORS) == N;
+        ReleaseDC(nullptr, dc);
+        bool alpha = false;
+        for (uint32_t p : px) alpha = alpha || (p >> 24) != 0;
+        if (color && !alpha)   // an icon without alpha: its mask says what is transparent
+            for (size_t i = 0; i < px.size(); ++i) px[i] = (px[i] & 0xffffffu) | (masked && (mask[i] & 0xffffffu) ? 0 : 0xff000000u);
+        if (color) app::OverlaySetThumbnail(px.data(), N, N);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    }
+    DestroyIcon(icon);
+}
+
+void PointerMove(float x, float y);
+void PointerLeave();
+bool PointerDown(float x, float y);
+struct PtrRelease { int pressed = 0, drag = 0; };
+PtrRelease PointerRelease();
+void PointerUp(float x, float y, const PtrRelease &r);
+void PointerCancel();
+void PointerWheel(float x, float y, int notches);
+
+// Every 33 ms: the overlay made (or remade) once SteamVR runs, the laser's input, the page sent
+// when it changed and shows.
+void VrTick()
+{
+    if (!g_vrPage) return;
+    std::vector<app::OverlayInput> input;
+    const app::OverlayTick t = app::OverlayUpdate((int)kW, (int)kH, input);
+    VrShowError(t.error);
+    if (t.created) g_vrDirty = true;
+    static float wheel = 0;
+    for (const app::OverlayInput &in : input) {
+        switch (in.kind) {
+        case app::OverlayInput::Move:
+        case app::OverlayInput::Down:
+        case app::OverlayInput::Up:
+            g_ptrVr = true;
+            g_vrPtrX = in.x;
+            g_vrPtrY = in.y;
+            if (in.kind == app::OverlayInput::Move) PointerMove(in.x, in.y);
+            else if (in.kind == app::OverlayInput::Down) PointerDown(in.x, in.y);
+            else PointerUp(in.x, in.y, PointerRelease());
+            break;
+        case app::OverlayInput::Leave:
+            if (!g_ptrVr) break;
+            g_vrPtrX = g_vrPtrY = -1;
+            if (g_in.pressed || g_in.drag) PointerCancel();
+            PointerLeave();
+            break;
+        case app::OverlayInput::Scroll: {
+            wheel += in.notches;
+            const int notches = (int)wheel;
+            wheel -= notches;
+            if (notches && g_ptrVr && g_vrPtrX >= 0) PointerWheel(g_vrPtrX, g_vrPtrY, notches);
+            break;
+        }
+        }
+    }
+    if (t.exists && t.visible && g_vrDirty) VrSendPage();
 }
 
 // ---- interaction --------------------------------------------------------------------------------
@@ -2352,6 +2512,117 @@ bool OnKey(UINT vk)
     return false;
 }
 
+// ---- the pointer: the window's mouse, or the laser on the dashboard's page (page coordinates) -----
+
+void PointerMove(float x, float y)
+{
+    if (g_in.drag) {
+        DragTo(x);
+        return;
+    }
+    TipTrack(x, y);
+    const Hit ht = HitTest(x, y);
+    const int row = ht.id == IDC_TEXLIST ? ht.part : -1;
+    const int part = ht.id == IDC_TEXLIST ? (ht.click ? ht.part : -1) : ht.part;
+    if (ht.id != g_in.hover || part != g_in.hoverPart || row != g_hoverRow) {
+        g_in.hover = ht.id;
+        g_in.hoverPart = part;
+        g_hoverRow = row;
+        Invalidate();
+    }
+}
+
+void PointerLeave()
+{
+    HideTip();
+    g_tipId = 0;
+    g_tipPart = -1;
+    g_tipSuppress = 0;
+    if (g_in.hover || g_hoverRow >= 0) {
+        g_in.hover = 0;
+        g_in.hoverPart = -1;
+        g_hoverRow = -1;
+        Invalidate();
+    }
+}
+
+// True if it pressed something (the window then captures the mouse).
+bool PointerDown(float x, float y)
+{
+    const Hit ht = HitTest(x, y);
+    TipForget();
+    g_in.focusVisible = false;
+    g_in.pressed = ht.click ? ht.id : 0;
+    if (ht.click) {
+        g_in.focus = ht.id;
+        ui::Widget *w = W(ht.id);
+        if (w && w->kind == ui::Kind::Slider) {
+            g_in.drag = w->id;
+            DragTo(x);
+        } else if (w && w->kind == ui::Kind::Segment) {
+            OnSegment(w->id, ht.part);
+        }
+        if (ht.id == IDC_TEXLIST) g_focusRow = ht.part;
+    }
+    Invalidate();
+    return ht.click;
+}
+
+// The button goes up: first what was pressed is taken (the window releases its capture then), then
+// PointerUp acts on it.
+PtrRelease PointerRelease()
+{
+    PtrRelease r;
+    r.pressed = g_in.pressed;
+    r.drag = g_in.drag;
+    g_in.pressed = 0;
+    g_in.drag = 0;
+    return r;
+}
+
+void PointerUp(float x, float y, const PtrRelease &r)
+{
+    if (r.drag) {
+        OnSlider(r.drag, false);
+    } else if (r.pressed) {
+        const Hit ht = HitTest(x, y);
+        if (ht.id == r.pressed && ht.click) {
+            const ui::Widget *w = W(r.pressed);
+            if (r.pressed == IDC_TEXLIST) OnListToggle(ht.part);
+            else if (w && w->kind == ui::Kind::Button) OnButton(r.pressed);
+            else if (w && w->kind == ui::Kind::Toggle) OnToggle(r.pressed);
+        }
+    }
+    Invalidate();
+}
+
+void PointerCancel()   // the press ends without a click (a slider keeps where it was dragged)
+{
+    if (g_in.drag) {
+        const int d = g_in.drag;
+        g_in.drag = 0;
+        OnSlider(d, false);
+    }
+    g_in.pressed = 0;
+    Invalidate();
+}
+
+// notches > 0: away from the user. The window's view of the page scrolls too; the dashboard shows it all.
+void PointerWheel(float x, float y, int notches)
+{
+    TipForget();
+    if (kList.Contains(x, y) && (int)g_rows.size() > kRowsShown) {
+        g_listScroll = std::max(0, std::min((int)g_rows.size() - kRowsShown, g_listScroll - notches));
+        g_hoverRow = -1;
+        Invalidate();
+    } else if (kLog.Contains(x, y) && !g_events.empty()) {
+        g_logScroll = std::max(0, g_logScroll + notches * 3);
+        Invalidate();
+    } else if (!g_ptrVr && MaxScroll() > 0) {
+        SetScroll(g_scroll - notches * 48.0f);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -2360,6 +2631,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         g_updStart = GetTickCount();
         g_gameRes = ReadAppString(L"manageResolution") != L"0";
         g_withVR = ReadAppString(L"withSteamVR") != L"0";
+        g_vrPage = ReadAppString(L"dashboard") != L"0";
         CreateControls();
         SetText(IDC_TEXHINT, L"Untick a size to leave it alone, say an overlay that got tinted. Eye textures stay upscaled together.");
         ModelToUi();
@@ -2371,6 +2643,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetTimer(h, TIMER_PUSH, 100, nullptr);
         RefreshUpdateUi();
         StartLink();
+        if (g_vrPage) {
+            VrMakeThumbnail();
+            SetTimer(h, TIMER_VR, 33, nullptr);
+        }
         return 0;
     }
     case WM_TIMER:
@@ -2386,16 +2662,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             Save();
         } else if (wp == TIMER_TIP) {
             KillTimer(h, TIMER_TIP);
-            POINT pt;
-            GetCursorPos(&pt);
-            ScreenToClient(h, &pt);
             int id = 0, part = -1;
             RectF a;
-            if (g_tipId && !g_in.drag && TipAt(L(pt.x), L(pt.y) + g_scroll, id, part, a) &&
-                id == g_tipId && part == g_tipPart) {
+            float px, py;
+            if (g_tipId && !g_in.drag && PointerOnPage(px, py) && TipAt(px, py, id, part, a) && id == g_tipId &&
+                part == g_tipPart) {
                 g_tipShown = true;
                 Invalidate();
             }
+        } else if (wp == TIMER_VR) {
+            VrTick();
         } else if (wp == TIMER_REPLAN) {
             KillTimer(h, TIMER_REPLAN);
             if (g_replanPending) {
@@ -2429,92 +2705,33 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_MOUSEMOVE: {
-        const float x = L(GET_X_LPARAM(lp)), y = L(GET_Y_LPARAM(lp)) + g_scroll;
         if (!g_mouseTracked) {
             TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, h, 0 };
             TrackMouseEvent(&t);
             g_mouseTracked = true;
         }
-        if (g_in.drag) {
-            DragTo(x);
-            return 0;
-        }
-        TipTrack(x, y);
-        const Hit ht = HitTest(x, y);
-        const int row = ht.id == IDC_TEXLIST ? ht.part : -1;
-        const int part = ht.id == IDC_TEXLIST ? (ht.click ? ht.part : -1) : ht.part;
-        if (ht.id != g_in.hover || part != g_in.hoverPart || row != g_hoverRow) {
-            g_in.hover = ht.id;
-            g_in.hoverPart = part;
-            g_hoverRow = row;
-            Invalidate();
-        }
+        g_ptrVr = false;
+        PointerMove(L(GET_X_LPARAM(lp)), L(GET_Y_LPARAM(lp)) + g_scroll);
         return 0;
     }
     case WM_MOUSELEAVE:
         g_mouseTracked = false;
-        HideTip();
-        g_tipId = 0;
-        g_tipPart = -1;
-        g_tipSuppress = 0;
-        if (g_in.hover || g_hoverRow >= 0) {
-            g_in.hover = 0;
-            g_in.hoverPart = -1;
-            g_hoverRow = -1;
-            Invalidate();
-        }
+        PointerLeave();
         return 0;
     case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK: {
-        const float x = L(GET_X_LPARAM(lp)), y = L(GET_Y_LPARAM(lp)) + g_scroll;
-        const Hit ht = HitTest(x, y);
-        TipForget();
+    case WM_LBUTTONDBLCLK:
+        g_ptrVr = false;
         SetFocus(h);
-        g_in.focusVisible = false;
-        g_in.pressed = ht.click ? ht.id : 0;
-        if (ht.click) {
-            g_in.focus = ht.id;
-            SetCapture(h);
-            ui::Widget *w = W(ht.id);
-            if (w && w->kind == ui::Kind::Slider) {
-                g_in.drag = w->id;
-                DragTo(x);
-            } else if (w && w->kind == ui::Kind::Segment) {
-                OnSegment(w->id, ht.part);
-            }
-            if (ht.id == IDC_TEXLIST) g_focusRow = ht.part;
-        }
-        Invalidate();
+        if (PointerDown(L(GET_X_LPARAM(lp)), L(GET_Y_LPARAM(lp)) + g_scroll)) SetCapture(h);
         return 0;
-    }
     case WM_LBUTTONUP: {
-        const float x = L(GET_X_LPARAM(lp)), y = L(GET_Y_LPARAM(lp)) + g_scroll;
-        const int pressed = g_in.pressed, drag = g_in.drag;
-        g_in.pressed = 0;
-        g_in.drag = 0;
+        const PtrRelease r = PointerRelease();
         if (GetCapture() == h) ReleaseCapture();
-        if (drag) {
-            OnSlider(drag, false);
-        } else if (pressed) {
-            const Hit ht = HitTest(x, y);
-            if (ht.id == pressed && ht.click) {
-                const ui::Widget *w = W(pressed);
-                if (pressed == IDC_TEXLIST) OnListToggle(ht.part);
-                else if (w && w->kind == ui::Kind::Button) OnButton(pressed);
-                else if (w && w->kind == ui::Kind::Toggle) OnToggle(pressed);
-            }
-        }
-        Invalidate();
+        PointerUp(L(GET_X_LPARAM(lp)), L(GET_Y_LPARAM(lp)) + g_scroll, r);
         return 0;
     }
     case WM_CAPTURECHANGED:
-        if (g_in.drag) {
-            const int d = g_in.drag;
-            g_in.drag = 0;
-            OnSlider(d, false);
-        }
-        g_in.pressed = 0;
-        Invalidate();
+        PointerCancel();
         break;
     case WM_MOUSEWHEEL: {
         static int acc = 0;
@@ -2522,20 +2739,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         const int notches = acc / WHEEL_DELTA;
         acc -= notches * WHEEL_DELTA;
         if (!notches) return 0;
-        TipForget();
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(h, &pt);
-        const float x = L(pt.x), y = L(pt.y) + g_scroll;
-        if (kList.Contains(x, y) && (int)g_rows.size() > kRowsShown) {
-            g_listScroll = std::max(0, std::min((int)g_rows.size() - kRowsShown, g_listScroll - notches));
-            g_hoverRow = -1;
-            Invalidate();
-        } else if (kLog.Contains(x, y) && !g_events.empty()) {
-            g_logScroll = std::max(0, g_logScroll + notches * 3);
-            Invalidate();
-        } else if (MaxScroll() > 0) {
-            SetScroll(g_scroll - notches * 48.0f);
-        }
+        g_ptrVr = false;
+        PointerWheel(L(pt.x), L(pt.y) + g_scroll, notches);
         return 0;
     }
     case WM_KEYDOWN:

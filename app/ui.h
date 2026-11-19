@@ -41,7 +41,19 @@ enum FontId { F_DISPLAY, F_BRAND, F_H2, F_BODY, F_LABEL, F_VALUE, F_SMALL, F_BUT
 
 void Startup(HINSTANCE inst);   // GDI+, the embedded fonts, the kraft texture
 void Shutdown();
-void MakeFonts(UINT dpi);
+void MakeFonts(UINT dpi);   // the window's fonts
+// While it lives, the fonts in use are those for another dpi (made once, kept), e.g. 96 for the
+// SteamVR page; then the window's again.
+class FontsFor {
+public:
+    explicit FontsFor(UINT dpi);
+    ~FontsFor();
+    FontsFor(const FontsFor &) = delete;
+    FontsFor &operator=(const FontsFor &) = delete;
+
+private:
+    bool switched_ = false;
+};
 HFONT Font(FontId f);
 float FontPx(FontId f);
 float Mid(FontId f, float cy);   // baseline that centres a line of text on cy
