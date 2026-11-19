@@ -1,3 +1,5 @@
 # build output (./build.sh, tools/package.sh)
 /build/
 *.o
+# Microsoft d3dcompiler_47.dll for tools/shaders.sh and tools/ab under Wine (tools/ab/setup-wine.sh)
+/tools/d3dcompiler_47.dll

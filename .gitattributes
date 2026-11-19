@@ -1,2 +1,5 @@
 # the compiled shaders (tools/shaders.sh): binary, no text diffs
 src/gen/shaders.bin binary
+# shell scripts and Python keep LF line endings in Windows checkouts too (MSYS2 / Git Bash run them)
+*.sh text eol=lf
+*.py text eol=lf

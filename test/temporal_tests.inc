@@ -2123,6 +2123,82 @@ static void RunFxaaTest(Gfx &g, EyeTarget &tgt, const Sequence &mov, const char 
     }
 }
 
+// tools/ab (VRUPSCALE_TEST_ONLY=abdump): the moving sequence once, under the settings in
+// VRUPSCALE_AB_INI ("[upscale]|mode=temporal|..."; '|' separates lines), writing every frame's output
+// of both eyes as raw RGBA8 bytes to <outDir>\<VRUPSCALE_AB_TAG>_e<eye>_<frame>.raw, so that two
+// builds can be compared pixel for pixel (tools/ab/cmp.py).
+//   VRUPSCALE_AB_REDRAW=1      each frame is drawn twice per eye, the second time as a compositor
+//                              repainting a frame it already has; that second draw is written
+//   VRUPSCALE_AB_NOTIME=1      gpuTiming=0 (no timestamp queries: as fast as the build allows)
+//   VRUPSCALE_AB_STATS=1       prints the per-pass GPU times at the end
+//   VRUPSCALE_AB_TOGGLE_A / _B=n  presses Ctrl+F10 (the optical flow switch) before frame n
+static void WriteRaw(const Image &im, const char *path)
+{
+    std::vector<uint8_t> b(im.px.size());
+    for (size_t k = 0; k < b.size(); ++k) b[k] = (uint8_t)lroundf(std::min(std::max(im.px[k], 0.0f), 1.0f) * 255.0f);
+    if (FILE *f = fopen(path, "wb")) {
+        fwrite(b.data(), 1, b.size(), f);
+        fclose(f);
+    }
+}
+
+static void RunAbDump(Gfx &g, const Sequence &mov, const char *iniBase, const char *reqShared, UINT misc, const char *outDir)
+{
+    const std::string tag = EnvStr("VRUPSCALE_AB_TAG")[0] ? EnvStr("VRUPSCALE_AB_TAG") : "ab";
+    char abIni[4096] = {};
+    const DWORD n = GetEnvironmentVariableA("VRUPSCALE_AB_INI", abIni, sizeof(abIni));
+    std::string extra = (n > 0 && n < sizeof(abIni)) ? abIni : "[upscale]|mode=temporal";
+    for (char &c : extra) if (c == '|') c = '\n';
+    std::string base = iniBase;
+    if (EnvStr("VRUPSCALE_AB_NOTIME")[0] == '1') base.replace(base.find("[general]\n"), 10, "[general]\ngpuTiming=0\n");
+    const std::string ini = base + "requireShared=" + reqShared + "\n" + extra + "\n";
+    WriteIni(ini.c_str());
+    Pump(g);
+    const bool redraw = EnvStr("VRUPSCALE_AB_REDRAW")[0] == '1', stats = EnvStr("VRUPSCALE_AB_STATS")[0] == '1';
+    const int togA = EnvStr("VRUPSCALE_AB_TOGGLE_A")[0] ? atoi(EnvStr("VRUPSCALE_AB_TOGGLE_A")) : -1;
+    const int togB = EnvStr("VRUPSCALE_AB_TOGGLE_B")[0] ? atoi(EnvStr("VRUPSCALE_AB_TOGGLE_B")) : -1;
+    printf("abdump: %s %d frames %dx%d -> %dx%d%s\n", tag.c_str(), mov.frames, mov.w, mov.h, mov.ow, mov.oh, redraw ? ", each drawn twice" : "");
+
+    std::vector<Image> blank = { mov.in[0][0], mov.in[1][0] };
+    ID3D11Texture2D *app = MakeTexture(g, DXGI_FORMAT_R8G8B8A8_TYPELESS, blank, misc);
+    ID3D11ShaderResourceView *views[2] = { MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+                                           MakeView(g, app, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1) };
+    EyeTarget tgt;
+    EnsureEyeTarget(g, tgt, mov.ow, mov.oh);
+    if (stats && g_passTimes) g_passTimes(nullptr, nullptr, 0, 1);   // nothing older
+    char path[MAX_PATH * 2];
+    for (int i = 0; i < mov.frames; ++i) {
+        if (i == togA || i == togB) {
+            if (g_hotkey) g_hotkey(9);   // Ctrl+F10
+            Pump(g);
+            printf("abdump: Ctrl+F10 before frame %d\n", i);
+        }
+        UploadSlices(g, app, mov.in[0][i], mov.in[1][i]);
+        Image out[2];
+        for (int e = 0; e < 2; ++e) out[e] = DrawEye(g, tgt, views[e], e, nullptr, !redraw);
+        if (redraw) {
+            Sleep(4);   // > dedupeMs: a later compositor frame showing the same app frame
+            for (int e = 0; e < 2; ++e) out[e] = DrawEye(g, tgt, views[e], e, nullptr, true);
+        }
+        for (int e = 0; e < 2; ++e) {
+            snprintf(path, sizeof(path), "%s\\%s_e%d_%03d.raw", outDir, tag.c_str(), e, i);
+            WriteRaw(out[e], path);
+        }
+        Sleep(4);   // > dedupeMs: the next draw of a texture is a new compositor frame
+    }
+    if (stats && g_passTimes) {
+        double ms[32] = {};
+        const char *names[32] = {};
+        const int np = g_passTimes(ms, names, 32, 1);
+        printf("abdump: %s per-pass GPU ms, average per eye update:", tag.c_str());
+        for (int i = 0; i < np; ++i) printf(" %s %.3f", names[i] ? names[i] : "?", ms[i]);
+        printf("\n");
+    }
+    ClearAll(g);
+    SafeRelease(views[0]); SafeRelease(views[1]); SafeRelease(app);
+    tgt.Release();
+}
+
 static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, bool sharedOk, bool qualityOnly)
 {
     LoadDebugExports();
@@ -2132,7 +2208,10 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     CHECK(g_debugStream != nullptr, "temporal debug export present");
     if (!g_debugStream) return;
 
-    const int W = 400, H = 440;
+    // VRUPSCALE_TEST_W / _H: another scene size, for the quality table (with VRUPSCALE_TEST_TUNE_ONLY)
+    // and tools/ab (the checks further down expect the default)
+    const int W = EnvStr("VRUPSCALE_TEST_W")[0] ? atoi(EnvStr("VRUPSCALE_TEST_W")) : 400;
+    const int H = EnvStr("VRUPSCALE_TEST_H")[0] ? atoi(EnvStr("VRUPSCALE_TEST_H")) : 440;
     // VRUPSCALE_TEST_FACTOR: the quality table at another scaling preset (with VRUPSCALE_TEST_TUNE_ONLY)
     const float F = EnvStr("VRUPSCALE_TEST_FACTOR")[0] ? (float)atof(EnvStr("VRUPSCALE_TEST_FACTOR")) : 1.3f;
     const int OW = (int)lroundf(W * F), OH = (int)lroundf(H * F);
@@ -2161,6 +2240,10 @@ static void RunTemporalTests(Gfx &g, const char *outDir, const char *reqShared, 
     }
     const int seqFrames = EnvStr("VRUPSCALE_TEST_FRAMES")[0] ? std::max(12, atoi(EnvStr("VRUPSCALE_TEST_FRAMES"))) : 24;
     Sequence mov = MakeSequence(world, W, H, OW, OH, seqFrames, true, 777);
+    if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "abdump") == 0) {
+        RunAbDump(g, mov, tIniBase, reqShared, misc, outDir);
+        return;
+    }
     Sequence still = MakeSequence(world, W, H, OW, OH, 4, false, 1);
     if (strcmp(EnvStr("VRUPSCALE_TEST_ONLY"), "gaze") == 0) {
         RunGazeTest(g, mov, tIniBase, reqShared, F, misc);
